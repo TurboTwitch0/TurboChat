@@ -28,6 +28,7 @@
   const voicePeers = new Map();
   const pendingIce = new Map();
   const voiceSignalQueues = new Map();
+  const blockedVoicePeers = new Map();
   const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const name = () => state.profile?.name || state.guest.name;
   const save = () => localStorage.setItem(storageKey, JSON.stringify({ guest: state.guest, active: state.active, followingRooms: state.followingRooms }));
@@ -121,7 +122,13 @@
         state.voiceMembers = data.participants || []; renderVoice();
         if (state.voiceRoom) connectToVoiceMembers(state.voiceMembers).catch(error => { state.voiceError = error.message; renderVoice(); });
       }
-      if (data.type === "signal" && data.room === state.voiceRoom && data.to === state.peerId) handleVoiceSignal(data).catch(error => { state.voiceError = error.message; renderVoice(); });
+      if (data.type === "signal" && data.room === state.voiceRoom && data.to === state.peerId) {
+        if ((blockedVoicePeers.get(data.from) || 0) > Date.now()) return;
+        handleVoiceSignal(data).catch(error => {
+        if (error.status === 409) { dropVoicePeer(data.from); return; }
+        state.voiceError = error.message; renderVoice();
+        });
+      }
   }
   async function pollUpdates() {
     if (polling) return; polling = true;
@@ -318,7 +325,7 @@
   async function leaveVoice(silent = false) {
     const previous = state.voiceRoom || state.joiningVoice;
     if (state.voiceRoom) api("/api/voice/leave", { method: "POST", body: JSON.stringify({ room: state.voiceRoom, peerId: state.peerId, guestId: state.guest.id }) }).catch(() => {});
-    for (const pc of voicePeers.values()) pc.close(); voicePeers.clear(); pendingIce.clear(); voiceSignalQueues.clear(); $("#remoteAudio").replaceChildren();
+    for (const pc of voicePeers.values()) pc.close(); voicePeers.clear(); pendingIce.clear(); voiceSignalQueues.clear(); blockedVoicePeers.clear(); $("#remoteAudio").replaceChildren();
     const socket = relaySocket; relaySocket = null; socket?.close(); micProcessor?.disconnect(); micSource?.disconnect(); outputGain?.disconnect(); micProcessor = null; micSource = null; outputGain = null;
     mic?.getTracks().forEach(track => track.stop()); mic = null; if (audioContext) await audioContext.close().catch(() => {}); audioContext = null; outputSchedule.clear();
     state.voiceRoom = ""; state.joiningVoice = false; state.voiceMembers = []; state.muted = false; state.deafened = false; state.voiceError = ""; lastVoiceHeartbeat = 0; renderVoice(); if (!silent && previous) toast("You left voice.");
@@ -344,16 +351,30 @@
     });
   }
   async function connectToVoiceMembers(participants) {
-    const activePeers = new Set((participants || []).map(item => item.peerId));
+    const now = Date.now();
+    for (const [peerId, expiresAt] of blockedVoicePeers) if (expiresAt <= now) blockedVoicePeers.delete(peerId);
+    const liveParticipants = (participants || []).filter(item => !blockedVoicePeers.has(item.peerId));
+    const activePeers = new Set(liveParticipants.map(item => item.peerId));
     for (const [peerId, pc] of voicePeers) if (!activePeers.has(peerId)) {
       pc.close(); voicePeers.delete(peerId); pendingIce.delete(peerId);
       document.querySelector(`[data-peer-audio="${CSS.escape(peerId)}"]`)?.remove();
     }
-    for (const participant of participants || []) {
+    state.voiceMembers = liveParticipants; renderVoice();
+    for (const participant of liveParticipants) {
       if (participant.peerId === state.peerId) continue;
       // One side creates the offer, even when both users join at nearly the same time.
-      await connectVoicePeer(participant.peerId, state.peerId > participant.peerId);
+      try { await connectVoicePeer(participant.peerId, state.peerId > participant.peerId); }
+      catch (error) {
+        if (error.status !== 409) throw error;
+        dropVoicePeer(participant.peerId);
+      }
     }
+  }
+  function dropVoicePeer(peerId) {
+    voicePeers.get(peerId)?.close(); voicePeers.delete(peerId); pendingIce.delete(peerId); voiceSignalQueues.delete(peerId);
+    blockedVoicePeers.set(peerId, Date.now() + 35000);
+    state.voiceMembers = state.voiceMembers.filter(item => item.peerId !== peerId);
+    document.querySelector(`[data-peer-audio="${CSS.escape(peerId)}"]`)?.remove(); renderVoice();
   }
   async function connectVoicePeer(peerId, offerer) {
     if (voicePeers.has(peerId) || !mic) return voicePeers.get(peerId);
@@ -394,7 +415,7 @@
       mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
       const result = await api("/api/voice/join", { method: "POST", body: JSON.stringify({ room: state.active, peerId: state.peerId, guestId: state.guest.id, guestName: name() }) });
       state.voiceRoom = state.active; state.joiningVoice = false; state.voiceMembers = result.participants || []; renderVoice();
-      lastVoiceHeartbeat = Date.now(); await connectToVoiceMembers(state.voiceMembers);
+      lastVoiceHeartbeat = Date.now(); blockedVoicePeers.clear(); await connectToVoiceMembers(state.voiceMembers);
     } catch (error) { state.joiningVoice = false; mic?.getTracks().forEach(track => track.stop()); mic = null; for (const pc of voicePeers.values()) pc.close(); voicePeers.clear(); state.voiceError = error.message; renderVoice(); toast(error.message); }
   }
   function showRules() { modal("A small promise to each other.", "Orbit works best when everyone gets to be a person here.", `<ul class="rules"><li>Be curious before you judge. People arrive with different stories.</li><li>Make room for quieter voices. A thoughtful reply goes a long way.</li><li>Keep personal information personal. Share only what feels right to you.</li><li>If someone asks you to stop, let the conversation breathe.</li></ul>`); }
