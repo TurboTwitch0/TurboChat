@@ -1,5 +1,5 @@
 import { getStore } from "@netlify/blobs";
-import { randomBytes, randomUUID, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, randomUUID, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
 import { promisify } from "node:util";
 
 const scrypt = promisify(scryptCallback);
@@ -22,6 +22,18 @@ function identity(data, user) { return user ? `user-${user.id}` : validId(data?.
 function isMember(room, who) { return !!who && (room?.memberKeys || []).includes(who); }
 function publicMember(entry) { return { id: entry.id, name: entry.name, emoji: entry.emoji, registered: !!entry.registered }; }
 function pushEvent(db, event) { db.nextEventSeq = (db.nextEventSeq || 0) + 1; db.events.push({ ...event, seq: db.nextEventSeq, at: Date.now() }); db.events = db.events.slice(-maxEvents); }
+const emailKey = email => createHash("sha256").update(email).digest("hex");
+async function readMessages(store, db, channel) {
+  const merged = new Map((db.messages[channel] || []).map(item => [item.id, item]));
+  const { blobs } = await store.list({ prefix: `messages/${channel}/` });
+  const recent = blobs.sort((a, b) => a.key.localeCompare(b.key)).slice(-250);
+  const records = await Promise.all(recent.map(blob => store.get(blob.key, { type: "json" })));
+  for (const item of records) if (item?.id) {
+    const previous = merged.get(item.id);
+    merged.set(item.id, previous ? { ...item, ...previous, reactions: previous.reactions ?? item.reactions } : item);
+  }
+  return [...merged.values()].sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt)).slice(-250);
+}
 
 export default async function handler(request) {
   const url = new URL(request.url);
@@ -39,8 +51,9 @@ export default async function handler(request) {
     db.users ||= []; db.messages ||= {}; db.rooms ||= []; db.parties ||= []; db.events ||= []; db.presence ||= {}; db.voicePeers ||= {};
     if (!db.eventSequenceVersion) { db.nextEventSeq = 0; for (const event of db.events) event.seq = ++db.nextEventSeq; db.eventSequenceVersion = 1; await store.setJSON("state", db); }
     const session = parseCookie(request.headers.get("cookie"), "orbit_session");
-    const userId = db.sessions?.[session];
-    const user = db.users.find(item => item.id === userId) || null;
+    const sessionUserId = session ? await store.get(`auth/sessions/${session}`, { type: "text" }) : null;
+    const userId = sessionUserId || db.sessions?.[session];
+    const user = userId ? (await store.get(`auth/users/${userId}`, { type: "json" }) || db.users.find(item => item.id === userId)) : null;
     const who = identity(data, user);
     const setCookie = token => ({ "set-cookie": `orbit_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000; Secure` });
     const save = () => store.setJSON("state", db);
@@ -62,12 +75,12 @@ export default async function handler(request) {
     if (method === "GET" && path === "/api/bootstrap") {
       const channel = validId(url.searchParams.get("channel")) || "global";
       if (!canSee(channel)) return reply(403, { error: "Join this party from its invite link first." });
-      return reply(200, { messages: (db.messages[channel] || []).slice(-250), rooms: db.rooms, parties: db.parties.filter(room => isMember(room, who)).map(safeRoom), music: db.music, members: online.map(publicMember), registeredCount: baseline + db.users.length, memberGoal: goal });
+      return reply(200, { messages: await readMessages(store, db, channel), rooms: db.rooms, parties: db.parties.filter(room => isMember(room, who)).map(safeRoom), music: db.music, members: online.map(publicMember), registeredCount: baseline + db.users.length, memberGoal: goal });
     }
     if (method === "GET" && path === "/api/messages") {
       const channel = validId(url.searchParams.get("channel")) || "global";
       if (!canSee(channel)) return reply(403, { error: "Join this party from its invite link first." });
-      return reply(200, { messages: (db.messages[channel] || []).slice(-250) });
+      return reply(200, { messages: await readMessages(store, db, channel) });
     }
     if (method === "GET" && path === "/api/updates") {
       const after = Number(url.searchParams.get("after")) || 0;
@@ -80,8 +93,16 @@ export default async function handler(request) {
       if (!who) return reply(400, { error: "Refresh the page and try again." });
       if (!canSee(channel)) return reply(403, { error: "Join this party from its invite link first." });
       const message = { id: randomUUID(), user: user?.name || clean(data.guestName, 32) || "Guest", userId: user?.id || "", registered: !!user, emoji: user?.emoji || "✦", text: content, reactions: {}, createdAt: new Date().toISOString() };
+      // Store messages under unique immutable keys so concurrent serverless
+      // writes cannot replace another message from the shared state snapshot.
+      const messageKey = `messages/${channel}/${message.createdAt.replace(/\D/g, "")}-${message.id}`;
+      await store.setJSON(messageKey, message);
+      const { blobs } = await store.list({ prefix: `messages/${channel}/` });
+      if (blobs.length > 300) {
+        for (const old of blobs.sort((a, b) => a.key.localeCompare(b.key)).slice(0, blobs.length - 250)) await store.delete(old.key);
+      }
       db.messages[channel] ||= []; db.messages[channel].push(message); db.messages[channel] = db.messages[channel].slice(-250);
-      pushEvent(db, { type: "message", channel, message }); await save(); return reply(201, { message });
+      pushEvent(db, { type: "message", channel, message }); await save().catch(() => {}); return reply(201, { message });
     }
     if (method === "POST" && path === "/api/typing") {
       if (!who) return reply(400, { error: "Refresh the page and try again." });
@@ -127,20 +148,23 @@ export default async function handler(request) {
       if (name.length < 2) return reply(400, { error: "Choose a name with at least two characters." });
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return reply(400, { error: "Enter a valid email address." });
       if (password.length < 8 || password.length > 128) return reply(400, { error: "Use a password between 8 and 128 characters." });
-      if (db.users.some(item => item.email === email)) return reply(409, { error: "That email already has an account. Sign in instead." });
+      const indexedUser = email ? await store.get(`auth/emails/${emailKey(email)}`, { type: "json" }) : null;
+      if (indexedUser || db.users.some(item => item.email === email)) return reply(409, { error: "That email already has an account. Sign in instead." });
       const salt = randomBytes(16).toString("hex"), hash = (await scrypt(password, salt, 64)).toString("hex");
       const created = { id: randomUUID(), name, email, salt, passwordHash: hash, emoji: [...name][0].toUpperCase() };
       db.users.push(created); db.sessions ||= {}; const token = randomBytes(32).toString("base64url"); db.sessions[token] = created.id;
-      pushEvent(db, { type: "presence", members: online.map(publicMember), registeredCount: baseline + db.users.length }); await save();
+      await Promise.all([store.setJSON(`auth/users/${created.id}`, created), store.setJSON(`auth/emails/${emailKey(email)}`, created), store.set(`auth/sessions/${token}`, created.id)]);
+      pushEvent(db, { type: "presence", members: online.map(publicMember), registeredCount: baseline + db.users.length }); await save().catch(() => {});
       return reply(201, { user: publicUser(created) }, setCookie(token));
     }
     if (method === "POST" && path === "/api/login") {
-      const email = clean(data.email, 120).toLowerCase(), password = typeof data.password === "string" ? data.password : "", found = db.users.find(item => item.email === email);
-      if (!found || !(await scrypt(password, found.salt, 64)).equals(Buffer.from(found.passwordHash, "hex"))) return reply(401, { error: "Email or password didn’t match." });
-      db.sessions ||= {}; const token = randomBytes(32).toString("base64url"); db.sessions[token] = found.id; await save(); return reply(200, { user: publicUser(found) }, setCookie(token));
+      const email = clean(data.email, 120).toLowerCase(), password = typeof data.password === "string" ? data.password : "";
+      const found = await store.get(`auth/emails/${emailKey(email)}`, { type: "json" }) || db.users.find(item => item.email === email);
+      if (!found || password.length > 128 || !(await scrypt(password, found.salt, 64)).equals(Buffer.from(found.passwordHash, "hex"))) return reply(401, { error: "Email or password didn’t match." });
+      const token = randomBytes(32).toString("base64url"); await store.set(`auth/sessions/${token}`, found.id); db.sessions ||= {}; db.sessions[token] = found.id; await save().catch(() => {}); return reply(200, { user: publicUser(found) }, setCookie(token));
     }
     if (method === "POST" && path === "/api/logout") {
-      if (db.sessions) delete db.sessions[session]; await save(); return reply(200, { ok: true }, { "set-cookie": "orbit_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0; Secure" });
+      if (session) await store.delete(`auth/sessions/${session}`); if (db.sessions) delete db.sessions[session]; await save().catch(() => {}); return reply(200, { ok: true }, { "set-cookie": "orbit_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0; Secure" });
     }
     if (path === "/api/voice/join" && method === "POST") {
       const room = validId(data.room), peerId = validId(data.peerId);

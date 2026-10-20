@@ -66,7 +66,7 @@
     const reactions = Object.entries(item.reactions || {}).map(([emoji, list]) => `<button class="reaction" data-react="${esc(item.id)}" data-emoji="${esc(emoji)}">${esc(emoji)} ${list.length}</button>`).join("");
     return `<article class="message"><span class="avatar">${esc(item.emoji || "✦")}</span><div class="message-body"><div class="message-meta"><b>${esc(item.user || "Guest")}</b>${item.registered ? `<i>member</i>` : ""}<time>${new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" }).format(new Date(item.createdAt || Date.now()))}</time></div><p>${esc(item.text)}</p><div class="message-actions">${reactions}<button class="reaction" data-react="${esc(item.id)}" data-emoji="💜">💜 +</button><button class="reply-link" data-reply="${i}">↩ Reply</button></div></div></article>`;
   }
-  function renderMessages() {
+  function renderMessages({ scrollToBottom = false } = {}) {
     const current = room(state.active), items = state.messages[state.active] || [];
     const feed = $("#messages"), previousTop = feed.scrollTop, wasAtBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 140;
     const channelInfo = info[state.active] || [current.name, current.topic || "Come in and say hello.", current.emoji || "✦", current.topic || "A friendly space for good conversation."];
@@ -77,10 +77,23 @@
     $("#followButton").setAttribute("aria-pressed", String(isFollowing));
     $("#messageInput").placeholder = `Message ${channelInfo[0]}…`; $("#musicPanel").classList.toggle("hidden", state.active !== "music");
     const greeting = `<div class="welcome-card"><span>${esc(channelInfo[2])}</span><div><h2>${state.active === "global" ? "The world is a little smaller now." : `Welcome to ${esc(channelInfo[0])}.`}</h2><p>${items.length ? "Join the conversation. Messages arrive live." : "No messages yet. Start the conversation."}</p></div></div><div class="day-label">LIVE CONVERSATION</div>`;
-    feed.innerHTML = greeting + items.map(renderMessage).join(""); feed.scrollTop = wasAtBottom ? feed.scrollHeight : previousTop;
-    $("#voiceRoomName").textContent = `${channelInfo[0]} voice`; renderVoice(); renderRoomList(); renderMembers(); renderMusic();
+    feed.innerHTML = greeting + items.map(renderMessage).join("");
+    if (scrollToBottom || wasAtBottom) feed.scrollTo({ top: feed.scrollHeight, behavior: "smooth" });
+    else feed.scrollTop = previousTop;
+    $("#voiceRoomName").textContent = `${channelInfo[0]} voice`; renderVoice();
   }
-  function addMessage(channel, item) { state.messages[channel] ||= []; if (!state.messages[channel].some(m => m.id === item.id)) { state.messages[channel].push(item); if (state.active === channel) renderMessages(); } }
+  function mergeMessages(channel, incoming) {
+    const existing = state.messages[channel] || [], byId = new Map(existing.map(item => [item.id, item]));
+    for (const item of incoming || []) {
+      const previous = byId.get(item.id);
+      byId.set(item.id, previous ? { ...previous, ...item, reactions: item.reactions ?? previous.reactions } : item);
+    }
+    const merged = [...byId.values()].sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0)).slice(-250);
+    const changed = merged.length !== existing.length || merged.some((item, i) => item.id !== existing[i]?.id || JSON.stringify(item.reactions || {}) !== JSON.stringify(existing[i]?.reactions || {}) || item.pending !== existing[i]?.pending);
+    state.messages[channel] = merged;
+    return changed;
+  }
+  function addMessage(channel, item) { if (mergeMessages(channel, [item]) && state.active === channel) renderMessages(); }
   function toggleFollow() {
     const index = state.followingRooms.indexOf(state.active);
     if (index < 0) { state.followingRooms.push(state.active); toast(`Following ${room(state.active).name}. Find it in your sidebar.`); }
@@ -88,7 +101,7 @@
     save(); renderRoomList(); renderMessages();
   }
   async function loadChannel(id) {
-    try { const data = await api(`/api/messages?channel=${encodeURIComponent(id)}&guestId=${encodeURIComponent(state.guest.id)}`); state.messages[id] = data.messages || []; if (state.active === id) renderMessages(); }
+    try { const data = await api(`/api/messages?channel=${encodeURIComponent(id)}&guestId=${encodeURIComponent(state.guest.id)}`); if (mergeMessages(id, data.messages || []) && state.active === id) renderMessages(); }
     catch (error) { toast(error.message); }
   }
   async function bootstrap() {
@@ -99,7 +112,7 @@
       state.active = "global"; save(); toast("That saved room is no longer available. You’re back in World chat.");
       data = await api(`/api/bootstrap?channel=global&guestId=${encodeURIComponent(state.guest.id)}`);
     }
-    state.rooms = data.rooms || []; state.parties = data.parties || []; state.messages[state.active] = data.messages || []; state.members = data.members || []; state.registered = Number(data.registeredCount) || 1428; state.goal = Number(data.memberGoal) || 1500; state.music = data.music || null; renderMessages();
+    state.rooms = data.rooms || []; state.parties = data.parties || []; mergeMessages(state.active, data.messages || []); state.members = data.members || []; state.registered = Number(data.registeredCount) || 1428; state.goal = Number(data.memberGoal) || 1500; state.music = data.music || null; renderRoomList(); renderMessages(); renderMembers(); renderMusic();
   }
   function connectLive() {
     state.stream?.close();
@@ -144,10 +157,8 @@
       const presenceChanged = JSON.stringify(state.members) !== JSON.stringify(result.members || []);
       state.members = result.members || []; state.registered = Number(result.registeredCount) || state.registered; if (presenceChanged) renderMembers();
       if (Date.now() - lastMessageSync > 4500) {
-        const latest = await api(`/api/messages?channel=${encodeURIComponent(state.active)}&guestId=${encodeURIComponent(state.guest.id)}`), current = state.messages[state.active] || [], incoming = latest.messages || [];
-        const currentVersion = current.map(item => `${item.id}:${JSON.stringify(item.reactions || {})}`).join("|");
-        const latestVersion = incoming.map(item => `${item.id}:${JSON.stringify(item.reactions || {})}`).join("|");
-        if (currentVersion !== latestVersion) { state.messages[state.active] = incoming; renderMessages(); }
+        const latest = await api(`/api/messages?channel=${encodeURIComponent(state.active)}&guestId=${encodeURIComponent(state.guest.id)}`);
+        if (mergeMessages(state.active, latest.messages || [])) renderMessages();
         lastMessageSync = Date.now();
       }
       lastEventSeq = Math.max(lastEventSeq, Number(result.nextSeq) || 0); setConnected(true, "Live");
@@ -159,14 +170,14 @@
     const content = value.trim(); if (!content || !state.connected) return;
     const input = $("#messageInput"); input.value = ""; $("#charCount").textContent = "0"; input.style.height = "auto";
     const channel = state.active, tempId = `pending-${crypto.randomUUID()}`, pending = { id: tempId, user: name(), emoji: state.profile?.emoji || "✦", text: content, createdAt: new Date().toISOString(), reactions: {}, pending: true };
-    addMessage(channel, pending);
-    try { const result = await api("/api/messages", { method: "POST", body: JSON.stringify({ channel, text: content, guestId: state.guest.id, guestName: name() }) }); state.messages[channel] = (state.messages[channel] || []).filter(item => item.id !== tempId); addMessage(channel, result.message); }
+    mergeMessages(channel, [pending]); if (state.active === channel) renderMessages({ scrollToBottom: true });
+    try { const result = await api("/api/messages", { method: "POST", body: JSON.stringify({ channel, text: content, guestId: state.guest.id, guestName: name() }) }); state.messages[channel] = (state.messages[channel] || []).filter(item => item.id !== tempId); mergeMessages(channel, [result.message]); if (state.active === channel) renderMessages({ scrollToBottom: true }); }
     catch (error) { state.messages[channel] = (state.messages[channel] || []).filter(item => item.id !== tempId); if (state.active === channel) renderMessages(); input.value = content; toast(error.message); }
   }
   async function selectChannel(id) {
     if (!allRooms().some(item => item.id === id)) return;
     if (state.voiceRoom && state.voiceRoom !== id) await leaveVoice(true);
-    state.active = id; save(); setView("chat"); renderMessages(); await loadChannel(id);
+    state.active = id; save(); setView("chat"); renderRoomList(); renderMessages(); await loadChannel(id);
   }
   function modal(title, subtitle, body) { $("#modalRoot").innerHTML = `<div class="modal-backdrop"><section class="modal"><button class="modal-close" data-close>×</button><small>ORBIT</small><h2>${esc(title)}</h2><p>${esc(subtitle)}</p>${body}</section></div>`; $("[data-close]").addEventListener("click", closeModal); $(".modal-backdrop").addEventListener("click", e => { if (e.target.classList.contains("modal-backdrop")) closeModal(); }); }
   function closeModal() { $("#modalRoot").innerHTML = ""; }
@@ -208,18 +219,18 @@
   }
   function authModal(mode = "login") {
     const register = mode === "register";
-    modal(register ? "Create your account." : "Welcome back.", register ? "Your account follows you on this server." : "Sign in to your Orbit account.", `<div class="auth-tabs"><button id="toLogin" class="${register ? "" : "active"}">Sign in</button><button id="toRegister" class="${register ? "active" : ""}">Create account</button></div><form id="authForm">${register ? `<label>Display name<input id="authName" required minlength="2" maxlength="32" autocomplete="nickname"></label>` : ""}<label>Email<input id="authEmail" type="email" required autocomplete="email"></label><label>Password<input id="authPassword" type="password" required minlength="${register ? "8" : "1"}" maxlength="128" autocomplete="${register ? "new-password" : "current-password"}"></label><button class="submit-button">${register ? "Create account" : "Sign in"}</button></form>${state.profile ? `<button id="logout" class="subtle-button">Sign out</button>` : ""}<button id="guestMode" class="subtle-button">Continue as ${esc(state.guest.name)}</button>`);
+    modal(register ? "Create your account." : "Welcome back.", register ? "Your account follows you on this server." : "Sign in to your Orbit account.", `<div class="auth-tabs"><button id="toLogin" class="${register ? "" : "active"}">Sign in</button><button id="toRegister" class="${register ? "active" : ""}">Create account</button></div><form id="authForm">${register ? `<label>Display name<input id="authName" required minlength="2" maxlength="32" autocomplete="nickname"></label>` : ""}<label>Email<input id="authEmail" type="email" required autocomplete="email" autocapitalize="none" spellcheck="false"></label><label>Password<input id="authPassword" type="password" required minlength="${register ? "8" : "1"}" maxlength="128" autocomplete="${register ? "new-password" : "current-password"}"></label><p id="authError" class="auth-error" role="alert"></p><button class="submit-button">${register ? "Create account" : "Sign in"}</button></form>${state.profile ? `<button id="logout" class="subtle-button">Sign out</button>` : ""}<button id="guestMode" class="subtle-button">Continue as ${esc(state.guest.name)}</button>`);
     $("#toLogin").onclick = () => authModal("login"); $("#toRegister").onclick = () => authModal("register");
     $("#authForm").onsubmit = async e => {
-      e.preventDefault(); const button = e.currentTarget.querySelector("button"); button.disabled = true;
+      e.preventDefault(); const button = e.currentTarget.querySelector(".submit-button"); button.disabled = true; button.textContent = register ? "Creating account…" : "Signing in…";
       try {
         const endpoint = register ? "/api/register" : "/api/login";
         const result = await api(endpoint, { method: "POST", body: JSON.stringify({ name: register ? $("#authName").value.trim() : undefined, email: $("#authEmail").value.trim(), password: $("#authPassword").value, guestId: state.guest.id }) });
         state.profile = result.user; closeModal(); connectLive(); updateIdentity(); toast(`Welcome, ${result.user.name}.`);
-      } catch (error) { toast(error.message); button.disabled = false; }
+      } catch (error) { $("#authError").textContent = error.message; button.disabled = false; button.textContent = register ? "Create account" : "Sign in"; }
     };
     $("#guestMode").onclick = () => { state.profile = null; updateIdentity(); closeModal(); };
-    if ($("#logout")) $("#logout").onclick = async () => { await api("/api/logout", { method: "POST", body: "{}" }); state.profile = null; connectLive(); updateIdentity(); closeModal(); };
+    if ($("#logout")) $("#logout").onclick = async () => { const button = $("#logout"); button.disabled = true; try { await api("/api/logout", { method: "POST", body: "{}" }); state.profile = null; connectLive(); updateIdentity(); closeModal(); } catch (error) { toast(error.message); button.disabled = false; } };
   }
   function updateIdentity() { $("#identityHint").textContent = state.profile ? `Signed in as ${state.profile.name}. Say something kind.` : `Chatting as ${state.guest.name}. Your name is saved in this browser.`; $("#profileButton").textContent = state.profile ? state.profile.name[0].toUpperCase() : "G"; $("#topProfile").innerHTML = state.profile ? esc(state.profile.name[0].toUpperCase()) : '<svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.5"/><path d="M4.5 20a7.5 7.5 0 0 1 15 0"/></svg>'; }
   function renderMusic() {
