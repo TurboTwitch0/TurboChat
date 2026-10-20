@@ -136,7 +136,7 @@
       if (Date.now() - lastHeartbeat > 10000) { await api("/api/presence", { method: "POST", body: JSON.stringify({ guestId: state.guest.id, guestName: name() }) }); lastHeartbeat = Date.now(); }
       const result = await api(`/api/updates?after=${lastEventSeq}&guestId=${encodeURIComponent(state.guest.id)}&peerId=${encodeURIComponent(state.peerId)}`);
       for (const event of result.events || []) receiveLiveEvent(event);
-      if (state.voiceRoom && Date.now() - lastVoiceHeartbeat > 12000) {
+      if (state.voiceRoom && Date.now() - lastVoiceHeartbeat > 5000) {
         const voice = await api("/api/voice/join", { method: "POST", body: JSON.stringify({ room: state.voiceRoom, peerId: state.peerId, guestId: state.guest.id, guestName: name() }) });
         lastVoiceHeartbeat = Date.now(); state.voiceMembers = voice.participants || []; renderVoice();
         await connectToVoiceMembers(state.voiceMembers);
@@ -372,7 +372,9 @@
   }
   function dropVoicePeer(peerId) {
     voicePeers.get(peerId)?.close(); voicePeers.delete(peerId); pendingIce.delete(peerId); voiceSignalQueues.delete(peerId);
-    blockedVoicePeers.set(peerId, Date.now() + 35000);
+    // A 409 can also mean the other join was lost in a concurrent Blobs write.
+    // Retry after the next heartbeat instead of suppressing the peer for a long time.
+    blockedVoicePeers.set(peerId, Date.now() + 4500);
     state.voiceMembers = state.voiceMembers.filter(item => item.peerId !== peerId);
     document.querySelector(`[data-peer-audio="${CSS.escape(peerId)}"]`)?.remove(); renderVoice();
   }
