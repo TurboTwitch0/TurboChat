@@ -146,10 +146,15 @@ export default async function handler(request) {
       const room = validId(data.room), peerId = validId(data.peerId);
       if (!who || !room || !peerId) return reply(400, { error: "Reconnect to chat before joining voice." });
       if (!canSee(room)) return reply(403, { error: "Join this party before entering voice." });
-      const peer = { peerId, room, who, name: user?.name || clean(data.guestName, 32) || "Guest", muted: false, deafened: false, seenAt: Date.now() };
+      const previous = db.voicePeers[peerId];
+      const sameSession = previous?.who === who && previous?.room === room;
+      const peer = { peerId, room, who, name: user?.name || clean(data.guestName, 32) || "Guest", muted: sameSession && previous.muted, deafened: sameSession && previous.deafened, seenAt: Date.now() };
       db.voicePeers[peerId] = peer;
       const participants = Object.values(db.voicePeers).filter(item => item.room === room).map(({ peerId, name, muted, deafened }) => ({ peerId, name, muted, deafened }));
-      pushEvent(db, { type: "voice", room, participants }); await save(); return reply(200, { participants });
+      // A join also acts as a heartbeat. Only announce a roster change so this
+      // repair path does not flood the shared event log while people are talking.
+      if (!previous || previous.room !== room || previous.name !== peer.name) pushEvent(db, { type: "voice", room, participants });
+      await save(); return reply(200, { participants });
     }
     if (path === "/api/voice/leave" && method === "POST") {
       const peerId = validId(data.peerId), peer = db.voicePeers[peerId];

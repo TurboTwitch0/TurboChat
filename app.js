@@ -23,10 +23,11 @@
     lounge: ["The Slow Lounge", "A softer room for slower conversations.", "☾", "Take a breath. What’s one good thing from today?"]
   };
   const state = { guest, profile: null, active: saved.active || "global", rooms: [], parties: [], messages: {}, music: null, members: [], registered: 1428, goal: 1500, followingRooms: Array.isArray(saved.followingRooms) ? saved.followingRooms : [], connected: false, stream: null, peerId: crypto.randomUUID(), voiceRoom: "", joiningVoice: false, voiceMembers: [], muted: false, deafened: false, voiceError: "", voiceMobileOpen: false };
-  let mic = null, audioContext = null, micSource = null, micProcessor = null, relaySocket = null, outputGain = null, outputSchedule = new Map(), toastTimer, reconnectTimer, typingTimer, typingStopTimer, pollTimer, lastEventSeq = 0, lastHeartbeat = 0, lastMessageSync = 0, localTyping = false, polling = false;
+  let mic = null, audioContext = null, micSource = null, micProcessor = null, relaySocket = null, outputGain = null, outputSchedule = new Map(), toastTimer, reconnectTimer, typingTimer, typingStopTimer, pollTimer, lastEventSeq = 0, lastHeartbeat = 0, lastMessageSync = 0, lastVoiceHeartbeat = 0, localTyping = false, polling = false;
   const typingPeers = new Map();
   const voicePeers = new Map();
   const pendingIce = new Map();
+  const voiceSignalQueues = new Map();
   const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const name = () => state.profile?.name || state.guest.name;
   const save = () => localStorage.setItem(storageKey, JSON.stringify({ guest: state.guest, active: state.active, followingRooms: state.followingRooms }));
@@ -116,7 +117,10 @@
       if (data.type === "presence") { state.members = data.members || []; state.registered = Number(data.registeredCount) || 1428; renderMembers(); }
       if (data.type === "room" && data.room?.type !== "party" && !state.rooms.some(r => r.id === data.room.id)) { state.rooms.unshift(data.room); renderRoomList(); }
       if (data.type === "music") { state.music = data.track; renderMusic(); }
-      if (data.type === "voice" && data.room === (state.voiceRoom || state.joiningVoice)) { state.voiceMembers = data.participants || []; renderVoice(); }
+      if (data.type === "voice" && data.room === (state.voiceRoom || state.joiningVoice)) {
+        state.voiceMembers = data.participants || []; renderVoice();
+        if (state.voiceRoom) connectToVoiceMembers(state.voiceMembers).catch(error => { state.voiceError = error.message; renderVoice(); });
+      }
       if (data.type === "signal" && data.room === state.voiceRoom && data.to === state.peerId) handleVoiceSignal(data).catch(error => { state.voiceError = error.message; renderVoice(); });
   }
   async function pollUpdates() {
@@ -125,6 +129,11 @@
       if (Date.now() - lastHeartbeat > 10000) { await api("/api/presence", { method: "POST", body: JSON.stringify({ guestId: state.guest.id, guestName: name() }) }); lastHeartbeat = Date.now(); }
       const result = await api(`/api/updates?after=${lastEventSeq}&guestId=${encodeURIComponent(state.guest.id)}&peerId=${encodeURIComponent(state.peerId)}`);
       for (const event of result.events || []) receiveLiveEvent(event);
+      if (state.voiceRoom && Date.now() - lastVoiceHeartbeat > 12000) {
+        const voice = await api("/api/voice/join", { method: "POST", body: JSON.stringify({ room: state.voiceRoom, peerId: state.peerId, guestId: state.guest.id, guestName: name() }) });
+        lastVoiceHeartbeat = Date.now(); state.voiceMembers = voice.participants || []; renderVoice();
+        await connectToVoiceMembers(state.voiceMembers);
+      }
       const presenceChanged = JSON.stringify(state.members) !== JSON.stringify(result.members || []);
       state.members = result.members || []; state.registered = Number(result.registeredCount) || state.registered; if (presenceChanged) renderMembers();
       if (Date.now() - lastMessageSync > 4500) {
@@ -309,10 +318,10 @@
   async function leaveVoice(silent = false) {
     const previous = state.voiceRoom || state.joiningVoice;
     if (state.voiceRoom) api("/api/voice/leave", { method: "POST", body: JSON.stringify({ room: state.voiceRoom, peerId: state.peerId, guestId: state.guest.id }) }).catch(() => {});
-    for (const pc of voicePeers.values()) pc.close(); voicePeers.clear(); pendingIce.clear(); $("#remoteAudio").replaceChildren();
+    for (const pc of voicePeers.values()) pc.close(); voicePeers.clear(); pendingIce.clear(); voiceSignalQueues.clear(); $("#remoteAudio").replaceChildren();
     const socket = relaySocket; relaySocket = null; socket?.close(); micProcessor?.disconnect(); micSource?.disconnect(); outputGain?.disconnect(); micProcessor = null; micSource = null; outputGain = null;
     mic?.getTracks().forEach(track => track.stop()); mic = null; if (audioContext) await audioContext.close().catch(() => {}); audioContext = null; outputSchedule.clear();
-    state.voiceRoom = ""; state.joiningVoice = false; state.voiceMembers = []; state.muted = false; state.deafened = false; state.voiceError = ""; renderVoice(); if (!silent && previous) toast("You left voice.");
+    state.voiceRoom = ""; state.joiningVoice = false; state.voiceMembers = []; state.muted = false; state.deafened = false; state.voiceError = ""; lastVoiceHeartbeat = 0; renderVoice(); if (!silent && previous) toast("You left voice.");
   }
   async function setVoiceDevice() {
     mic?.getAudioTracks().forEach(track => track.enabled = !state.muted && !state.deafened); if (outputGain) outputGain.gain.value = state.deafened ? 0 : 1; $("#remoteAudio").querySelectorAll("audio").forEach(audio => audio.muted = state.deafened); renderVoice();
@@ -320,17 +329,47 @@
     try { await api("/api/voice/state", { method: "POST", body: JSON.stringify({ room: state.voiceRoom, peerId: state.peerId, muted: state.muted, deafened: state.deafened, guestId: state.guest.id }) }); } catch (error) { toast(error.message); }
   }
   async function sendVoiceSignal(targetId, signal) {
-    await api("/api/voice/signal", { method: "POST", body: JSON.stringify({ room: state.voiceRoom, peerId: state.peerId, targetId, signal, guestId: state.guest.id }) });
+    const previous = voiceSignalQueues.get(targetId) || Promise.resolve();
+    const next = previous.catch(() => {}).then(() => api("/api/voice/signal", { method: "POST", body: JSON.stringify({ room: state.voiceRoom, peerId: state.peerId, targetId, signal, guestId: state.guest.id }) }));
+    voiceSignalQueues.set(targetId, next);
+    try { await next; } finally { if (voiceSignalQueues.get(targetId) === next) voiceSignalQueues.delete(targetId); }
+  }
+  function waitForIceGathering(pc) {
+    if (pc.iceGatheringState === "complete") return Promise.resolve();
+    return new Promise(resolve => {
+      const timeout = setTimeout(finish, 6000);
+      function finish() { clearTimeout(timeout); pc.removeEventListener("icegatheringstatechange", onState); resolve(); }
+      function onState() { if (pc.iceGatheringState === "complete") finish(); }
+      pc.addEventListener("icegatheringstatechange", onState);
+    });
+  }
+  async function connectToVoiceMembers(participants) {
+    const activePeers = new Set((participants || []).map(item => item.peerId));
+    for (const [peerId, pc] of voicePeers) if (!activePeers.has(peerId)) {
+      pc.close(); voicePeers.delete(peerId); pendingIce.delete(peerId);
+      document.querySelector(`[data-peer-audio="${CSS.escape(peerId)}"]`)?.remove();
+    }
+    for (const participant of participants || []) {
+      if (participant.peerId === state.peerId) continue;
+      // One side creates the offer, even when both users join at nearly the same time.
+      await connectVoicePeer(participant.peerId, state.peerId > participant.peerId);
+    }
   }
   async function connectVoicePeer(peerId, offerer) {
     if (voicePeers.has(peerId) || !mic) return voicePeers.get(peerId);
-    const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun.cloudflare.com:3478" }] });
+    const pc = new RTCPeerConnection({ iceServers: [
+      { urls: "stun:stun.l.google.com:19302" },
+      { urls: "stun:stun.cloudflare.com:3478" },
+      { urls: "stun:stun.cloudflare.com:53" }
+    ] });
     voicePeers.set(peerId, pc);
     for (const track of mic.getTracks()) pc.addTrack(track, mic);
-    pc.onicecandidate = event => { if (event.candidate && state.voiceRoom) sendVoiceSignal(peerId, { candidate: event.candidate }).catch(() => {}); };
     pc.ontrack = event => { let audio = document.querySelector(`[data-peer-audio="${CSS.escape(peerId)}"]`); if (!audio) { audio = document.createElement("audio"); audio.autoplay = true; audio.playsInline = true; audio.dataset.peerAudio = peerId; audio.muted = state.deafened; $("#remoteAudio").append(audio); } audio.srcObject = event.streams[0] || new MediaStream([event.track]); audio.play().catch(() => { state.voiceError = "Voice connected. Tap the page once to enable audio playback."; renderVoice(); }); };
     pc.onconnectionstatechange = () => { if (["failed", "disconnected"].includes(pc.connectionState)) { state.voiceError = "A peer voice connection was interrupted. Rejoin the voice room."; renderVoice(); } };
-    if (offerer) { const offer = await pc.createOffer(); await pc.setLocalDescription(offer); await sendVoiceSignal(peerId, { description: pc.localDescription }); }
+    if (offerer) {
+      const offer = await pc.createOffer(); await pc.setLocalDescription(offer); await waitForIceGathering(pc);
+      await sendVoiceSignal(peerId, { description: pc.localDescription });
+    }
     return pc;
   }
   async function handleVoiceSignal(event) {
@@ -339,7 +378,10 @@
     if (!pc) return;
     if (signal.description) {
       await pc.setRemoteDescription(signal.description);
-      if (signal.description.type === "offer") { const answer = await pc.createAnswer(); await pc.setLocalDescription(answer); await sendVoiceSignal(event.from, { description: pc.localDescription }); }
+      if (signal.description.type === "offer") {
+        const answer = await pc.createAnswer(); await pc.setLocalDescription(answer); await waitForIceGathering(pc);
+        await sendVoiceSignal(event.from, { description: pc.localDescription });
+      }
       const queued = pendingIce.get(event.from) || []; pendingIce.delete(event.from); for (const candidate of queued) await pc.addIceCandidate(candidate);
     }
     if (signal.candidate) { if (pc.remoteDescription) await pc.addIceCandidate(signal.candidate); else { const queued = pendingIce.get(event.from) || []; queued.push(signal.candidate); pendingIce.set(event.from, queued); } }
@@ -347,12 +389,12 @@
   async function joinVoiceWebRTC() {
     if (state.voiceRoom) return leaveVoice(); if (!state.connected) return toast("Wait for chat to reconnect before joining voice.");
     if (!navigator.mediaDevices?.getUserMedia || !window.RTCPeerConnection) return toast("This browser does not support secure WebRTC voice.");
-    state.joiningVoice = true; state.voiceError = ""; renderVoice();
+    state.joiningVoice = state.active; state.voiceError = ""; renderVoice();
     try {
       mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
       const result = await api("/api/voice/join", { method: "POST", body: JSON.stringify({ room: state.active, peerId: state.peerId, guestId: state.guest.id, guestName: name() }) });
       state.voiceRoom = state.active; state.joiningVoice = false; state.voiceMembers = result.participants || []; renderVoice();
-      for (const participant of state.voiceMembers) if (participant.peerId !== state.peerId) await connectVoicePeer(participant.peerId, true);
+      lastVoiceHeartbeat = Date.now(); await connectToVoiceMembers(state.voiceMembers);
     } catch (error) { state.joiningVoice = false; mic?.getTracks().forEach(track => track.stop()); mic = null; for (const pc of voicePeers.values()) pc.close(); voicePeers.clear(); state.voiceError = error.message; renderVoice(); toast(error.message); }
   }
   function showRules() { modal("A small promise to each other.", "Orbit works best when everyone gets to be a person here.", `<ul class="rules"><li>Be curious before you judge. People arrive with different stories.</li><li>Make room for quieter voices. A thoughtful reply goes a long way.</li><li>Keep personal information personal. Share only what feels right to you.</li><li>If someone asks you to stop, let the conversation breathe.</li></ul>`); }
