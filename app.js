@@ -325,7 +325,7 @@
   async function leaveVoice(silent = false) {
     const previous = state.voiceRoom || state.joiningVoice;
     if (state.voiceRoom) api("/api/voice/leave", { method: "POST", body: JSON.stringify({ room: state.voiceRoom, peerId: state.peerId, guestId: state.guest.id }) }).catch(() => {});
-    for (const pc of voicePeers.values()) pc.close(); voicePeers.clear(); pendingIce.clear(); voiceSignalQueues.clear(); blockedVoicePeers.clear(); $("#remoteAudio").replaceChildren();
+    for (const pc of voicePeers.values()) { clearTimeout(pc.__orbitOfferRetry); pc.close(); } voicePeers.clear(); pendingIce.clear(); voiceSignalQueues.clear(); blockedVoicePeers.clear(); $("#remoteAudio").replaceChildren();
     const socket = relaySocket; relaySocket = null; socket?.close(); micProcessor?.disconnect(); micSource?.disconnect(); outputGain?.disconnect(); micProcessor = null; micSource = null; outputGain = null;
     mic?.getTracks().forEach(track => track.stop()); mic = null; if (audioContext) await audioContext.close().catch(() => {}); audioContext = null; outputSchedule.clear();
     state.voiceRoom = ""; state.joiningVoice = false; state.voiceMembers = []; state.muted = false; state.deafened = false; state.voiceError = ""; lastVoiceHeartbeat = 0; renderVoice(); if (!silent && previous) toast("You left voice.");
@@ -356,7 +356,7 @@
     const liveParticipants = (participants || []).filter(item => !blockedVoicePeers.has(item.peerId));
     const activePeers = new Set(liveParticipants.map(item => item.peerId));
     for (const [peerId, pc] of voicePeers) if (!activePeers.has(peerId)) {
-      pc.close(); voicePeers.delete(peerId); pendingIce.delete(peerId);
+      clearTimeout(pc.__orbitOfferRetry); pc.close(); voicePeers.delete(peerId); pendingIce.delete(peerId);
       document.querySelector(`[data-peer-audio="${CSS.escape(peerId)}"]`)?.remove();
     }
     state.voiceMembers = liveParticipants; renderVoice();
@@ -371,7 +371,8 @@
     }
   }
   function dropVoicePeer(peerId) {
-    voicePeers.get(peerId)?.close(); voicePeers.delete(peerId); pendingIce.delete(peerId); voiceSignalQueues.delete(peerId);
+    const pc = voicePeers.get(peerId); if (pc) { clearTimeout(pc.__orbitOfferRetry); pc.close(); }
+    voicePeers.delete(peerId); pendingIce.delete(peerId); voiceSignalQueues.delete(peerId);
     // A 409 can also mean the other join was lost in a concurrent Blobs write.
     // Retry after the next heartbeat instead of suppressing the peer for a long time.
     blockedVoicePeers.set(peerId, Date.now() + 4500);
@@ -388,18 +389,38 @@
     voicePeers.set(peerId, pc);
     for (const track of mic.getTracks()) pc.addTrack(track, mic);
     pc.ontrack = event => { let audio = document.querySelector(`[data-peer-audio="${CSS.escape(peerId)}"]`); if (!audio) { audio = document.createElement("audio"); audio.autoplay = true; audio.playsInline = true; audio.dataset.peerAudio = peerId; audio.muted = state.deafened; $("#remoteAudio").append(audio); } audio.srcObject = event.streams[0] || new MediaStream([event.track]); audio.play().catch(() => { state.voiceError = "Voice connected. Tap the page once to enable audio playback."; renderVoice(); }); };
-    pc.onconnectionstatechange = () => { if (["failed", "disconnected"].includes(pc.connectionState)) { state.voiceError = "A peer voice connection was interrupted. Rejoin the voice room."; renderVoice(); } };
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === "connected") clearTimeout(pc.__orbitOfferRetry);
+      if (["failed", "disconnected"].includes(pc.connectionState)) { state.voiceError = "A peer voice connection was interrupted. Rejoin the voice room."; renderVoice(); }
+    };
     if (offerer) {
       const offer = await pc.createOffer(); await pc.setLocalDescription(offer); await waitForIceGathering(pc);
-      await sendVoiceSignal(peerId, { description: pc.localDescription });
+      const description = pc.localDescription;
+      try { await sendVoiceSignal(peerId, { description }); }
+      catch (error) { if (error.status !== 409) throw error; }
+      scheduleVoiceOfferRetry(peerId, pc, description);
     }
     return pc;
+  }
+  function scheduleVoiceOfferRetry(peerId, pc, description, attempt = 0) {
+    clearTimeout(pc.__orbitOfferRetry);
+    if (attempt >= 8 || pc.remoteDescription || pc.signalingState === "closed") return;
+    pc.__orbitOfferRetry = setTimeout(async () => {
+      if (!state.voiceRoom || voicePeers.get(peerId) !== pc || pc.remoteDescription || pc.signalingState === "closed") return;
+      try { await sendVoiceSignal(peerId, { description }); }
+      catch (error) { if (error.status !== 409) { state.voiceError = error.message; renderVoice(); } }
+      scheduleVoiceOfferRetry(peerId, pc, description, attempt + 1);
+    }, 2200);
   }
   async function handleVoiceSignal(event) {
     const signal = event.signal || {}; let pc = voicePeers.get(event.from);
     if (!pc && signal.description?.type === "offer") pc = await connectVoicePeer(event.from, false);
     if (!pc) return;
     if (signal.description) {
+      if (signal.description.type === "offer" && pc.remoteDescription?.sdp === signal.description.sdp && pc.localDescription?.type === "answer") {
+        await sendVoiceSignal(event.from, { description: pc.localDescription }); return;
+      }
+      if (signal.description.type === "answer") clearTimeout(pc.__orbitOfferRetry);
       await pc.setRemoteDescription(signal.description);
       if (signal.description.type === "offer") {
         const answer = await pc.createAnswer(); await pc.setLocalDescription(answer); await waitForIceGathering(pc);
