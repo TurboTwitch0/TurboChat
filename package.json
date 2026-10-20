@@ -1,0 +1,16 @@
+{
+  "name": "orbit-chat",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A real-time global chat with rooms, parties, music, and voice",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node server.js",
+    "start:cloud": "bash scripts/ensure-running.sh",
+    "music:generate": "node scripts/generate-originals.js",
+    "build": "node scripts/build-netlify.js"
+  },
+  "dependencies": {
+    "@netlify/blobs": "^8.2.0"
+  }
+}

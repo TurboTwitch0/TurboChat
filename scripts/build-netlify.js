@@ -1,0 +1,10 @@
+"use strict";
+const fs = require("node:fs");
+const path = require("node:path");
+const root = path.resolve(__dirname, "..");
+const publish = path.join(root, "dist");
+fs.rmSync(publish, { recursive: true, force: true });
+fs.mkdirSync(publish, { recursive: true });
+for (const file of ["index.html", "app.js", "styles.css"]) fs.copyFileSync(path.join(root, file), path.join(publish, file));
+fs.cpSync(path.join(root, "media"), path.join(publish, "media"), { recursive: true });
+console.log("Netlify static site built in dist/.");
