@@ -22,7 +22,7 @@
     makers: ["The Makers Table", "A friendly corner for things in progress.", "✳", "Show us what you’re making, learning, or figuring out."],
     lounge: ["The Slow Lounge", "A softer room for slower conversations.", "☾", "Take a breath. What’s one good thing from today?"]
   };
-  const state = { guest, profile: null, active: saved.active || "global", rooms: [], parties: [], messages: {}, music: null, members: [], registered: 1428, goal: 1500, followingRooms: Array.isArray(saved.followingRooms) ? saved.followingRooms : [], connected: false, stream: null, peerId: crypto.randomUUID(), voiceRoom: "", joiningVoice: false, voiceMembers: [], muted: false, deafened: false, voiceError: "", voiceMobileOpen: false };
+  const state = { guest, profile: null, active: saved.active || "global", rooms: [], parties: [], servers: [], messages: {}, music: null, members: [], registered: 1428, goal: 1500, followingRooms: Array.isArray(saved.followingRooms) ? saved.followingRooms : [], connected: false, stream: null, peerId: crypto.randomUUID(), voiceRoom: "", joiningVoice: false, voiceMembers: [], muted: false, deafened: false, voiceError: "", voiceMobileOpen: false };
   let mic = null, audioContext = null, micSource = null, micProcessor = null, relaySocket = null, outputGain = null, outputSchedule = new Map(), toastTimer, reconnectTimer, typingTimer, typingStopTimer, pollTimer, lastEventSeq = 0, lastHeartbeat = 0, lastMessageSync = 0, lastVoiceHeartbeat = 0, localTyping = false, polling = false;
   const typingPeers = new Map();
   const voicePeers = new Map();
@@ -39,7 +39,7 @@
     if (!response.ok) { const error = new Error(data.error || `Request failed (${response.status}).`); error.status = response.status; throw error; }
     return data;
   }
-  function allRooms() { return [...defaultRooms, ...state.rooms, ...state.parties]; }
+  function allRooms() { return [...defaultRooms, ...state.rooms, ...state.parties, ...state.servers.flatMap(server => server.channels.map(channel => ({ ...channel, serverId: server.id, serverName: server.name, emoji: channel.type === "voice" ? "◖" : "#", topic: server.description || `A channel in ${server.name}.` })))]; }
   function room(id) { return allRooms().find(x => x.id === id) || { id, name: "Party", emoji: "✦", topic: "A private room for good people." }; }
   function setConnected(value, label) {
     state.connected = value; $("#connectionLabel").textContent = label || (value ? "Connected" : "Reconnecting…");
@@ -52,13 +52,15 @@
     $("#mobileRoomNav").innerHTML = rooms.map(item => `<button class="mobile-room-chip ${state.active === item.id ? "selected" : ""}" data-channel="${esc(item.id)}" title="${esc(item.name)}"><span>${esc(item.emoji || "✦")}</span>${esc(item.name)}${state.followingRooms.includes(item.id) ? `<i aria-label="Following">★</i>` : ""}</button>`).join("");
     const followed = rooms.filter(item => state.followingRooms.includes(item.id));
     $("#followingSection").classList.toggle("hidden", followed.length === 0);
-    $("#followingList").innerHTML = followed.map(row).join(""); renderVoiceRooms();
+    $("#followingList").innerHTML = followed.map(row).join("");
+    $("#serverList").innerHTML = state.servers.map(server => { const isOwner = server.ownerId === state.profile?.id || server.ownerId === `guest-${state.guest.id}`; return `<section class="server-group"><div class="server-heading"><span>${esc(server.emoji || "✳")} ${esc(server.name)}</span><div><button data-server-invite="${esc(server.id)}" title="Invite to ${esc(server.name)}">↗</button>${isOwner ? `<button data-add-channel="${esc(server.id)}" title="Add channel">＋</button>` : ""}</div></div>${(server.channels || []).map(channel => `<button class="space-row server-channel ${state.active === channel.id ? "selected" : ""}" data-channel="${esc(channel.id)}"><span class="channel-type-icon">${channel.type === "voice" ? "◖" : "#"}</span><b>${esc(channel.name)}</b></button>`).join("")}</section>`; }).join("") || `<div class="server-empty">Make a server to gather your people and add text or voice channels.</div>`;
+    renderVoiceRooms();
   }
   function renderMembers(filter = $("#memberSearch").value.toLowerCase()) {
     const members = state.members.filter(item => item.name.toLowerCase().includes(filter));
     $("#onlineCount").textContent = state.members.length; $("#activeMemberCount").textContent = members.length; $("#registeredCount").textContent = state.registered.toLocaleString(); $("#goalCount").textContent = state.registered.toLocaleString();
     $("#goalFill").style.width = `${Math.min(100, state.registered / state.goal * 100)}%`;
-    const row = item => `<div class="member-row"><span class="avatar">${esc(item.emoji || "✦")}</span><span><b>${esc(item.name)}${item.id === `guest-${state.guest.id}` ? " <small>(you)</small>" : ""}</b><small>${item.registered ? "Registered member" : "Guest"}</small></span><i></i></div>`;
+    const row = item => `<div class="member-row"><span class="avatar">${esc(item.emoji || "✦")}</span><span><b>${esc(item.name)}${item.id === `guest-${state.guest.id}` ? " <small>(you)</small>" : ""}</b><small>${esc(item.about || (item.registered ? "Registered member" : "Guest"))}</small></span><i class="${esc(item.status || "online")}" title="${esc(item.status || "online")}"></i></div>`;
     $("#memberList").innerHTML = members.length ? members.map(row).join("") : `<div class="empty-state">${state.connected ? "You're here first. Say hello." : "Connecting to the chat…"}</div>`;
     $("#peopleList").innerHTML = members.length ? members.map(item => `<div class="person-card"><span class="avatar">${esc(item.emoji || "✦")}</span><b>${esc(item.name)}</b><small>${item.registered ? "Member" : "Guest"}</small></div>`).join("") : `<div class="empty-state">Invite someone to join you.</div>`;
   }
@@ -112,7 +114,7 @@
       state.active = "global"; save(); toast("That saved room is no longer available. You’re back in World chat.");
       data = await api(`/api/bootstrap?channel=global&guestId=${encodeURIComponent(state.guest.id)}`);
     }
-    state.rooms = data.rooms || []; state.parties = data.parties || []; mergeMessages(state.active, data.messages || []); state.members = data.members || []; state.registered = Number(data.registeredCount) || 1428; state.goal = Number(data.memberGoal) || 1500; state.music = data.music || null; renderRoomList(); renderMessages(); renderMembers(); renderMusic();
+    state.rooms = data.rooms || []; state.parties = data.parties || []; state.servers = [...new Map((data.servers || []).map(server => [server.id, server])).values()]; mergeMessages(state.active, data.messages || []); state.members = data.members || []; state.registered = Number(data.registeredCount) || 1428; state.goal = Number(data.memberGoal) || 1500; state.music = data.music || null; renderRoomList(); renderMessages(); renderMembers(); renderMusic();
   }
   function connectLive() {
     state.stream?.close();
@@ -130,6 +132,7 @@
       if (data.type === "reaction") { const item = (state.messages[data.channel] || []).find(m => m.id === data.messageId); if (item) { item.reactions = data.reactions; if (state.active === data.channel) renderMessages(); } }
       if (data.type === "presence") { state.members = data.members || []; state.registered = Number(data.registeredCount) || 1428; renderMembers(); }
       if (data.type === "room" && data.room?.type !== "party" && !state.rooms.some(r => r.id === data.room.id)) { state.rooms.unshift(data.room); renderRoomList(); }
+      if (data.type === "server" && data.server) { const index = state.servers.findIndex(server => server.id === data.server.id); if (index < 0) state.servers.unshift(data.server); else state.servers[index] = data.server; renderRoomList(); }
       if (data.type === "music") { state.music = data.track; renderMusic(); }
       if (data.type === "voice" && data.room === (state.voiceRoom || state.joiningVoice)) {
         state.voiceMembers = data.participants || []; renderVoice();
@@ -177,13 +180,40 @@
   async function selectChannel(id) {
     if (!allRooms().some(item => item.id === id)) return;
     if (state.voiceRoom && state.voiceRoom !== id) await leaveVoice(true);
-    state.active = id; save(); setView("chat"); renderRoomList(); renderMessages(); await loadChannel(id);
+    state.active = id; save(); renderRoomList();
+    if (room(id).type === "voice") { $("#voiceTabRoomName").textContent = room(id).name; setView("voice"); renderVoiceRooms(); return; }
+    setView("chat"); renderMessages(); await loadChannel(id);
   }
   function modal(title, subtitle, body) { $("#modalRoot").innerHTML = `<div class="modal-backdrop"><section class="modal"><button class="modal-close" data-close>×</button><small>ORBIT</small><h2>${esc(title)}</h2><p>${esc(subtitle)}</p>${body}</section></div>`; $("[data-close]").addEventListener("click", closeModal); $(".modal-backdrop").addEventListener("click", e => { if (e.target.classList.contains("modal-backdrop")) closeModal(); }); }
   function closeModal() { $("#modalRoot").innerHTML = ""; }
   function createRoomMenu() {
     modal("Make a place for your people.", "Create an open room or a private party.", `<div class="modal-actions"><button id="makeRoom" class="modal-choice"><b>✳ Community room</b><small>Anyone can find and join.</small></button><button id="makeParty" class="modal-choice"><b>✦ Invite-only party</b><small>Only people with your invite can enter.</small></button></div>`);
     $("#makeRoom").onclick = () => roomForm(false); $("#makeParty").onclick = () => roomForm(true);
+  }
+  function createServerModal() {
+    modal("Start your server", "Gather a community around the things you love. Every server starts with a text channel and a voice lounge.", `<form id="serverForm"><label>Server name<input id="serverName" required minlength="2" maxlength="42" placeholder="The late night club"></label><label>Server icon<select id="serverEmoji"><option>✳</option><option>🎮</option><option>🎨</option><option>🎧</option><option>🌱</option><option>🚀</option><option>📚</option></select></label><label>About this server<input id="serverDescription" maxlength="120" placeholder="What brings your people together?"></label><p id="serverError" class="auth-error" role="alert"></p><button class="submit-button">Create server</button></form>`);
+    $("#serverForm").onsubmit = async event => {
+      event.preventDefault(); const button = event.currentTarget.querySelector(".submit-button"); button.disabled = true; button.textContent = "Creating…";
+      try {
+        const result = await api("/api/servers", { method: "POST", body: JSON.stringify({ name: $("#serverName").value.trim(), emoji: $("#serverEmoji").value, description: $("#serverDescription").value.trim(), guestId: state.guest.id }) });
+        state.servers = [result.server, ...state.servers.filter(server => server.id !== result.server.id)]; closeModal(); renderRoomList(); await selectChannel(result.server.channels[0].id); inviteCreated(result.server, result.inviteCode, "server");
+      } catch (error) { $("#serverError").textContent = error.message; button.disabled = false; button.textContent = "Create server"; }
+    };
+  }
+  function addServerChannelModal(serverId) {
+    const server = state.servers.find(item => item.id === serverId); if (!server) return;
+    modal(`Add a channel to ${server.name}`, "Text channels are for messages. Voice channels open the live voice room.", `<form id="serverChannelForm"><label>Channel name<input id="serverChannelName" required maxlength="40" placeholder="general-chat"></label><label>Channel type<select id="serverChannelType"><option value="text"># Text</option><option value="voice">◖ Voice</option></select></label><p id="serverChannelError" class="auth-error" role="alert"></p><button class="submit-button">Add channel</button></form>`);
+    $("#serverChannelForm").onsubmit = async event => {
+      event.preventDefault(); const button = event.currentTarget.querySelector(".submit-button"); button.disabled = true;
+      try {
+        const result = await api("/api/servers/channels", { method: "POST", body: JSON.stringify({ serverId, name: $("#serverChannelName").value.trim(), type: $("#serverChannelType").value, guestId: state.guest.id }) });
+        state.servers = state.servers.map(item => item.id === serverId ? result.server : item); closeModal(); renderRoomList(); await selectChannel(result.channel.id);
+      } catch (error) { $("#serverChannelError").textContent = error.message; button.disabled = false; }
+    };
+  }
+  async function inviteToServer(serverId) {
+    try { const result = await api("/api/servers/invite", { method: "POST", body: JSON.stringify({ id: serverId, guestId: state.guest.id }) }); const server = state.servers.find(item => item.id === serverId); inviteCreated(server, result.inviteCode, "server"); }
+    catch (error) { toast(error.message); }
   }
   function roomForm(isParty) {
     modal(isParty ? "Start a party." : "Start a community room.", "Give people a good reason to join the conversation.", `<form id="roomForm"><label>Name<input id="roomName" required minlength="2" maxlength="42" placeholder="${isParty ? "Friday night crew" : "Book lovers unite"}"></label><label>Conversation starter<input id="roomTopic" maxlength="100" placeholder="What should people talk about?"></label><button class="submit-button">Create ${isParty ? "party" : "room"} →</button></form>`);
@@ -198,9 +228,9 @@
     };
   }
   function packInvite(data) { return btoa(unescape(encodeURIComponent(JSON.stringify(data)))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, ""); }
-  function inviteCreated(item, code) {
-    const link = `${appOrigin}${location.pathname}?invite=${packInvite({ id: item.id, inviteCode: code, name: item.name, topic: item.topic })}`;
-    modal(`Invite someone to ${item.name}.`, "Anyone with this invite can join your private party.", `<div class="invite-box"><input id="inviteLink" readonly value="${esc(link)}"><button id="copyInvite" class="submit-button">Copy invite</button></div><button id="doneInvite" class="subtle-button">Done</button>`);
+  function inviteCreated(item, code, kind = "party") {
+    const link = `${appOrigin}${location.pathname}?invite=${packInvite({ kind, id: item.id, inviteCode: code, name: item.name, topic: item.topic })}`;
+    modal(`Invite someone to ${item.name}.`, kind === "server" ? "Anyone with this link can join your server." : "Anyone with this invite can join your private party.", `<div class="invite-box"><input id="inviteLink" readonly value="${esc(link)}"><button id="copyInvite" class="submit-button">Copy invite</button></div><button id="doneInvite" class="subtle-button">Done</button>`);
     $("#copyInvite").onclick = async () => { try { await navigator.clipboard.writeText(link); toast("Invite copied."); } catch { $("#inviteLink").select(); document.execCommand("copy"); toast("Invite copied."); } };
     $("#doneInvite").onclick = closeModal;
   }
@@ -208,8 +238,14 @@
     const encoded = new URLSearchParams(location.search).get("invite"); if (!encoded) return;
     try {
       const data = JSON.parse(decodeURIComponent(escape(atob(encoded.replace(/-/g, "+").replace(/_/g, "/")))));
-      const result = await api("/api/parties/join", { method: "POST", body: JSON.stringify({ id: data.id, inviteCode: data.inviteCode, guestId: state.guest.id }) });
-      state.parties = (state.parties || []).filter(item => item.id !== result.room.id); state.parties.unshift(result.room); state.active = result.room.id; save(); history.replaceState({}, "", location.pathname); toast(`You joined ${result.room.name}.`);
+      if (data.kind === "server") {
+        const result = await api("/api/servers/join", { method: "POST", body: JSON.stringify({ id: data.id, inviteCode: data.inviteCode, guestId: state.guest.id }) });
+        state.servers = state.servers.filter(server => server.id !== result.server.id); state.servers.unshift(result.server); state.active = result.server.channels[0].id; renderRoomList();
+      } else {
+        const result = await api("/api/parties/join", { method: "POST", body: JSON.stringify({ id: data.id, inviteCode: data.inviteCode, guestId: state.guest.id }) });
+        state.parties = (state.parties || []).filter(item => item.id !== result.room.id); state.parties.unshift(result.room); state.active = result.room.id;
+      }
+      save(); history.replaceState({}, "", location.pathname); toast(`You joined ${data.name || "the server"}.`);
     } catch (error) { history.replaceState({}, "", location.pathname); toast(error.message); }
   }
   function inviteGeneral() {
@@ -226,13 +262,28 @@
       try {
         const endpoint = register ? "/api/register" : "/api/login";
         const result = await api(endpoint, { method: "POST", body: JSON.stringify({ name: register ? $("#authName").value.trim() : undefined, email: $("#authEmail").value.trim(), password: $("#authPassword").value, guestId: state.guest.id }) });
-        state.profile = result.user; closeModal(); connectLive(); updateIdentity(); toast(`Welcome, ${result.user.name}.`);
+        const session = await api("/api/me");
+        if (!session.user || session.user.id !== result.user?.id) throw new Error("Your account was accepted, but this browser did not receive its sign-in session. Check cookies for this site and try again.");
+        state.profile = session.user; closeModal(); connectLive(); updateIdentity(); toast(`Welcome, ${session.user.name}.`);
       } catch (error) { $("#authError").textContent = error.message; button.disabled = false; button.textContent = register ? "Create account" : "Sign in"; }
     };
     $("#guestMode").onclick = () => { state.profile = null; updateIdentity(); closeModal(); };
     if ($("#logout")) $("#logout").onclick = async () => { const button = $("#logout"); button.disabled = true; try { await api("/api/logout", { method: "POST", body: "{}" }); state.profile = null; connectLive(); updateIdentity(); closeModal(); } catch (error) { toast(error.message); button.disabled = false; } };
   }
-  function updateIdentity() { $("#identityHint").textContent = state.profile ? `Signed in as ${state.profile.name}. Say something kind.` : `Chatting as ${state.guest.name}. Your name is saved in this browser.`; $("#profileButton").textContent = state.profile ? state.profile.name[0].toUpperCase() : "G"; $("#topProfile").innerHTML = state.profile ? esc(state.profile.name[0].toUpperCase()) : '<svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.5"/><path d="M4.5 20a7.5 7.5 0 0 1 15 0"/></svg>'; }
+  function profileModal() {
+    if (!state.profile) return authModal("login");
+    const emojis = ["✦","🌙","🌻","🦊","🐸","🐈","🎧","🚀","🌊","⭐","🍄","🪐"];
+    modal("Your profile", "Make your little corner feel like you.", `<form id="profileForm"><label>Display name<input id="profileName" required minlength="2" maxlength="32" value="${esc(state.profile.name)}" autocomplete="nickname"></label><label>Avatar<select id="profileEmoji">${emojis.map(emoji => `<option value="${emoji}" ${state.profile.emoji === emoji ? "selected" : ""}>${emoji}</option>`).join("")}</select></label><label>About me<input id="profileAbout" maxlength="100" value="${esc(state.profile.about || "")}" placeholder="A little about you"></label><label>Status<select id="profileStatus"><option value="online" ${state.profile.status !== "idle" && state.profile.status !== "dnd" ? "selected" : ""}>Online</option><option value="idle" ${state.profile.status === "idle" ? "selected" : ""}>Idle</option><option value="dnd" ${state.profile.status === "dnd" ? "selected" : ""}>Do not disturb</option></select></label><p id="profileError" class="auth-error" role="alert"></p><button class="submit-button">Save profile</button></form><button id="profileSignOut" class="subtle-button">Sign out</button>`);
+    $("#profileForm").onsubmit = async event => {
+      event.preventDefault(); const button = event.currentTarget.querySelector(".submit-button"); button.disabled = true; button.textContent = "Saving…";
+      try {
+        const result = await api("/api/profile", { method: "POST", body: JSON.stringify({ name: $("#profileName").value.trim(), emoji: $("#profileEmoji").value, about: $("#profileAbout").value.trim(), status: $("#profileStatus").value }) });
+        state.profile = result.user; closeModal(); updateIdentity(); renderMembers(); renderMessages(); connectLive(); toast("Profile saved.");
+      } catch (error) { $("#profileError").textContent = error.message; button.disabled = false; button.textContent = "Save profile"; }
+    };
+    $("#profileSignOut").onclick = async () => { try { await api("/api/logout", { method: "POST", body: "{}" }); state.profile = null; updateIdentity(); closeModal(); connectLive(); toast("Signed out."); } catch (error) { toast(error.message); } };
+  }
+  function updateIdentity() { $("#identityHint").textContent = state.profile ? `Signed in as ${state.profile.name}. Say something kind.` : `Chatting as ${state.guest.name}. Your name is saved in this browser.`; $("#profileButton").textContent = state.profile?.emoji || (state.profile ? state.profile.name[0].toUpperCase() : "G"); $("#topProfile").textContent = state.profile?.emoji || (state.profile ? state.profile.name[0].toUpperCase() : "◉"); }
   function renderMusic() {
     const builtins = [
       ["neon", "Neon Postcards", "Retro pop · 112 BPM", "neon-postcards.wav"], ["midnight", "Midnight Arcade", "Synthwave · 118 BPM", "midnight-arcade.wav"], ["dreamwave", "Dreamwave Radio", "Dream pop · 96 BPM", "dreamwave-radio.wav"], ["orbit", "Slow Orbit", "Ambient pop · 82 BPM", "slow-orbit.wav"]
@@ -262,7 +313,9 @@
   async function selectVoiceRoom(id) {
     if (!allRooms().some(item => item.id === id)) return;
     if (state.voiceRoom && state.voiceRoom !== id) await leaveVoice(true);
-    state.active = id; save(); renderMessages(); await loadChannel(id); setView("voice"); renderVoiceRooms();
+    state.active = id; save(); renderRoomList();
+    if (room(id).type === "voice") { $("#voiceTabRoomName").textContent = room(id).name; setView("voice"); renderVoiceRooms(); renderVoice(); return; }
+    setView("chat"); renderMessages(); await loadChannel(id);
   }
   function setView(view) {
     ["chat", "people", "voice"].forEach(name => $(`#${name}View`).classList.toggle("hidden", name !== view));
@@ -460,6 +513,8 @@
   }
   function bind() {
     document.addEventListener("click", event => {
+      const addChannel = event.target.closest("[data-add-channel]"); if (addChannel) addServerChannelModal(addChannel.dataset.addChannel);
+      const inviteServer = event.target.closest("[data-server-invite]"); if (inviteServer) inviteToServer(inviteServer.dataset.serverInvite);
       const channel = event.target.closest("[data-channel]"); if (channel) selectChannel(channel.dataset.channel);
       const voiceRoom = event.target.closest("[data-voice-room]"); if (voiceRoom) selectVoiceRoom(voiceRoom.dataset.voiceRoom);
       const searchRoom = event.target.closest("[data-search-room]"); if (searchRoom) { const id = searchRoom.dataset.searchRoom; closeModal(); selectChannel(id); }
@@ -467,9 +522,9 @@
       const react = event.target.closest("[data-react]"); if (react) api("/api/reactions", { method: "POST", body: JSON.stringify({ channel: state.active, messageId: react.dataset.react, emoji: react.dataset.emoji, guestId: state.guest.id, guestName: name() }) }).catch(error => toast(error.message));
       const reply = event.target.closest("[data-reply]"); if (reply) { const item = (state.messages[state.active] || [])[Number(reply.dataset.reply)]; $("#messageInput").value = `@${item?.user || "Guest"} `; $("#messageInput").focus(); }
     });
-    $("#createSpace").onclick = $("#railCreate").onclick = createRoomMenu; $("#searchOpen").onclick = search; $("#inviteButton").onclick = $("#peopleInvite").onclick = inviteGeneral;
+    $("#createSpace").onclick = createRoomMenu; $("#createServer").onclick = $("#railCreate").onclick = createServerModal; $("#searchOpen").onclick = search; $("#inviteButton").onclick = $("#peopleInvite").onclick = inviteGeneral;
     $("#followButton").onclick = toggleFollow;
-    $("#helpButton").onclick = showRules; $("#profileButton").onclick = $("#topProfile").onclick = () => authModal();
+    $("#helpButton").onclick = showRules; $("#profileButton").onclick = $("#topProfile").onclick = () => state.profile ? profileModal() : authModal();
     $("#messageForm").onsubmit = e => { e.preventDefault(); sendMessage($("#messageInput").value); };
     $("#messageInput").oninput = e => { $("#charCount").textContent = e.currentTarget.value.length; e.currentTarget.style.height = "auto"; e.currentTarget.style.height = `${Math.min(e.currentTarget.scrollHeight, 130)}px`; clearTimeout(typingStopTimer); if (e.currentTarget.value.trim()) { if (!localTyping) { clearTimeout(typingTimer); typingTimer = setTimeout(() => sendTyping(true), 180); } typingStopTimer = setTimeout(() => sendTyping(false), 1600); } else { clearTimeout(typingTimer); sendTyping(false); } };
     $("#messageInput").onkeydown = e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); clearTimeout(typingTimer); clearTimeout(typingStopTimer); sendTyping(false); sendMessage(e.currentTarget.value); } };

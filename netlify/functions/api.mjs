@@ -8,7 +8,7 @@ const goal = 1500;
 const maxEvents = 500;
 const clean = (value, size = 200) => typeof value === "string" ? value.trim().slice(0, size) : "";
 const validId = value => typeof value === "string" && /^[\w-]{1,100}$/.test(value) ? value : "";
-const publicUser = user => user ? { id: user.id, name: user.name, email: user.email, emoji: user.emoji } : null;
+const publicUser = user => user ? { id: user.id, name: user.name, email: user.email, emoji: user.emoji, about: user.about || "", status: user.status || "online" } : null;
 const safeRoom = room => { if (!room) return room; const { inviteCode, ...value } = room; return value; };
 function reply(statusCode, body, extra = {}) {
   const headers = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff", ...extra };
@@ -20,7 +20,7 @@ function parseCookie(header, key) {
 }
 function identity(data, user) { return user ? `user-${user.id}` : validId(data?.guestId) ? `guest-${validId(data.guestId)}` : ""; }
 function isMember(room, who) { return !!who && (room?.memberKeys || []).includes(who); }
-function publicMember(entry) { return { id: entry.id, name: entry.name, emoji: entry.emoji, registered: !!entry.registered }; }
+function publicMember(entry) { return { id: entry.id, name: entry.name, emoji: entry.emoji, about: entry.about || "", status: entry.status || "online", registered: !!entry.registered }; }
 function pushEvent(db, event) { db.nextEventSeq = (db.nextEventSeq || 0) + 1; db.events.push({ ...event, seq: db.nextEventSeq, at: Date.now() }); db.events = db.events.slice(-maxEvents); }
 const emailKey = email => createHash("sha256").update(email).digest("hex");
 async function readMessages(store, db, channel) {
@@ -47,8 +47,8 @@ export default async function handler(request) {
   }
   try {
     const store = getStore("orbit-chat");
-    const db = await store.get("state", { type: "json" }) || { users: [], messages: {}, rooms: [], parties: [], music: null, events: [], presence: {} };
-    db.users ||= []; db.messages ||= {}; db.rooms ||= []; db.parties ||= []; db.events ||= []; db.presence ||= {}; db.voicePeers ||= {};
+    const db = await store.get("state", { type: "json" }) || { users: [], messages: {}, rooms: [], parties: [], servers: [], music: null, events: [], presence: {} };
+    db.users ||= []; db.messages ||= {}; db.rooms ||= []; db.parties ||= []; db.servers ||= []; db.events ||= []; db.presence ||= {}; db.voicePeers ||= {};
     if (!db.eventSequenceVersion) { db.nextEventSeq = 0; for (const event of db.events) event.seq = ++db.nextEventSeq; db.eventSequenceVersion = 1; await store.setJSON("state", db); }
     const session = parseCookie(request.headers.get("cookie"), "orbit_session");
     const sessionUserId = session ? await store.get(`auth/sessions/${session}`, { type: "text" }) : null;
@@ -58,7 +58,19 @@ export default async function handler(request) {
     const setCookie = token => ({ "set-cookie": `orbit_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000; Secure` });
     const save = () => store.setJSON("state", db);
     const getParty = channel => db.parties.find(item => item.id === channel);
-    const canSee = channel => { const party = getParty(channel); return !party || isMember(party, who); };
+    const getServer = id => db.servers.find(item => item.id === id);
+    const getChannelServer = channel => db.servers.find(server => server.channels.some(item => item.id === channel));
+    const safeServer = server => server && ({ id: server.id, name: server.name, emoji: server.emoji, description: server.description, ownerId: server.ownerId, channels: server.channels });
+    const canSee = channel => { const party = getParty(channel), server = getChannelServer(channel); return party ? isMember(party, who) : !server || isMember(server, who); };
+    const migrateGuestMemberships = (guestId, userId) => {
+      const guestKey = `guest-${validId(guestId)}`;
+      if (guestKey === "guest-") return;
+      for (const group of [...db.parties, ...db.servers]) if ((group.memberKeys || []).includes(guestKey)) {
+        group.memberKeys = group.memberKeys.filter(key => key !== guestKey);
+        if (!group.memberKeys.includes(`user-${userId}`)) group.memberKeys.push(`user-${userId}`);
+        if (group.ownerId === guestKey) group.ownerId = userId;
+      }
+    };
     const online = Object.values(db.presence).filter(member => Date.now() - member.seenAt < 30000);
     db.presence = Object.fromEntries(Object.entries(db.presence).filter(([, member]) => Date.now() - member.seenAt < 30000));
     db.voicePeers = Object.fromEntries(Object.entries(db.voicePeers).filter(([, peer]) => Date.now() - peer.seenAt < 30000));
@@ -67,7 +79,7 @@ export default async function handler(request) {
     if (method === "GET" && path === "/api/me") return reply(200, { user: publicUser(user) });
     if (method === "POST" && path === "/api/presence") {
       if (!who) return reply(400, { error: "Refresh the page and try again." });
-      db.presence[who] = { id: who, name: user?.name || clean(data.guestName, 32) || "Guest", emoji: user?.emoji || "✦", registered: !!user, seenAt: Date.now() };
+      db.presence[who] = { id: who, name: user?.name || clean(data.guestName, 32) || "Guest", emoji: user?.emoji || "✦", about: user?.about || "", status: user?.status || "online", registered: !!user, seenAt: Date.now() };
       for (const peer of Object.values(db.voicePeers)) if (peer.who === who) peer.seenAt = Date.now();
       pushEvent(db, { type: "presence", members: Object.values(db.presence).map(publicMember), registeredCount: baseline + db.users.length }); await save();
       return reply(200, { ok: true });
@@ -75,7 +87,7 @@ export default async function handler(request) {
     if (method === "GET" && path === "/api/bootstrap") {
       const channel = validId(url.searchParams.get("channel")) || "global";
       if (!canSee(channel)) return reply(403, { error: "Join this party from its invite link first." });
-      return reply(200, { messages: await readMessages(store, db, channel), rooms: db.rooms, parties: db.parties.filter(room => isMember(room, who)).map(safeRoom), music: db.music, members: online.map(publicMember), registeredCount: baseline + db.users.length, memberGoal: goal });
+      return reply(200, { messages: await readMessages(store, db, channel), rooms: db.rooms, parties: db.parties.filter(room => isMember(room, who)).map(safeRoom), servers: db.servers.filter(server => isMember(server, who)).map(safeServer), music: db.music, members: online.map(publicMember), registeredCount: baseline + db.users.length, memberGoal: goal });
     }
     if (method === "GET" && path === "/api/messages") {
       const channel = validId(url.searchParams.get("channel")) || "global";
@@ -85,7 +97,7 @@ export default async function handler(request) {
     if (method === "GET" && path === "/api/updates") {
       const after = Number(url.searchParams.get("after")) || 0;
       const peerId = validId(url.searchParams.get("peerId"));
-      return reply(200, { events: db.events.filter(event => event.seq > after && (!event.channel || canSee(event.channel)) && (event.type !== "signal" || event.to === peerId)), nextSeq: db.nextEventSeq || 0, members: online.map(publicMember), registeredCount: baseline + db.users.length });
+      return reply(200, { events: db.events.filter(event => event.seq > after && (!event.channel || canSee(event.channel)) && (!event.serverId || isMember(getServer(event.serverId), who)) && (event.type !== "signal" || event.to === peerId)), nextSeq: db.nextEventSeq || 0, members: online.map(publicMember), registeredCount: baseline + db.users.length });
     }
     if (method === "POST" && path === "/api/messages") {
       const channel = validId(data.channel) || "global", content = clean(data.text, 700);
@@ -128,6 +140,35 @@ export default async function handler(request) {
       const room = { id: `${party ? "party" : "room"}-${randomUUID()}`, name, title: name, topic: clean(data.topic, 100), emoji: party ? "✦" : "✳", color: party ? "#8069bd" : "#3c998b", type: party ? "party" : "channel", owner: user?.name || clean(data.owner, 32) || "Guest", memberKeys: [who], inviteCode, createdAt: new Date().toISOString() };
       (party ? db.parties : db.rooms).unshift(room); pushEvent(db, { type: "room", room: safeRoom(room) }); await save(); return reply(201, { room: safeRoom(room), inviteCode });
     }
+    if (method === "POST" && path === "/api/servers") {
+      const serverName = clean(data.name, 42), description = clean(data.description, 120);
+      if (!who) return reply(400, { error: "Reconnect to Orbit and try again." });
+      if (serverName.length < 2) return reply(400, { error: "Server names need at least two characters." });
+      const id = `server-${randomUUID()}`, inviteCode = randomBytes(18).toString("base64url");
+      const server = { id, name: serverName, description, emoji: clean(data.emoji, 8) || "✳", ownerId: user?.id || who, memberKeys: [who], inviteCode, channels: [{ id: `channel-${randomUUID()}`, name: "general", type: "text" }, { id: `voice-${randomUUID()}`, name: "voice-lounge", type: "voice" }], createdAt: new Date().toISOString() };
+      db.servers.unshift(server); pushEvent(db, { type: "server", serverId: id, server: safeServer(server) }); await save(); return reply(201, { server: safeServer(server), inviteCode });
+    }
+    if (method === "POST" && path === "/api/servers/join") {
+      const server = getServer(validId(data.id));
+      if (!server || !who || !data.inviteCode || data.inviteCode !== server.inviteCode) return reply(404, { error: "This server invite is invalid or expired." });
+      if (!server.memberKeys.includes(who)) server.memberKeys.push(who);
+      pushEvent(db, { type: "server", serverId: server.id, server: safeServer(server) }); await save(); return reply(200, { server: safeServer(server) });
+    }
+    if (method === "POST" && path === "/api/servers/invite") {
+      const server = getServer(validId(data.id));
+      if (!server || !isMember(server, who)) return reply(403, { error: "Join that server before inviting people." });
+      server.inviteCode = randomBytes(18).toString("base64url"); await save(); return reply(200, { inviteCode: server.inviteCode });
+    }
+    if (method === "POST" && path === "/api/servers/channels") {
+      const server = getServer(validId(data.serverId)), channelName = clean(data.name, 40).toLowerCase().replace(/\s+/g, "-");
+      if (!server || !isMember(server, who)) return reply(403, { error: "Join that server before adding a channel." });
+      if (server.ownerId !== (user?.id || who)) return reply(403, { error: "Only the server owner can add channels." });
+      if (!/^[a-z0-9][a-z0-9-]{0,39}$/.test(channelName)) return reply(400, { error: "Use letters, numbers, and hyphens for the channel name." });
+      const channelType = data.type === "voice" ? "voice" : "text";
+      if (server.channels.some(item => item.name === channelName)) return reply(409, { error: "That channel name already exists." });
+      const channel = { id: `${channelType === "voice" ? "voice" : "channel"}-${randomUUID()}`, name: channelName, type: channelType };
+      server.channels.push(channel); pushEvent(db, { type: "server", serverId: server.id, server: safeServer(server) }); await save(); return reply(201, { channel, server: safeServer(server) });
+    }
     if (method === "POST" && path === "/api/parties/join") {
       const room = db.parties.find(item => item.id === validId(data.id));
       if (!room || !who || !data.inviteCode || data.inviteCode !== room.inviteCode) return reply(404, { error: "This party invite is invalid or expired." });
@@ -151,7 +192,8 @@ export default async function handler(request) {
       const indexedUser = email ? await store.get(`auth/emails/${emailKey(email)}`, { type: "json" }) : null;
       if (indexedUser || db.users.some(item => item.email === email)) return reply(409, { error: "That email already has an account. Sign in instead." });
       const salt = randomBytes(16).toString("hex"), hash = (await scrypt(password, salt, 64)).toString("hex");
-      const created = { id: randomUUID(), name, email, salt, passwordHash: hash, emoji: [...name][0].toUpperCase() };
+      const created = { id: randomUUID(), name, email, salt, passwordHash: hash, emoji: [...name][0].toUpperCase(), about: "", status: "online" };
+      migrateGuestMemberships(data.guestId, created.id);
       db.users.push(created); db.sessions ||= {}; const token = randomBytes(32).toString("base64url"); db.sessions[token] = created.id;
       await Promise.all([store.setJSON(`auth/users/${created.id}`, created), store.setJSON(`auth/emails/${emailKey(email)}`, created), store.set(`auth/sessions/${token}`, created.id)]);
       pushEvent(db, { type: "presence", members: online.map(publicMember), registeredCount: baseline + db.users.length }); await save().catch(() => {});
@@ -161,10 +203,25 @@ export default async function handler(request) {
       const email = clean(data.email, 120).toLowerCase(), password = typeof data.password === "string" ? data.password : "";
       const found = await store.get(`auth/emails/${emailKey(email)}`, { type: "json" }) || db.users.find(item => item.email === email);
       if (!found || password.length > 128 || !(await scrypt(password, found.salt, 64)).equals(Buffer.from(found.passwordHash, "hex"))) return reply(401, { error: "Email or password didn’t match." });
+      migrateGuestMemberships(data.guestId, found.id);
       const token = randomBytes(32).toString("base64url"); await store.set(`auth/sessions/${token}`, found.id); db.sessions ||= {}; db.sessions[token] = found.id; await save().catch(() => {}); return reply(200, { user: publicUser(found) }, setCookie(token));
     }
     if (method === "POST" && path === "/api/logout") {
       if (session) await store.delete(`auth/sessions/${session}`); if (db.sessions) delete db.sessions[session]; await save().catch(() => {}); return reply(200, { ok: true }, { "set-cookie": "orbit_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0; Secure" });
+    }
+    if (method === "POST" && path === "/api/profile") {
+      if (!user) return reply(401, { error: "Sign in to edit your profile." });
+      const name = clean(data.name, 32), emoji = clean(data.emoji, 8), allowed = new Set(["✦","🌙","🌻","🦊","🐸","🐈","🎧","🚀","🌊","⭐","🍄","🪐"]);
+      if (name.length < 2) return reply(400, { error: "Your display name needs at least two characters." });
+      if (!allowed.has(emoji)) return reply(400, { error: "Choose an avatar from the list." });
+      user.name = name; user.emoji = emoji; user.about = clean(data.about, 100); user.status = ["online","idle","dnd"].includes(data.status) ? data.status : "online";
+      const emailIndex = `auth/emails/${emailKey(user.email)}`;
+      await Promise.all([store.setJSON(`auth/users/${user.id}`, user), store.setJSON(emailIndex, user)]);
+      db.users = db.users.map(item => item.id === user.id ? user : item);
+      const presenceEntry = db.presence[who];
+      if (presenceEntry) Object.assign(presenceEntry, { name, emoji, about: user.about, status: user.status, seenAt: Date.now() });
+      pushEvent(db, { type: "presence", members: online.map(publicMember), registeredCount: baseline + db.users.length }); await save().catch(() => {});
+      return reply(200, { user: publicUser(user) });
     }
     if (path === "/api/voice/join" && method === "POST") {
       const room = validId(data.room), peerId = validId(data.peerId);

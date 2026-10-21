@@ -3,13 +3,14 @@
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#101114"><meta name="description" content="A small corner of the internet for a very big world.">
-  <title>Orbit — find your people</title><link rel="icon" href="data:,"><link rel="stylesheet" href="styles.css?v=orbit-chat-3">
+  <title>Orbit — find your people</title><link rel="icon" href="data:,"><link rel="stylesheet" href="styles.css?v=orbit-chat-4">
 </head>
 <body>
   <div class="app-shell">
     <aside class="rail"><a href="#global" class="brand-orb" title="Orbit home">o</a><button class="rail-item active" data-view="chat" title="Chat" aria-label="Chat"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H5l1.7-3.3A7.5 7.5 0 1 1 20 11.5Z"/></svg></button><button class="rail-item" data-view="people" title="People" aria-label="People"><svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.5"/><path d="M2.8 19a6.2 6.2 0 0 1 12.4 0M16 5a3.5 3.5 0 0 1 0 6.8M17 14a5.4 5.4 0 0 1 4.2 5"/></svg></button><button class="rail-item" data-view="voice" title="Voice chat" aria-label="Voice chat"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M3 10v4m4-8v12m4-15v18m4-14v10m4-7v4m3-2h1"/></svg></button><button id="railCreate" class="rail-item" title="Create a room" aria-label="Create a room">＋</button><div class="rail-bottom"><button id="helpButton" class="rail-item" title="Community promise" aria-label="Community promise">?</button><button id="profileButton" class="profile-orb" title="Account">G</button></div></aside>
     <aside class="sidebar"><div class="brand-row"><span class="brand-star">✳</span><span>orbit</span><span class="beta">BETA</span></div><p class="sidebar-kicker">YOUR CORNER OF THE INTERNET</p><button class="search-box" id="searchOpen">⌕ <span>Find a conversation</span><kbd>⌘ K</kbd></button>
       <div class="section-title"><span>TEXT CHANNELS</span><button id="createSpace" aria-label="Create room">＋</button></div><div id="spaceList" class="space-list"></div>
+      <div class="section-title server-section-title"><span>YOUR SERVERS</span><button id="createServer" aria-label="Create server">＋</button></div><div id="serverList" class="space-list server-list"></div>
       <div id="followingSection" class="following-section hidden"><div class="section-title"><span>FOLLOWING</span><i>SAVED</i></div><div id="followingList" class="space-list"></div></div>
       <div class="section-title events-title"><span>HAPPENING NOW</span><i>OPEN</i></div><button class="event-link" data-channel="music"><span class="event-icon purple">♫</span><span><b>Now Playing</b><small>Listen together</small></span></button><button class="event-link" data-channel="global"><span class="event-icon teal">✦</span><span><b>World check-in</b><small>Say hello anywhere</small></span></button>
       <div class="sidebar-spacer"></div><div class="sidebar-note"><span>✦</span><div><b>Small world, big conversations.</b><small>Meet someone new today.</small></div></div>
@@ -26,5 +27,5 @@
     </main>
   </div>
   <div id="toast" class="toast" role="status"></div><div id="modalRoot"></div>
-  <button id="mobileVoice" class="mobile-voice">◖ <span>Voice</span><b id="mobileVoiceCount">0</b></button><script src="app.js?v=orbit-chat-8"></script>
+  <button id="mobileVoice" class="mobile-voice">◖ <span>Voice</span><b id="mobileVoiceCount">0</b></button><script src="app.js?v=orbit-chat-10"></script>
 </body></html>
