@@ -6,6 +6,7 @@
   const usePolling = !localHosts.has(location.hostname) && !location.port;
   const appOrigin = API_BASE || location.origin;
   const storageKey = "orbit.chat.v3";
+  const VOICE_SAMPLE_RATE = 24000;
   const saved = (() => { try { return JSON.parse(localStorage.getItem(storageKey) || "{}"); } catch { return {}; } })();
   const guest = saved.guest || { id: crypto.randomUUID(), name: `Guest ${100 + Math.floor(Math.random() * 900)}` };
   const defaultRooms = [
@@ -342,6 +343,14 @@
     const url = new URL("/api/voice/audio", base); url.protocol = base.protocol === "https:" ? "wss:" : "ws:";
     url.searchParams.set("room", state.voiceRoom); url.searchParams.set("peerId", state.peerId); url.searchParams.set("guestId", state.guest.id); return url.href;
   }
+  async function captureVoiceMic() {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: {
+      channelCount: { ideal: 1 }, sampleRate: { ideal: 48000 }, sampleSize: { ideal: 16 },
+      echoCancellation: true, noiseSuppression: true, autoGainControl: true
+    } });
+    for (const track of stream.getAudioTracks()) track.contentHint = "speech";
+    return stream;
+  }
   function receiveAudio(buffer) {
     if (!(buffer instanceof ArrayBuffer) || buffer.byteLength < 10 || !audioContext || !outputGain) return;
     const view = new DataView(buffer), idLength = view.getUint16(0, false);
@@ -357,10 +366,14 @@
   function sendAudio(event) {
     const output = event.outputBuffer.getChannelData(0); output.fill(0);
     if (!relaySocket || relaySocket.readyState !== WebSocket.OPEN || state.muted || state.deafened) return;
-    const input = event.inputBuffer.getChannelData(0), step = audioContext.sampleRate / 16000, count = Math.floor(input.length / step);
+    const input = event.inputBuffer.getChannelData(0), step = audioContext.sampleRate / VOICE_SAMPLE_RATE, count = Math.floor(input.length / step);
     if (!count) return;
-    const packet = new ArrayBuffer(4 + count * 2), view = new DataView(packet); view.setUint32(0, 16000, true);
-    for (let i = 0; i < count; i++) { const sample = input[Math.floor(i * step)]; view.setInt16(4 + i * 2, Math.max(-1, Math.min(1, sample)) * 32767, true); }
+    const packet = new ArrayBuffer(4 + count * 2), view = new DataView(packet); view.setUint32(0, VOICE_SAMPLE_RATE, true);
+    for (let i = 0; i < count; i++) {
+      const position = i * step, index = Math.floor(position), fraction = position - index;
+      const sample = input[index] * (1 - fraction) + (input[Math.min(index + 1, input.length - 1)] || 0) * fraction;
+      view.setInt16(4 + i * 2, Math.round(Math.max(-1, Math.min(1, sample)) * 32767), true);
+    }
     relaySocket.send(packet);
   }
   function connectVoiceAudio() {
@@ -369,7 +382,7 @@
     relaySocket.onmessage = event => receiveAudio(event.data);
     relaySocket.onerror = () => { if (state.voiceRoom) { state.voiceError = "Voice audio could not connect. Check this server’s network access."; renderVoice(); } };
     relaySocket.onclose = () => { if (state.voiceRoom) { state.voiceError = "Voice audio disconnected. Leave and rejoin voice."; renderVoice(); } };
-    micSource = audioContext.createMediaStreamSource(mic); micProcessor = audioContext.createScriptProcessor(2048, 1, 1);
+    micSource = audioContext.createMediaStreamSource(mic); micProcessor = audioContext.createScriptProcessor(1024, 1, 1);
     outputGain = audioContext.createGain(); outputGain.gain.value = state.deafened ? 0 : 1; outputGain.connect(audioContext.destination);
     micProcessor.onaudioprocess = sendAudio; micSource.connect(micProcessor); micProcessor.connect(audioContext.destination);
   }
@@ -379,8 +392,8 @@
     state.joiningVoice = true; state.voiceError = ""; renderVoice();
     try {
       if (!navigator.mediaDevices?.getUserMedia) throw new Error("Microphone access needs HTTPS or localhost.");
-      audioContext = new AudioContext({ sampleRate: 16000 }); await audioContext.resume();
-      mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+      audioContext = new AudioContext(); await audioContext.resume();
+      mic = await captureVoiceMic();
       state.joiningVoice = state.active;
       const result = await api("/api/voice/join", { method: "POST", body: JSON.stringify({ room: state.active, peerId: state.peerId, guestId: state.guest.id }) });
       state.voiceRoom = state.active; state.joiningVoice = false; state.voiceMembers = result.participants || []; connectVoiceAudio(); renderVoice();
@@ -451,7 +464,17 @@
       { urls: "stun:stun.cloudflare.com:53" }
     ] });
     voicePeers.set(peerId, pc);
-    for (const track of mic.getTracks()) pc.addTrack(track, mic);
+    for (const track of mic.getTracks()) {
+      const sender = pc.addTrack(track, mic);
+      if (track.kind === "audio" && sender.setParameters) {
+        try {
+          const parameters = sender.getParameters();
+          parameters.encodings ||= [{}];
+          parameters.encodings[0].maxBitrate = 64000;
+          await sender.setParameters(parameters);
+        } catch { /* Keep the browser's default Opus settings if tuning is unsupported. */ }
+      }
+    }
     pc.ontrack = event => { let audio = document.querySelector(`[data-peer-audio="${CSS.escape(peerId)}"]`); if (!audio) { audio = document.createElement("audio"); audio.autoplay = true; audio.playsInline = true; audio.dataset.peerAudio = peerId; audio.muted = state.deafened; $("#remoteAudio").append(audio); } audio.srcObject = event.streams[0] || new MediaStream([event.track]); audio.play().catch(() => { state.voiceError = "Voice connected. Tap the page once to enable audio playback."; renderVoice(); }); };
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === "connected") clearTimeout(pc.__orbitOfferRetry);
@@ -499,7 +522,7 @@
     if (!navigator.mediaDevices?.getUserMedia || !window.RTCPeerConnection) return toast("This browser does not support secure WebRTC voice.");
     state.joiningVoice = state.active; state.voiceError = ""; renderVoice();
     try {
-      mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+      mic = await captureVoiceMic();
       const result = await api("/api/voice/join", { method: "POST", body: JSON.stringify({ room: state.active, peerId: state.peerId, guestId: state.guest.id, guestName: name() }) });
       state.voiceRoom = state.active; state.joiningVoice = false; state.voiceMembers = result.participants || []; renderVoice();
       lastVoiceHeartbeat = Date.now(); blockedVoicePeers.clear(); await connectToVoiceMembers(state.voiceMembers);
