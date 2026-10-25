@@ -66,7 +66,7 @@
   }
   function renderMessage(item, i) {
     const reactions = Object.entries(item.reactions || {}).map(([emoji, list]) => `<button class="reaction" data-react="${esc(item.id)}" data-emoji="${esc(emoji)}">${esc(emoji)} ${list.length}</button>`).join("");
-    return `<article class="message"><span class="avatar">${esc(item.emoji || "✦")}</span><div class="message-body"><div class="message-meta"><b>${esc(item.user || "Guest")}</b>${item.registered ? `<i>member</i>` : ""}<time>${new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" }).format(new Date(item.createdAt || Date.now()))}</time></div><p>${esc(item.text)}</p><div class="message-actions">${reactions}<button class="reaction" data-react="${esc(item.id)}" data-emoji="💜">💜 +</button><button class="reply-link" data-reply="${i}">↩ Reply</button></div></div></article>`;
+    return `<article class="message" data-message-id="${esc(item.id)}"><span class="avatar">${esc(item.emoji || "✦")}</span><div class="message-body"><div class="message-meta"><b>${esc(item.user || "Guest")}</b>${item.registered ? `<i>member</i>` : ""}<time>${new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" }).format(new Date(item.createdAt || Date.now()))}</time></div><p>${esc(item.text)}</p><div class="message-actions">${reactions}<button class="reaction" data-react="${esc(item.id)}" data-emoji="💜">💜 +</button><button class="reply-link" data-reply="${i}">↩ Reply</button></div></div></article>`;
   }
   function renderMessages({ scrollToBottom = false } = {}) {
     const current = room(state.active), items = state.messages[state.active] || [];
@@ -507,9 +507,43 @@
   }
   function showRules() { modal("A small promise to each other.", "Orbit works best when everyone gets to be a person here.", `<ul class="rules"><li>Be curious before you judge. People arrive with different stories.</li><li>Make room for quieter voices. A thoughtful reply goes a long way.</li><li>Keep personal information personal. Share only what feels right to you.</li><li>If someone asks you to stop, let the conversation breathe.</li></ul>`); }
   function search() {
-    modal("Find a conversation.", "Search the rooms and parties you can access.", `<input id="searchInput" class="search-input" placeholder="Try music, travel, makers…" autocomplete="off"><div id="searchResults" class="search-results"></div>`);
-    const update = () => { const term = $("#searchInput").value.toLowerCase(); $("#searchResults").innerHTML = allRooms().filter(item => item.name.toLowerCase().includes(term) || (item.topic || "").toLowerCase().includes(term)).map(item => `<button data-search-room="${esc(item.id)}">${esc(item.emoji || "✦")} ${esc(item.name)}<small>${esc(item.topic || "")}</small></button>`).join("") || `<p class="empty-state">No matching room yet.</p>`; };
-    $("#searchInput").oninput = update; $("#searchInput").focus(); update();
+    modal("Find a conversation.", "Search rooms or find a message in your conversations.", `<input id="searchInput" class="search-input" placeholder="Try music, travel, or a message…" autocomplete="off"><div class="search-tabs"><button class="active" data-search-mode="rooms">Rooms</button><button data-search-mode="messages">Messages</button></div><div id="searchResults" class="search-results" aria-live="polite"></div>`);
+    let mode = "rooms", historyPromise = null;
+    const cache = new Map(Object.entries(state.messages));
+    const results = $("#searchResults"), input = $("#searchInput");
+    const roomResults = term => allRooms().filter(item => item.name.toLowerCase().includes(term) || (item.topic || "").toLowerCase().includes(term)).map(item => `<button data-search-room="${esc(item.id)}">${esc(item.emoji || "✦")} ${esc(item.name)}<small>${esc(item.topic || "")}</small></button>`).join("") || `<p class="empty-state">No matching room yet.</p>`;
+    const messageResults = term => {
+      const words = term.split(/\s+/).filter(Boolean), hits = [];
+      for (const [channel, messages] of cache) for (const item of messages) {
+        const content = String(item.text || "").toLowerCase();
+        if (words.every(word => content.includes(word))) hits.push({ channel, item });
+      }
+      hits.sort((a, b) => new Date(b.item.createdAt || 0) - new Date(a.item.createdAt || 0));
+      return hits.slice(0, 30).map(({ channel, item }) => `<button class="message-search-result" data-search-message="${esc(item.id)}" data-search-channel="${esc(channel)}"><b>${esc(item.user || "Guest")} <small>in ${esc(room(channel).name)}</small></b><span>${esc(String(item.text || "").slice(0, 180))}</span></button>`).join("") || `<p class="empty-state">No matching messages yet.</p>`;
+    };
+    const render = term => {
+      if (!term) { results.innerHTML = `<p class="empty-state">${mode === "rooms" ? "Choose a room or start typing to search." : "Type at least two characters to search messages."}</p>`; return; }
+      if (mode === "rooms") { results.innerHTML = roomResults(term); return; }
+      if (term.length < 2) { results.innerHTML = `<p class="empty-state">Type at least two characters to search messages.</p>`; return; }
+      results.innerHTML = messageResults(term);
+    };
+    const loadHistory = async id => {
+      if (cache.has(id)) return;
+      try { const data = await api(`/api/messages?channel=${encodeURIComponent(id)}&guestId=${encodeURIComponent(state.guest.id)}`); cache.set(id, data.messages || []); }
+      catch { cache.set(id, []); }
+    };
+    const update = () => {
+      const term = input.value.trim().toLowerCase();
+      render(term);
+      if (mode !== "messages" || term.length < 2 || historyPromise) return;
+      results.innerHTML = `<p class="empty-state">Searching your conversations…</p>`;
+      historyPromise = (async () => {
+        const rooms = allRooms();
+        for (let i = 0; i < rooms.length; i += 6) await Promise.all(rooms.slice(i, i + 6).map(item => loadHistory(item.id)));
+      })().finally(() => { if (input.isConnected && mode === "messages") render(input.value.trim().toLowerCase()); });
+    };
+    $$("[data-search-mode]").forEach(button => button.onclick = () => { mode = button.dataset.searchMode; $$("[data-search-mode]").forEach(tab => tab.classList.toggle("active", tab === button)); update(); });
+    input.oninput = update; input.focus(); update();
   }
   function bind() {
     document.addEventListener("click", event => {
@@ -518,6 +552,13 @@
       const channel = event.target.closest("[data-channel]"); if (channel) selectChannel(channel.dataset.channel);
       const voiceRoom = event.target.closest("[data-voice-room]"); if (voiceRoom) selectVoiceRoom(voiceRoom.dataset.voiceRoom);
       const searchRoom = event.target.closest("[data-search-room]"); if (searchRoom) { const id = searchRoom.dataset.searchRoom; closeModal(); selectChannel(id); }
+      const searchMessage = event.target.closest("[data-search-message]"); if (searchMessage) {
+        const id = searchMessage.dataset.searchMessage, channelId = searchMessage.dataset.searchChannel; closeModal();
+        selectChannel(channelId).then(() => requestAnimationFrame(() => {
+          const target = document.querySelector(`[data-message-id="${CSS.escape(id)}"]`);
+          if (target) { target.scrollIntoView({ block: "center", behavior: "smooth" }); target.classList.add("search-highlight"); setTimeout(() => target.classList.remove("search-highlight"), 1800); }
+        }));
+      }
       const track = event.target.closest("[data-track]"); if (track) playBuiltin(track.dataset.track);
       const react = event.target.closest("[data-react]"); if (react) api("/api/reactions", { method: "POST", body: JSON.stringify({ channel: state.active, messageId: react.dataset.react, emoji: react.dataset.emoji, guestId: state.guest.id, guestName: name() }) }).catch(error => toast(error.message));
       const reply = event.target.closest("[data-reply]"); if (reply) { const item = (state.messages[state.active] || [])[Number(reply.dataset.reply)]; $("#messageInput").value = `@${item?.user || "Guest"} `; $("#messageInput").focus(); }
