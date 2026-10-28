@@ -35,17 +35,12 @@
   };
   function renderShowcase() {
     const current = defaultRooms[showcaseIndex];
-    const card = (offset, position) => {
-      const index = (showcaseIndex + offset + defaultRooms.length) % defaultRooms.length;
-      const item = defaultRooms[index], [kicker, description, accent] = showcaseNotes[item.id];
-      const content = `<span class="stage-card-kicker">${esc(kicker)}</span><div class="room-object" aria-hidden="true"><span class="room-object-ring"></span><span class="room-object-glyph">${esc(item.emoji)}</span><i></i></div><h3>${esc(item.name)}</h3><p>${esc(description)}</p><span class="stage-card-footer"><img src="assets/turbochat-mark.svg" alt="" width="20" height="20">PUBLIC ROOM <span>${String(index + 1).padStart(2, "0")}</span></span>`;
-      return position === "current" ? `<article class="stage-room-card is-current" style="--room-accent:${accent}" aria-label="Selected public room: ${esc(item.name)}">${content}</article>` : `<button class="stage-room-card is-${position}" style="--room-accent:${accent}" data-showcase-select="${index}" aria-label="Preview ${esc(item.name)}">${content}</button>`;
-    };
-    $("#showcaseCards").innerHTML = card(-1, "previous") + card(0, "current") + card(1, "next");
+    const [kicker, description, accent] = showcaseNotes[current.id];
+    $("#showcaseCards").innerHTML = `<article class="stage-room-card is-current" style="--room-accent:${accent}" aria-label="Selected public room: ${esc(current.name)}"><span class="room-preview-symbol" aria-hidden="true">${esc(current.emoji)}</span><span class="stage-card-kicker">${esc(kicker)}</span><h3>${esc(current.name)}</h3><p>${esc(description)}</p><span class="stage-card-footer">Public room · Explore as a guest</span></article>`;
     $("#showcaseOpen").dataset.channel = current.id;
     $("#showcaseOpen").textContent = `Open ${current.name} ↗`;
     $("#showcaseSelection").textContent = `${String(showcaseIndex + 1).padStart(2, "0")} / ${String(defaultRooms.length).padStart(2, "0")} — ${current.name}`;
-    $$("#showcaseChoices [data-showcase-select]").forEach(button => { const selected = Number(button.dataset.showcaseSelect) === showcaseIndex; button.setAttribute("aria-pressed", String(selected)); button.classList.toggle("selected", selected); });
+    $$("#showcaseChoices [data-showcase-select]").forEach(button => { const index = Number(button.dataset.showcaseSelect), selected = index === showcaseIndex; button.textContent = defaultRooms[index].name; button.setAttribute("aria-pressed", String(selected)); button.classList.toggle("selected", selected); });
   }
   function selectShowcase(index, focus = false) {
     if (!Number.isInteger(index)) return;
@@ -262,7 +257,7 @@
   }
   function modal(title, subtitle, body) {
     if (!$("#modalRoot").childElementCount) modalOpener = document.activeElement;
-    $("#modalRoot").innerHTML = `<div class="modal-backdrop"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle" aria-describedby="modalDescription"><button class="modal-close" data-close aria-label="Close dialog">×</button><div class="modal-brand"><img src="assets/turbochat-mark.svg" alt="" width="30" height="30"><span>TurboChat</span></div><h2 id="modalTitle">${esc(title)}</h2><p id="modalDescription">${esc(subtitle)}</p>${body}</section></div>`;
+    $("#modalRoot").innerHTML = `<div class="modal-backdrop"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle" aria-describedby="modalDescription"><div class="modal-header"><div class="modal-brand"><img src="assets/turbochat-mark.svg" alt="" width="30" height="30"><span>TurboChat</span></div><button class="modal-close" data-close aria-label="Close dialog">×</button></div><div class="modal-content"><h2 id="modalTitle">${esc(title)}</h2><p id="modalDescription">${esc(subtitle)}</p>${body}</div></section></div>`;
     $(".app-shell").inert = true; $("#mobileVoice").inert = true;
     $("[data-close]").addEventListener("click", closeModal); $(".modal-backdrop").addEventListener("click", e => { if (e.target.classList.contains("modal-backdrop")) closeModal(); });
     ($(".modal input:not([readonly])") || $(".modal button:not([data-close])") || $("[data-close]")).focus();
@@ -434,7 +429,9 @@
     $("#voiceToggle").disabled = state.joiningVoice || (!state.connected && !self); $("#voiceMute").classList.toggle("hidden", !self); $("#voiceDeafen").classList.toggle("hidden", !self);
     $("#voiceMute").textContent = state.muted ? "Unmute" : "Mute"; $("#voiceDeafen").textContent = state.deafened ? "Undeafen" : "Deafen"; $("#voiceStatus").textContent = status;
     $("#voiceDot").classList.toggle("active", self || state.voiceMembers.length > 0); $("#mobileVoiceCount").textContent = state.voiceMembers.length;
-    $("#rightPanel").classList.toggle("mobile-open", self || state.voiceMobileOpen); $("#voiceParticipants").innerHTML = participants;
+    $("#rightPanel").classList.toggle("mobile-open", state.voiceMobileOpen); $("#voiceParticipants").innerHTML = participants;
+    $("#mobileVoice").setAttribute("aria-expanded", String(state.voiceMobileOpen));
+    $("#mobileVoice").setAttribute("aria-label", state.voiceMobileOpen ? "Hide voice controls" : "Show voice controls");
     $("#voiceTabRoomName").textContent = `${room(state.active).name} voice`; $("#voiceTabStatus").textContent = status; $("#voiceTabDot").classList.toggle("active", self);
     $("#voiceTabParticipants").innerHTML = participants || `<p>${self ? "You’re connected. Waiting for someone to join." : "It’s quiet here. Be the first to join."}</p>`;
     $("#voiceTabJoin").textContent = state.joiningVoice ? "Joining…" : self ? "Leave voice" : "Join voice"; $("#voiceTabJoin").disabled = state.joiningVoice || (!state.connected && !self);
@@ -706,13 +703,14 @@
     $("#messageForm").onsubmit = e => { e.preventDefault(); sendMessage($("#messageInput").value); };
     $("#messageInput").oninput = e => { saveDraft(); clearTimeout(typingStopTimer); if (e.currentTarget.value.trim()) { if (!localTyping) { clearTimeout(typingTimer); typingTimer = setTimeout(() => sendTyping(true), 180); } typingStopTimer = setTimeout(() => sendTyping(false), 1600); } else { clearTimeout(typingTimer); sendTyping(false); } };
     $("#messageInput").onkeydown = e => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); clearTimeout(typingTimer); clearTimeout(typingStopTimer); sendTyping(false); sendMessage(e.currentTarget.value); } };
+    window.addEventListener("resize", updateComposer);
     $("#emojiButton").onclick = () => { $("#messageInput").value += "👋"; $("#messageInput").dispatchEvent(new Event("input")); $("#messageInput").focus(); };
     $("#musicForm").onsubmit = shareMusic; $("#memberSearch").oninput = e => renderMembers(e.target.value.toLowerCase());
-    $("#voiceToggle").onclick = $("#voiceTabJoin").onclick = joinVoice; $("#voiceMute").onclick = $("#voiceTabMute").onclick = () => { state.muted = !state.muted; setVoiceDevice(); }; $("#voiceDeafen").onclick = $("#voiceTabDeafen").onclick = () => { state.deafened = !state.deafened; setVoiceDevice(); }; $("#mobileVoice").onclick = () => { if (state.voiceRoom) { joinVoice(); return; } state.voiceMobileOpen = !state.voiceMobileOpen; renderVoice(); };
+    $("#voiceToggle").onclick = $("#voiceTabJoin").onclick = joinVoice; $("#voiceMute").onclick = $("#voiceTabMute").onclick = () => { state.muted = !state.muted; setVoiceDevice(); }; $("#voiceDeafen").onclick = $("#voiceTabDeafen").onclick = () => { state.deafened = !state.deafened; setVoiceDevice(); }; $("#mobileVoice").onclick = () => { state.voiceMobileOpen = !state.voiceMobileOpen; renderVoice(); };
     $$("[data-view]").forEach(button => button.onclick = () => setView(button.dataset.view));
     document.addEventListener("keydown", e => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); search(); }
-      if (e.key === "Escape") closeModal();
+      if (e.key === "Escape") { closeModal(); state.voiceMobileOpen = false; renderVoice(); }
       if (e.key === "Tab" && $(".modal")) { const controls = $$(".modal button:not([disabled]), .modal input:not([disabled]), .modal select:not([disabled]), .modal textarea:not([disabled]), .modal a[href]").filter(item => item.getClientRects().length); const first = controls[0], last = controls.at(-1); if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last?.focus(); } else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first?.focus(); } }
     });
     window.addEventListener("pagehide", () => { if (state.voiceRoom) navigator.sendBeacon(`${API_BASE}/api/voice/leave`, new Blob([JSON.stringify({ room: state.voiceRoom, peerId: state.peerId, guestId: state.guest.id })], { type: "application/json" })); relaySocket?.close(); micProcessor?.disconnect(); micSource?.disconnect(); mic?.getTracks().forEach(track => track.stop()); audioContext?.close(); state.stream?.close(); });

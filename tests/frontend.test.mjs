@@ -255,6 +255,32 @@ test("voice animation represents only a joined, unmuted, healthy voice session",
   }
 });
 
+test("the mobile voice panel opens only on request and closes without leaving voice", () => {
+  const { app, element, listeners, requests } = fixture();
+  app.bind(); app.state.connected = true; app.state.voiceRoom = "global";
+  app.renderVoice();
+  const panel = element("#rightPanel"), toggle = element("#mobileVoice");
+  assert.equal(panel.classList.contains("mobile-open"), false);
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  assert.equal(toggle.getAttribute("aria-label"), "Show voice controls");
+  toggle.onclick();
+  assert.equal(panel.classList.contains("mobile-open"), true);
+  assert.equal(toggle.getAttribute("aria-expanded"), "true");
+  assert.equal(toggle.getAttribute("aria-label"), "Hide voice controls");
+  assert.equal(app.state.voiceRoom, "global");
+  toggle.onclick();
+  assert.equal(panel.classList.contains("mobile-open"), false);
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  assert.equal(app.state.voiceRoom, "global");
+  toggle.onclick();
+  listeners.get("keydown")({ key: "Escape" });
+  assert.equal(app.state.voiceMobileOpen, false);
+  assert.equal(panel.classList.contains("mobile-open"), false);
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  assert.equal(app.state.voiceRoom, "global");
+  assert.equal(requests.length, 0);
+});
+
 test("blocked browser storage keeps the draft in memory and never claims it was saved on the device", async () => {
   const { app, element, storage } = fixture({ storageBlocked: true });
   app.state.loading = false;
@@ -309,9 +335,8 @@ test("the room showcase contains public descriptions and never includes private 
   for (let index = 0; index < 5; index++) {
     app.selectShowcase(index);
     const markup = element("#showcaseCards").innerHTML;
-    assert.match(markup, /PUBLIC ROOM/);
+    assert.match(markup, /Public room/i);
     assert.match(markup, /aria-label="Selected public room:/);
-    assert.match(markup, /aria-label="Preview /);
     assert.doesNotMatch(markup, /Custom sensitive|Private party|Private server|Secret channel|Private member|Private message|Private profile/);
   }
 });
@@ -354,4 +379,55 @@ test("touch or click previews select only, while the explicit open action naviga
   assert.equal(app.state.active, "music");
   assert.equal(app.state.view, "chat");
   assert.ok(requests.some(request => request.url.pathname === "/api/messages" && request.url.searchParams.get("channel") === "music"));
+});
+
+test("changing a public room preview preserves the current room and its multiline draft", async () => {
+  const { app, element, requests, storage } = fixture();
+  app.bind(); app.state.loading = false;
+  element("#messageInput").value = "Keep the World draft"; app.saveDraft();
+  await app.selectChannel("music");
+  element("#messageInput").value = "A music draft\nwith a second line"; app.saveDraft();
+  app.state.view = "discover";
+  const requestCount = requests.length;
+  app.selectShowcase(2);
+  assert.equal(element("#showcaseOpen").dataset.channel, "travel");
+  assert.equal(app.state.active, "music");
+  assert.equal(element("#messageInput").value, "A music draft\nwith a second line");
+  assert.equal(app.drafts.global, "Keep the World draft");
+  assert.equal(app.drafts.music, "A music draft\nwith a second line");
+  assert.equal(requests.length, requestCount);
+  const reload = fixture({ storage }); reload.app.restoreDraft();
+  assert.equal(reload.app.state.active, "music");
+  assert.equal(reload.element("#messageInput").value, "A music draft\nwith a second line");
+});
+
+test("opening a public room and submitting its composer sends there while retaining another room's draft", async () => {
+  const { app, element, listeners, requests } = fixture({ request(record) {
+    if (record.method === "POST" && record.url.pathname === "/api/messages") return {
+      message: { id: "accepted-travel-message", text: record.body.text, user: "Local guest", createdAt: "2026-10-27T12:00:00Z", reactions: {} }
+    };
+  } });
+  app.bind(); app.state.loading = false; app.state.connected = true;
+  element("#messageInput").value = "Keep my World draft"; app.saveDraft();
+  app.selectShowcase(2);
+  listeners.get("click")({ target: { closest: selector => selector === "[data-channel]" ? element("#showcaseOpen") : null } });
+  assert.equal(app.state.active, "travel");
+  assert.equal(app.state.view, "chat");
+  assert.equal(element("#messageInput").value, "");
+  element("#messageInput").value = "A new thought\nfor this room"; app.saveDraft();
+  let prevented = 0;
+  element("#messageForm").onsubmit({ preventDefault: () => prevented++ });
+  await new Promise(resolve => setImmediate(resolve));
+  const sent = requests.filter(request => request.method === "POST" && request.url.pathname === "/api/messages");
+  assert.equal(prevented, 1);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].body.channel, "travel");
+  assert.equal(sent[0].body.text, "A new thought\nfor this room");
+  assert.ok(app.state.messages.travel.some(message => message.id === "accepted-travel-message"));
+  assert.equal(element("#messageInput").value, "");
+  assert.equal(element("#sendButton").disabled, true);
+  assert.equal(app.drafts.travel, undefined);
+  assert.equal(app.drafts.global, "Keep my World draft");
+  await app.selectChannel("global");
+  assert.equal(element("#messageInput").value, "Keep my World draft");
 });

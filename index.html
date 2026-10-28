@@ -3,9 +3,7 @@
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#111219"><meta name="description" content="Find your people. Keep the conversation going. Rooms, shared music, message search and voice in one friendly space.">
-  <title>TurboChat — find your people</title><meta property="og:title" content="TurboChat — Good conversations have a place."><meta property="og:description" content="Find a room. Pick up a conversation. Make yourself at home."><meta property="og:image" content="https://turbo-chat-five.vercel.app/assets/turbochat-social-landscape-1200x630.png"><meta name="twitter:card" content="summary_large_image"><link rel="icon" type="image/svg+xml" href="assets/turbochat-icon.svg"><link rel="stylesheet" href="styles.css?v=turbochat-15">
-<link rel="stylesheet" href="brand.css?v=turbochat-15">
-<link rel="stylesheet" href="showcase.css?v=turbochat-15b">
+  <title>TurboChat — find your people</title><meta property="og:title" content="TurboChat — Good conversations have a place."><meta property="og:description" content="Find a room. Pick up a conversation. Make yourself at home."><meta property="og:image" content="https://turbo-chat-five.vercel.app/assets/turbochat-social-landscape-1200x630.png"><meta name="twitter:card" content="summary_large_image"><link rel="icon" type="image/svg+xml" href="assets/turbochat-icon.svg"><link rel="stylesheet" href="styles.css?v=readable-16">
 </head>
 <body>
   <div class="app-shell">
@@ -24,11 +22,11 @@
 
       <section id="discoverView" class="discover-view" aria-label="Explore TurboChat">
         <div class="discover-hero showcase-hero">
-          <div class="hero-copy"><div class="eyebrow"><span></span> GOOD CONVERSATIONS HAVE A PLACE</div><h1><span>Your people.</span> <em>Your orbit.</em></h1><p>Somewhere to share a song, a half-formed idea, or a little hello. Find your kind of conversation. Make yourself at home.</p><div class="hero-actions"><button class="secondary-action" data-search-open>Find a conversation <span>⌕</span></button></div><p class="hero-footnote">Public rooms. Your pace. Explore as a guest.</p><div class="showcase-signature"><img src="assets/turbochat-mark.svg" alt="" width="28" height="28"><span>Find your people.<br>Keep the conversation going.</span></div></div>
-          <section id="roomShowcase" class="room-showcase" aria-label="Public room showcase" aria-roledescription="carousel" aria-describedby="showcaseHelp">
-            <div class="showcase-space"><div class="stage-halo" aria-hidden="true"></div><div class="stage-orbit orbit-back" aria-hidden="true"></div><div class="stage-orbit orbit-front" aria-hidden="true"></div><div class="stage-floor" aria-hidden="true"></div><div id="showcaseCards" class="showcase-cards"></div><span class="stage-coordinate" aria-hidden="true">TC / PUBLIC SPACES</span></div>
-            <div class="showcase-controls"><button id="showcasePrevious" class="stage-arrow" aria-label="Preview previous room">←</button><div id="showcaseChoices" class="showcase-choices" role="group" aria-label="Choose a public room"><button data-showcase-select="0" aria-label="Preview The World" aria-pressed="true"><span></span></button><button data-showcase-select="1" aria-label="Preview Now Playing" aria-pressed="false"><span></span></button><button data-showcase-select="2" aria-label="Preview Somewhere New" aria-pressed="false"><span></span></button><button data-showcase-select="3" aria-label="Preview The Makers Table" aria-pressed="false"><span></span></button><button data-showcase-select="4" aria-label="Preview The Slow Lounge" aria-pressed="false"><span></span></button></div><button id="showcaseNext" class="stage-arrow" aria-label="Preview next room">→</button></div>
-            <p id="showcaseSelection" class="showcase-selection" aria-live="polite" aria-atomic="true">01 / 05 — The World</p><button id="showcaseOpen" class="primary-action showcase-open" data-channel="global">Open The World ↗</button><p id="showcaseHelp" class="showcase-help">Pick a room above. Use the arrows or choose a dot.<br><span>Keyboard: ← →, Home, End on the room choices.</span></p>
+          <div class="hero-copy"><div class="eyebrow"><span></span> GOOD CONVERSATIONS HAVE A PLACE</div><h1>Find your people.<br><em>Make yourself at home.</em></h1><p>Somewhere to share a song, a half-formed idea, or a little hello. Find your kind of conversation. Make yourself at home.</p><div class="hero-actions"><button class="secondary-action" data-search-open>Find a conversation <span>⌕</span></button></div><p class="hero-footnote">Public rooms. Your pace. Explore as a guest.</p><div class="showcase-signature"><img src="assets/turbochat-mark.svg" alt="" width="28" height="28"><span>Find your people.<br>Keep the conversation going.</span></div></div>
+          <section id="roomShowcase" class="room-showcase" aria-label="Public room showcase"  aria-describedby="showcaseHelp">
+            <div class="showcase-space"><div id="showcaseCards" class="showcase-cards"></div></div>
+            <div class="showcase-controls"><button id="showcasePrevious" class="stage-arrow" aria-label="Preview previous room">← Previous</button><div id="showcaseChoices" class="showcase-choices" role="group" aria-label="Choose a public room"><button data-showcase-select="0" aria-label="Preview The World" aria-pressed="true"><span></span></button><button data-showcase-select="1" aria-label="Preview Now Playing" aria-pressed="false"><span></span></button><button data-showcase-select="2" aria-label="Preview Somewhere New" aria-pressed="false"><span></span></button><button data-showcase-select="3" aria-label="Preview The Makers Table" aria-pressed="false"><span></span></button><button data-showcase-select="4" aria-label="Preview The Slow Lounge" aria-pressed="false"><span></span></button></div><button id="showcaseNext" class="stage-arrow" aria-label="Preview next room">Next →</button></div>
+            <p id="showcaseSelection" class="showcase-selection" aria-live="polite" aria-atomic="true">01 / 05 — The World</p><button id="showcaseOpen" class="primary-action showcase-open" data-channel="global">Open The World ↗</button><p id="showcaseHelp" class="showcase-help">Choose a room, then open its conversation.<br><span>Keyboard: ← →, Home, End on the room choices.</span></p>
           </section>
         </div>
         <div class="discover-section-head"><div><small>PULL UP A CHAIR</small><h2>Every kind of hello.</h2></div><span>Pick a room. Pull up a chair.</span></div>
@@ -50,5 +48,5 @@
     </main>
   </div>
   <div id="toast" class="toast" role="status"></div><div id="modalRoot"></div>
-  <script src="app.js?v=turbochat-15"></script>
+  <script src="app.js?v=readable-16"></script>
 </body></html>
