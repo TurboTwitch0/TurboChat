@@ -5,10 +5,10 @@ import { randomUUID } from "node:crypto";
 import vm from "node:vm";
 
 const source = await readFile(new URL("../app.js", import.meta.url), "utf8");
-const entry = "bind(); renderMessages(); restoreDraft(); updateIdentity(); start();";
+const entry = "bind(); renderMessages(); updateIdentity(); start();";
 assert.ok(source.includes(entry), "The test harness must replace only the application startup.");
 // Expose functions in the test-only copy; production does not export internals.
-const testSource = source.replace(entry, "globalThis.app = { state, drafts, saveDraft, restoreDraft, selectChannel, pollUpdates, sendMessage, receiveLiveEvent, typingPeers, bind, renderMessages, renderVoice, setConnected, loadChannel, bootstrap, scrollBehavior, renderShowcase, selectShowcase, showcaseKeydown, messageFollow, scrollToLatest, scheduleBottomScroll, handleFeedScroll, pauseMessageFollow, initMessageScrolling, enterMessageRoom, visibleMessages, hideWorldHistory, restoreWorldHistory };");
+const testSource = source.replace(entry, "globalThis.app = { state, drafts, chooseDrafts, saveDraft, restoreDraft, selectChannel, addMessage, setView, renderRoomList, pollUpdates, sendMessage, receiveLiveEvent, typingPeers, bind, renderMessages, renderVoice, setConnected, loadChannel, bootstrap, scrollBehavior, renderShowcase, selectShowcase, showcaseKeydown, messageFollow, scrollToLatest, scheduleBottomScroll, handleFeedScroll, pauseMessageFollow, initMessageScrolling, enterMessageRoom, visibleMessages, hideWorldHistory, restoreWorldHistory };");
 
 function deferred() {
   let resolve, reject;
@@ -722,4 +722,119 @@ test("opening a public room and submitting its composer sends there while retain
   assert.equal(app.drafts.global, "Keep my World draft");
   await app.selectChannel("global");
   assert.equal(element("#messageInput").value, "Keep my World draft");
+});
+
+test("guest and account drafts remain private and restore across identity switches and reloads", async () => {
+  const { app, element, storage } = fixture();
+  const firstAccount = { id: "first-account" }, secondAccount = { id: "second-account" };
+  app.chooseDrafts(null);
+  element("#messageInput").value = "Guest World draft"; app.saveDraft();
+
+  app.chooseDrafts(firstAccount);
+  assert.equal(element("#messageInput").value, "");
+  assert.equal(app.drafts.global, undefined);
+  element("#messageInput").value = "First account World draft"; app.saveDraft();
+  await app.selectChannel("music");
+  element("#messageInput").value = "First account music draft"; app.saveDraft();
+
+  app.chooseDrafts(secondAccount);
+  assert.equal(element("#messageInput").value, "");
+  assert.equal(app.drafts.global, undefined);
+  element("#messageInput").value = "Second account music draft"; app.saveDraft();
+  app.chooseDrafts(firstAccount);
+  assert.equal(element("#messageInput").value, "First account music draft");
+  assert.equal(app.drafts.global, "First account World draft");
+
+  app.chooseDrafts(null);
+  assert.equal(element("#messageInput").value, "");
+  await app.selectChannel("global");
+  assert.equal(element("#messageInput").value, "Guest World draft");
+
+  const reload = fixture({ storage });
+  reload.app.chooseDrafts(secondAccount);
+  assert.equal(reload.element("#messageInput").value, "");
+  await reload.app.selectChannel("music");
+  assert.equal(reload.element("#messageInput").value, "Second account music draft");
+  reload.app.chooseDrafts(firstAccount);
+  assert.equal(reload.element("#messageInput").value, "First account music draft");
+  await reload.app.selectChannel("global");
+  assert.equal(reload.element("#messageInput").value, "First account World draft");
+});
+
+test("legacy unowned drafts bind to the resolved account without becoming guest drafts", () => {
+  const storage = new Map([["orbit.chat.v3", JSON.stringify({ guest: { id: "legacy-guest", name: "Guest" }, drafts: { global: "Legacy account draft" } })]]);
+  const { app, element } = fixture({ storage });
+  const account = { id: "legacy-account" };
+  app.chooseDrafts(account);
+  assert.equal(element("#messageInput").value, "Legacy account draft");
+  app.chooseDrafts(null);
+  assert.equal(element("#messageInput").value, "");
+  assert.equal(app.drafts.global, undefined);
+  app.chooseDrafts(account);
+  assert.equal(element("#messageInput").value, "Legacy account draft");
+  const reload = fixture({ storage });
+  reload.app.chooseDrafts(null);
+  assert.equal(reload.element("#messageInput").value, "");
+  reload.app.chooseDrafts(account);
+  assert.equal(reload.element("#messageInput").value, "Legacy account draft");
+});
+
+test("unread counts deduplicate live messages and treat only the open chat as read", () => {
+  const { app } = fixture();
+  app.state.loading = false; app.state.active = "global"; app.state.view = "discover";
+  const world = { id: "world-live", text: "A World message", createdAt: "2026-10-27T12:00:00Z" };
+  app.addMessage("global", world);
+  assert.equal(app.state.unread.global, 1, "the current channel is unread while its chat view is closed");
+  app.addMessage("global", world);
+  assert.equal(app.state.unread.global, 1, "a repeated live event must not increment unread");
+  app.setView("chat");
+  assert.equal(app.state.unread.global || 0, 0);
+  app.addMessage("global", { ...world, id: "world-visible" });
+  assert.equal(app.state.unread.global || 0, 0);
+
+  const music = { id: "music-live", text: "A music message", createdAt: "2026-10-27T12:00:01Z" };
+  app.addMessage("music", music);
+  app.addMessage("music", { ...music, reactions: { "💜": ["another-member"] } });
+  assert.equal(app.state.unread.music, 1, "updates to an existing message are not new unread messages");
+  app.setView("voice");
+  app.addMessage("global", { ...world, id: "world-while-in-voice" });
+  assert.equal(app.state.unread.global, 1);
+  app.setView("chat");
+  assert.equal(app.state.unread.global || 0, 0);
+  assert.equal(app.state.unread.music, 1, "reading World must leave another room's unread count intact");
+});
+
+test("opening an unread room clears that room's count while retaining the other rooms' counts", async () => {
+  const { app } = fixture();
+  app.state.loading = false; app.state.view = "chat";
+  app.addMessage("music", { id: "music-unread", text: "Music", createdAt: "2026-10-27T12:00:00Z" });
+  app.addMessage("travel", { id: "travel-unread", text: "Travel", createdAt: "2026-10-27T12:00:01Z" });
+  assert.equal(app.state.unread.music, 1);
+  assert.equal(app.state.unread.travel, 1);
+  await app.selectChannel("music");
+  assert.equal(app.state.active, "music");
+  assert.equal(app.state.view, "chat");
+  assert.equal(app.state.unread.music || 0, 0);
+  assert.equal(app.state.unread.travel, 1);
+});
+
+test("the first polling snapshot restores history without treating old events as new unread messages", () => {
+  const { app } = fixture();
+  app.state.view = "chat"; app.state.active = "global";
+  app.receiveLiveEvent({ type: "message", channel: "music", message: { id: "snapshot-message", text: "Earlier music conversation" } }, false);
+  assert.equal(app.state.messages.music[0].id, "snapshot-message");
+  assert.equal(app.state.unread.music, undefined);
+  app.receiveLiveEvent({ type: "message", channel: "music", message: { id: "new-live-message", text: "A new arrival" } });
+  assert.equal(app.state.unread.music, 1);
+});
+
+test("a sender's accepted message is not marked unread after switching away", () => {
+  const { app } = fixture();
+  app.state.view = "chat"; app.state.active = "global"; app.state.profile = { id: "the-sender" };
+  app.addMessage("music", { id: "own-accepted", userId: "the-sender", text: "My message" });
+  assert.equal(app.state.unread.music, undefined);
+  app.state.profile = null;
+  app.state.messages.music = [{ id: "pending-local", pending: true, user: "Guest", text: "My guest message" }];
+  app.addMessage("music", { id: "guest-accepted", user: "Guest", text: "My guest message" });
+  assert.equal(app.state.unread.music, undefined);
 });

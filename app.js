@@ -63,11 +63,27 @@
   const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const name = () => state.profile?.name || state.guest.name;
   const drafts = saved.drafts && typeof saved.drafts === "object" && !Array.isArray(saved.drafts) ? saved.drafts : {};
+  const draftBooks = saved.draftsByIdentity && typeof saved.draftsByIdentity === "object" && !Array.isArray(saved.draftsByIdentity) ? saved.draftsByIdentity : {};
+  let draftIdentity = typeof saved.draftIdentity === "string" ? saved.draftIdentity : "", accountBusy = false;
+  state.unread = {};
   let worldHistoryReset = saved.worldHistoryReset && Number.isFinite(saved.worldHistoryReset.through) && Array.isArray(saved.worldHistoryReset.ids) ? saved.worldHistoryReset : null;
   let worldHistoryInitialized = saved.worldHistoryInitialized === true || !!worldHistoryReset;
   const messageFollow = { room: null, pinned: true, generation: 0, adjusting: false, frame: null, anchor: null };
-  let identityVersion = 0, modalOpener = null;
-  const save = () => { try { localStorage.setItem(storageKey, JSON.stringify({ guest: state.guest, active: state.active, view: state.view, followingRooms: state.followingRooms, drafts, worldHistoryReset, worldHistoryInitialized })); state.storageAvailable = true; return true; } catch { state.storageAvailable = false; return false; } };
+  let identityVersion = 0, modalOpener = null, pollingHasSnapshot = false;
+  const save = () => { if (draftIdentity) draftBooks[draftIdentity] = { ...drafts }; try { localStorage.setItem(storageKey, JSON.stringify({ guest: state.guest, active: state.active, view: state.view, followingRooms: state.followingRooms, drafts, draftIdentity, draftsByIdentity: draftBooks, worldHistoryReset, worldHistoryInitialized })); state.storageAvailable = true; return true; } catch { state.storageAvailable = false; return false; } };
+  function chooseDrafts(profile) {
+    const next = profile ? `user-${profile.id}` : `guest-${state.guest.id}`;
+    if (draftIdentity && draftIdentity !== next) {
+      draftBooks[draftIdentity] = { ...drafts };
+      for (const key of Object.keys(drafts)) delete drafts[key];
+      Object.assign(drafts, draftBooks[next] || {});
+    }
+    draftIdentity = next; save(); restoreDraft();
+  }
+  function unreadBadge(channel) {
+    const count = state.unread[channel] || 0;
+    return count ? `<em class="unread-badge" aria-label="${count} unread messages">${count > 99 ? "99+" : count}</em>` : "";
+  }
   const scrollBehavior = () => window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
   function visibleMessages(channel, items = state.messages[channel] || []) {
     if (channel !== "global" || !worldHistoryReset) return items;
@@ -173,10 +189,15 @@
   function clearTyping() { clearTimeout(typingTimer); clearTimeout(typingStopTimer); sendTyping(false); for (const [key, value] of typingPeers) if (key.endsWith(":timer")) clearTimeout(value); typingPeers.clear(); renderTyping(); }
   function toast(message) { const el = $("#toast"); el.textContent = message; el.classList.add("show"); clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove("show"), 3000); }
   async function api(path, options = {}) {
-    const response = await fetch(`${API_BASE}${path}`, { credentials: "include", headers: { "Content-Type": "application/json", ...(options.headers || {}) }, ...options });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) { const error = new Error(data.error || `Request failed (${response.status}).`); error.status = response.status; throw error; }
-    return data;
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
+    const timer = controller && setTimeout(() => controller.abort(), 15000);
+    try {
+      const response = await fetch(`${API_BASE}${path}`, { credentials: "include", ...(controller ? { signal: controller.signal } : {}), ...options, headers: { "Content-Type": "application/json", ...(options.headers || {}) } });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) { const error = new Error(data.error || `Request failed (${response.status}).`); error.status = response.status; throw error; }
+      return data;
+    } catch (error) { if (error.name === "AbortError") throw new Error("The connection timed out. Please try again."); throw error; }
+    finally { if (timer) clearTimeout(timer); }
   }
   function allRooms() { return [...defaultRooms, ...state.rooms, ...state.parties, ...state.servers.flatMap(server => server.channels.map(channel => ({ ...channel, serverId: server.id, serverName: server.name, emoji: channel.type === "voice" ? "◖" : "#", topic: server.description || `A channel in ${server.name}.` })))]; }
   function room(id) { return allRooms().find(x => x.id === id) || { id, name: "Party", emoji: "✦", topic: "A private room for good people." }; }
@@ -190,13 +211,13 @@
   }
   function renderRoomList() {
     const rooms = allRooms();
-    const row = item => `<button class="space-row ${state.active === item.id ? "selected" : ""}" data-channel="${esc(item.id)}"><span style="--tile:${esc(item.color || "#6758ad")}">${esc(item.emoji || "✦")}</span><b>${esc(item.name)}</b></button>`;
+    const row = item => `<button class="space-row ${state.active === item.id ? "selected" : ""}" data-channel="${esc(item.id)}"><span style="--tile:${esc(item.color || "#6758ad")}">${esc(item.emoji || "✦")}</span><b>${esc(item.name)}</b>${unreadBadge(item.id)}</button>`;
     $("#spaceList").innerHTML = [...defaultRooms, ...state.rooms, ...state.parties].map(row).join("");
-    $("#mobileRoomNav").innerHTML = rooms.map(item => `<button class="mobile-room-chip ${state.active === item.id ? "selected" : ""}" data-channel="${esc(item.id)}" title="${esc(item.name)}"><span>${esc(item.emoji || "✦")}</span>${esc(item.name)}${state.followingRooms.includes(item.id) ? `<i aria-label="Following">★</i>` : ""}</button>`).join("");
+    $("#mobileRoomNav").innerHTML = rooms.map(item => `<button class="mobile-room-chip ${state.active === item.id ? "selected" : ""}" data-channel="${esc(item.id)}" title="${esc(item.name)}"><span>${esc(item.emoji || "✦")}</span>${esc(item.serverName ? `${item.serverName} / ${item.name}` : item.name)}${unreadBadge(item.id)}${state.followingRooms.includes(item.id) ? `<i aria-label="Following">★</i>` : ""}</button>`).join("");
     const followed = rooms.filter(item => state.followingRooms.includes(item.id));
     $("#followingSection").classList.toggle("hidden", followed.length === 0);
     $("#followingList").innerHTML = followed.map(row).join("");
-    $("#serverList").innerHTML = state.servers.map(server => { const isOwner = server.ownerId === state.profile?.id || server.ownerId === `guest-${state.guest.id}`; return `<section class="server-group"><div class="server-heading"><span>${esc(server.emoji || "✳")} ${esc(server.name)}</span><div><button data-server-invite="${esc(server.id)}" title="Invite to ${esc(server.name)}">↗</button>${isOwner ? `<button data-add-channel="${esc(server.id)}" title="Add channel">＋</button>` : ""}</div></div>${(server.channels || []).map(channel => `<button class="space-row server-channel ${state.active === channel.id ? "selected" : ""}" data-channel="${esc(channel.id)}"><span class="channel-type-icon">${channel.type === "voice" ? "◖" : "#"}</span><b>${esc(channel.name)}</b></button>`).join("")}</section>`; }).join("") || `<div class="server-empty">Make a server to gather your people and add text or voice channels.</div>`;
+    $("#serverList").innerHTML = state.servers.map(server => { const isOwner = server.ownerId === state.profile?.id || server.ownerId === `guest-${state.guest.id}`; return `<section class="server-group"><div class="server-heading"><span>${esc(server.emoji || "✳")} ${esc(server.name)}</span><div><button data-server-invite="${esc(server.id)}" title="Invite to ${esc(server.name)}">↗</button>${isOwner ? `<button data-add-channel="${esc(server.id)}" title="Add channel">＋</button>` : ""}</div></div>${(server.channels || []).map(channel => `<button class="space-row server-channel ${state.active === channel.id ? "selected" : ""}" data-channel="${esc(channel.id)}"><span class="channel-type-icon">${channel.type === "voice" ? "◖" : "#"}</span><b>${esc(channel.name)}</b>${unreadBadge(channel.id)}</button>`).join("")}</section>`; }).join("") || `<div class="server-empty">Make a server to gather your people and add text or voice channels.</div>`;
     renderVoiceRooms();
   }
   function renderMembers(filter = $("#memberSearch").value.toLowerCase()) {
@@ -256,7 +277,13 @@
     state.messages[channel] = merged;
     return changed;
   }
-  function addMessage(channel, item) { if (mergeMessages(channel, [item]) && state.active === channel) renderMessages(); }
+  function addMessage(channel, item, notifyUnread = true) {
+    const existing = state.messages[channel] || [], isNew = !existing.some(message => message.id === item.id);
+    const ownMessage = (item.userId && item.userId === state.profile?.id) || existing.some(message => message.pending && message.user === item.user && message.text === item.text);
+    const changed = mergeMessages(channel, [item]);
+    if (notifyUnread && isNew && !ownMessage && (state.active !== channel || state.view !== "chat")) { state.unread[channel] = (state.unread[channel] || 0) + 1; renderRoomList(); }
+    if (changed && state.active === channel) renderMessages();
+  }
   function toggleFollow() {
     const index = state.followingRooms.indexOf(state.active);
     if (index < 0) { state.followingRooms.push(state.active); toast(`Following ${room(state.active).name}. Find it in your sidebar.`); }
@@ -284,15 +311,15 @@
   }
   function connectLive() {
     state.stream?.close();
-    if (usePolling) { clearInterval(pollTimer); pollUpdates(); pollTimer = setInterval(pollUpdates, 1200); return; }
+    if (usePolling) { pollingHasSnapshot = false; clearInterval(pollTimer); pollUpdates(); pollTimer = setInterval(pollUpdates, 1200); return; }
     const query = new URLSearchParams({ guestId: state.guest.id, name: name(), peerId: state.peerId });
     const stream = new EventSource(`${API_BASE}/api/events?${query}`, { withCredentials: true }); state.stream = stream;
     stream.onopen = () => { clearTimeout(reconnectTimer); setConnected(true, "Live"); };
     stream.onerror = () => { setConnected(false, "Reconnecting…"); if (state.voiceRoom) leaveVoice(true); };
     stream.addEventListener("update", event => { let data; try { data = JSON.parse(event.data); } catch { return; } receiveLiveEvent(data); });
   }
-  function receiveLiveEvent(data) {
-      if (data.type === "message") addMessage(data.channel, data.message);
+  function receiveLiveEvent(data, notifyUnread = true) {
+      if (data.type === "message") addMessage(data.channel, data.message, notifyUnread);
       if (data.type === "typing" && data.channel === state.active && data.id !== `guest-${state.guest.id}` && data.id !== `user-${state.profile?.id}`) { typingPeers.set(data.id, data.name); renderTyping(); clearTimeout(typingPeers.get(`${data.id}:timer`)); typingPeers.set(`${data.id}:timer`, setTimeout(() => { typingPeers.delete(data.id); renderTyping(); }, 2800)); }
       if (data.type === "typing-stop") { const timer = typingPeers.get(`${data.id}:timer`); if (timer) clearTimeout(timer); typingPeers.delete(data.id); typingPeers.delete(`${data.id}:timer`); if (data.channel === state.active) renderTyping(); }
       if (data.type === "reaction") { const item = (state.messages[data.channel] || []).find(m => m.id === data.messageId); if (item) { item.reactions = data.reactions; if (state.active === data.channel) renderMessages(); } }
@@ -319,7 +346,8 @@
       if (Date.now() - lastHeartbeat > 10000) { await api("/api/presence", { method: "POST", body: JSON.stringify({ guestId: state.guest.id, guestName: name() }) }); lastHeartbeat = Date.now(); }
       const result = await api(`/api/updates?after=${lastEventSeq}&guestId=${encodeURIComponent(state.guest.id)}&peerId=${encodeURIComponent(state.peerId)}`);
       if (version !== identityVersion) return;
-      for (const event of result.events || []) receiveLiveEvent(event);
+      for (const event of result.events || []) receiveLiveEvent(event, pollingHasSnapshot);
+      pollingHasSnapshot = true;
       if (state.voiceRoom && Date.now() - lastVoiceHeartbeat > 5000) {
         const voice = await api("/api/voice/join", { method: "POST", body: JSON.stringify({ room: state.voiceRoom, peerId: state.peerId, guestId: state.guest.id, guestName: name() }) });
         lastVoiceHeartbeat = Date.now(); state.voiceMembers = voice.participants || []; renderVoice();
@@ -365,7 +393,12 @@
     $("[data-close]").addEventListener("click", closeModal); $(".modal-backdrop").addEventListener("click", e => { if (e.target.classList.contains("modal-backdrop")) closeModal(); });
     ($(".modal input:not([readonly])") || $(".modal button:not([data-close])") || $("[data-close]")).focus();
   }
-  function closeModal() { $("#modalRoot").innerHTML = ""; $(".app-shell").inert = false; $("#mobileVoice").inert = false; if (modalOpener?.isConnected) modalOpener.focus(); modalOpener = null; }
+  function closeModal() { if (accountBusy) return; $("#modalRoot").innerHTML = ""; $(".app-shell").inert = false; $("#mobileVoice").inert = false; if (modalOpener?.isConnected) modalOpener.focus(); modalOpener = null; }
+  function setAccountBusy(busy) {
+    accountBusy = busy;
+    $$("#modalRoot button, #modalRoot input, #modalRoot select").forEach(control => control.disabled = busy);
+    $("#modalRoot").setAttribute("aria-busy", String(busy));
+  }
   function createRoomMenu() {
     modal("Make a place for your people.", "Create an open room or a private party.", `<div class="modal-actions"><button id="makeRoom" class="modal-choice"><b>✳ Community room</b><small>Anyone can find and join.</small></button><button id="makeParty" class="modal-choice"><b>✦ Invite-only party</b><small>Only people with your invite can enter.</small></button></div>`);
     $("#makeRoom").onclick = () => roomForm(false); $("#makeParty").onclick = () => roomForm(true);
@@ -439,14 +472,14 @@
     $("#togglePassword").onclick = () => { const input = $("#authPassword"), show = input.type === "password"; input.type = show ? "text" : "password"; $("#togglePassword").textContent = show ? "Hide password" : "Show password"; $("#togglePassword").setAttribute("aria-pressed", String(show)); };
     $("#toLogin").onclick = () => authModal("login"); $("#toRegister").onclick = () => authModal("register");
     $("#authForm").onsubmit = async e => {
-      e.preventDefault(); const button = e.currentTarget.querySelector(".submit-button"); button.disabled = true; button.textContent = register ? "Creating account…" : "Signing in…";
+      e.preventDefault(); const form = e.currentTarget, button = form.querySelector(".submit-button"), errorField = form.querySelector("#authError"); setAccountBusy(true); errorField.textContent = ""; button.textContent = register ? "Creating account…" : "Signing in…";
       try {
         const endpoint = register ? "/api/register" : "/api/login";
         const result = await api(endpoint, { method: "POST", body: JSON.stringify({ name: register ? $("#authName").value.trim() : undefined, email: $("#authEmail").value.trim(), password: $("#authPassword").value, guestId: state.guest.id }) });
         const session = await api("/api/me");
         if (!session.user || session.user.id !== result.user?.id) throw new Error("Your account was accepted, but this browser did not receive its sign-in session. Check cookies for this site and try again.");
-        await refreshIdentity(session.user); closeModal(); toast(`Welcome, ${session.user.name}.`);
-      } catch (error) { if ($("#authError")) $("#authError").textContent = error.message; button.disabled = false; button.textContent = register ? "Create account" : "Sign in"; }
+        await refreshIdentity(session.user); setAccountBusy(false); closeModal(); toast(`Welcome, ${session.user.name}.`);
+      } catch (error) { setAccountBusy(false); if (form.isConnected) errorField.textContent = error.message; button.textContent = register ? "Create account" : "Sign in"; }
     };
     $("#guestMode").onclick = () => state.profile ? signOut() : closeModal();
     if ($("#logout")) $("#logout").onclick = signOut;
@@ -456,29 +489,30 @@
     const emojis = ["✦","🌙","🌻","🦊","🐸","🐈","🎧","🚀","🌊","⭐","🍄","🪐"];
     modal("Your profile", "Make your little corner feel like you.", `<form id="profileForm"><label>Display name<input id="profileName" required minlength="2" maxlength="32" value="${esc(state.profile.name)}" autocomplete="nickname"></label><label>Avatar<select id="profileEmoji">${emojis.map(emoji => `<option value="${emoji}" ${state.profile.emoji === emoji ? "selected" : ""}>${emoji}</option>`).join("")}</select></label><label>About me<input id="profileAbout" maxlength="100" value="${esc(state.profile.about || "")}" placeholder="A little about you"></label><label>Status<select id="profileStatus"><option value="online" ${state.profile.status !== "idle" && state.profile.status !== "dnd" ? "selected" : ""}>Online</option><option value="idle" ${state.profile.status === "idle" ? "selected" : ""}>Idle</option><option value="dnd" ${state.profile.status === "dnd" ? "selected" : ""}>Do not disturb</option></select></label><p id="profileError" class="auth-error" role="alert"></p><button class="submit-button">Save profile</button></form><button id="profileSignOut" class="subtle-button">Sign out</button>`);
     $("#profileForm").onsubmit = async event => {
-      event.preventDefault(); const button = event.currentTarget.querySelector(".submit-button"); button.disabled = true; button.textContent = "Saving…";
+      event.preventDefault(); const form = event.currentTarget, button = form.querySelector(".submit-button"), errorField = form.querySelector("#profileError"); setAccountBusy(true); button.textContent = "Saving…";
       try {
         const result = await api("/api/profile", { method: "POST", body: JSON.stringify({ name: $("#profileName").value.trim(), emoji: $("#profileEmoji").value, about: $("#profileAbout").value.trim(), status: $("#profileStatus").value }) });
-        state.profile = result.user; closeModal(); updateIdentity(); renderMembers(); renderMessages(); connectLive(); toast("Profile saved.");
-      } catch (error) { $("#profileError").textContent = error.message; button.disabled = false; button.textContent = "Save profile"; }
+        state.profile = result.user; setAccountBusy(false); closeModal(); updateIdentity(); renderMembers(); renderMessages(); connectLive(); toast("Profile saved.");
+      } catch (error) { setAccountBusy(false); if (form.isConnected) errorField.textContent = error.message; button.textContent = "Save profile"; }
     };
     $("#profileSignOut").onclick = signOut;
   }
-  async function refreshIdentity(profile) {
+  async function refreshIdentity(profile, resetChannel = false) {
     saveDraft(); clearTyping(); identityVersion++; state.stream?.close(); clearInterval(pollTimer);
-    state.profile = profile; state.messages = {}; state.parties = []; state.servers = []; state.members = []; lastEventSeq = 0; lastHeartbeat = 0; lastMessageSync = 0;
+    if (state.voiceRoom) await leaveVoice(true);
+    state.profile = profile; if (resetChannel) state.active = "global"; chooseDrafts(profile);
+    state.messages = {}; state.parties = []; state.servers = []; state.members = []; state.unread = {}; lastEventSeq = 0; lastHeartbeat = 0; lastMessageSync = 0;
     updateIdentity(); renderRoomList(); renderMessages(); renderMembers();
-    try { await bootstrap(); } finally { connectLive(); }
+    try { await bootstrap(); } catch (error) { state.loading = false; state.channelErrors[state.active] = error.message; renderMessages(); } finally { connectLive(); }
   }
   async function signOut() {
-    const button = $("#profileSignOut") || $("#logout"); if (button) button.disabled = true;
+    if (accountBusy) return; setAccountBusy(true);
     try {
       saveDraft(); clearTyping();
       if (state.voiceRoom) await leaveVoice(true);
       await api("/api/logout", { method: "POST", body: "{}" });
-      for (const id of [...state.parties.map(item => item.id), ...state.servers.flatMap(item => item.channels.map(channel => channel.id))]) delete drafts[id];
-      state.active = "global"; restoreDraft(); await refreshIdentity(null); closeModal(); toast("Signed out.");
-    } catch (error) { toast(error.message); if (button) button.disabled = false; }
+      await refreshIdentity(null, true); setAccountBusy(false); closeModal(); toast("Signed out.");
+    } catch (error) { setAccountBusy(false); toast(error.message); }
   }
   function updateIdentity() { $("#identityHint").textContent = state.profile ? `Signed in as ${state.profile.name}` : `Chatting as ${state.guest.name}`; $("#profileButton").textContent = state.profile?.emoji || (state.profile ? state.profile.name[0].toUpperCase() : "G"); $("#topProfile").textContent = state.profile ? `${state.profile.emoji || "◉"} ${state.profile.name}` : "Sign in"; $("#discoverAccount").textContent = state.profile ? "Your profile ↗" : "Sign in to your space ↗"; $("#discoverIdentity").textContent = state.profile ? `Welcome back, ${state.profile.name}. Your next conversation is waiting.` : "No introduction needed. Explore as a guest, or sign in to your profile."; }
   function renderMusic() {
@@ -520,6 +554,7 @@
     if (!["discover", "chat", "people", "voice"].includes(view)) return;
     const previousView = state.view;
     state.view = view; $(".main-panel").dataset.view = view; save(); renderHeader();
+    if (view === "chat" && state.unread[state.active]) { delete state.unread[state.active]; renderRoomList(); }
     ["discover", "chat", "people", "voice"].forEach(name => $(`#${name}View`).classList.toggle("hidden", name !== view));
     $("#mobileRoomNav").classList.toggle("is-hidden", view !== "chat");
     $$('[data-view]').forEach(button => { button.classList.toggle("active", button.dataset.view === view); button.setAttribute("aria-pressed", String(button.dataset.view === view)); });
@@ -816,6 +851,7 @@
     $("#voiceToggle").onclick = $("#voiceTabJoin").onclick = joinVoice; $("#voiceMute").onclick = $("#voiceTabMute").onclick = () => { state.muted = !state.muted; setVoiceDevice(); }; $("#voiceDeafen").onclick = $("#voiceTabDeafen").onclick = () => { state.deafened = !state.deafened; setVoiceDevice(); }; $("#mobileVoice").onclick = () => { state.voiceMobileOpen = !state.voiceMobileOpen; renderVoice(); };
     $$("[data-view]").forEach(button => button.onclick = () => setView(button.dataset.view));
     document.addEventListener("keydown", e => {
+      if (accountBusy) return;
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); search(); }
       if (e.key === "Escape") { closeModal(); state.voiceMobileOpen = false; renderVoice(); }
       if (e.key === "Tab" && $(".modal")) { const controls = $$(".modal button:not([disabled]), .modal input:not([disabled]), .modal select:not([disabled]), .modal textarea:not([disabled]), .modal a[href]").filter(item => item.getClientRects().length); const first = controls[0], last = controls.at(-1); if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last?.focus(); } else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first?.focus(); } }
@@ -823,9 +859,10 @@
     window.addEventListener("pagehide", () => { if (state.voiceRoom) navigator.sendBeacon(`${API_BASE}/api/voice/leave`, new Blob([JSON.stringify({ room: state.voiceRoom, peerId: state.peerId, guestId: state.guest.id })], { type: "application/json" })); relaySocket?.close(); micProcessor?.disconnect(); micSource?.disconnect(); mic?.getTracks().forEach(track => track.stop()); audioContext?.close(); state.stream?.close(); });
   }
   async function start() {
+    const version = identityVersion;
     clearTimeout(reconnectTimer); state.loading = true; setConnected(false, "Connecting…"); save(); setView(state.view); renderMessages();
-    try { const me = await api("/api/me"); state.profile = me.user; await processInvite(); await bootstrap(); updateIdentity(); setView(state.view); connectLive(); }
-    catch (error) { state.loading = false; state.channelErrors[state.active] = error.message; setConnected(false, "Reconnecting…"); renderMessages(); reconnectTimer = setTimeout(start, 8000); }
+    try { const me = await api("/api/me"); if (version !== identityVersion) return; state.profile = me.user; chooseDrafts(me.user); await processInvite(); await bootstrap(); if (version !== identityVersion) return; updateIdentity(); setView(state.view); connectLive(); }
+    catch (error) { if (version !== identityVersion) return; state.loading = false; state.channelErrors[state.active] = error.message; setConnected(false, "Reconnecting…"); renderMessages(); reconnectTimer = setTimeout(start, 8000); }
   }
-  bind(); renderMessages(); restoreDraft(); updateIdentity(); start();
+  bind(); renderMessages(); updateIdentity(); start();
 })();

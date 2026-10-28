@@ -451,3 +451,9 @@ h1,h2,h3,p { margin-top:0; }
 @media(prefers-reduced-motion:reduce) {
   *,*::before,*::after { animation:none!important; transition:none!important; scroll-behavior:auto!important; }
 }
+
+/* Activity stays visible while moving between conversations. */
+.unread-badge{display:inline-flex;align-items:center;justify-content:center;flex:none;min-width:22px;height:22px;margin-left:auto;padding:0 6px;border-radius:8px;background:#b5a0ff;color:#1c152d;font:700 11px/1 var(--body);font-style:normal}
+.space-row:has(.unread-badge) b{color:#f5f1ff}
+.mobile-room-chip .unread-badge{height:20px;min-width:20px;margin-left:3px;font-size:10px}
+#modalRoot[aria-busy="true"] .modal{cursor:progress}
