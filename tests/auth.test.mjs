@@ -25,8 +25,21 @@ function hostedFixture() {
   };
   const handler = createApiHandler(() => store);
   const request = (url, body, cookie = "") => handler(new Request(`https://orbit.test${url}`, { method: body ? "POST" : "GET", headers: { "Content-Type": "application/json", cookie }, ...(body ? { body: JSON.stringify(body) } : {}) }));
-  return { records, reads, store, request };
+  return { records, reads, store, request, handler };
 }
+
+test('hosted API rejects JSON values that are not request objects before accessing storage', async () => {
+  const { handler, records, reads } = hostedFixture();
+  for (const data of [null, [], 'text', 42, true]) {
+    const response = await handler(new Request('https://orbit.test/api/register', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data)
+    }));
+    assert.equal(response.status, 400);
+    assert.match((await response.json()).error, /JSON object/);
+  }
+  assert.equal(records.size, 0);
+  assert.equal(reads.length, 0);
+});
 
 test("hosted accounts retain sessions, reject bad passwords, and revoke on sign-out", async () => {
   const { request, records, reads } = hostedFixture();
@@ -98,6 +111,11 @@ test("local sessions survive a server restart and stay revoked after a second re
   const request = (url, body, cookie = "") => fetch(`http://127.0.0.1:${port}${url}`, { method: body ? "POST" : "GET", headers: { "Content-Type": "application/json", cookie }, ...(body ? { body: JSON.stringify(body) } : {}) });
   try {
     await start();
+    for (const data of [null, [], 'text', 42, true]) {
+      const response = await fetch(`http://127.0.0.1:${port}/api/register`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+      assert.equal(response.status, 400);
+      assert.match((await response.json()).error, /JSON object/);
+    }
     const created = await request("/api/register", credentials);
     assert.equal(created.status, 201);
     const cookie = cookieOf(created), user = (await created.json()).user;

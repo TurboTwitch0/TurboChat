@@ -46,6 +46,7 @@ return async function handler(request) {
   if (method !== "GET" && method !== "HEAD") {
     try { data = request.body ? await request.json() : {}; }
     catch { return reply(400, { error: "Invalid request body." }); }
+    if (!data || typeof data !== "object" || Array.isArray(data)) return reply(400, { error: "Invalid request body. Expected a JSON object." });
   }
   try {
     const store = storeFactory("orbit-chat");
