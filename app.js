@@ -63,9 +63,104 @@
   const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const name = () => state.profile?.name || state.guest.name;
   const drafts = saved.drafts && typeof saved.drafts === "object" && !Array.isArray(saved.drafts) ? saved.drafts : {};
+  let worldHistoryReset = saved.worldHistoryReset && Number.isFinite(saved.worldHistoryReset.through) && Array.isArray(saved.worldHistoryReset.ids) ? saved.worldHistoryReset : null;
+  let worldHistoryInitialized = saved.worldHistoryInitialized === true || !!worldHistoryReset;
+  const messageFollow = { room: null, pinned: true, generation: 0, adjusting: false, frame: null, anchor: null };
   let identityVersion = 0, modalOpener = null;
-  const save = () => { try { localStorage.setItem(storageKey, JSON.stringify({ guest: state.guest, active: state.active, view: state.view, followingRooms: state.followingRooms, drafts })); state.storageAvailable = true; return true; } catch { state.storageAvailable = false; return false; } };
+  const save = () => { try { localStorage.setItem(storageKey, JSON.stringify({ guest: state.guest, active: state.active, view: state.view, followingRooms: state.followingRooms, drafts, worldHistoryReset, worldHistoryInitialized })); state.storageAvailable = true; return true; } catch { state.storageAvailable = false; return false; } };
   const scrollBehavior = () => window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
+  function visibleMessages(channel, items = state.messages[channel] || []) {
+    if (channel !== "global" || !worldHistoryReset) return items;
+    const ids = new Set(worldHistoryReset.ids);
+    return items.filter(item => item.pending || item.failed || (!ids.has(item.id) && !(Date.parse(item.createdAt) < worldHistoryReset.through)));
+  }
+  function renderWorldHistory() {
+    $("#worldHistoryBar").classList.toggle("hidden", state.active !== "global");
+    $("#worldHistoryStatus").textContent = worldHistoryReset ? `Earlier texts hidden in this ${state.storageAvailable === false ? "tab" : "browser"}. New messages appear here.` : "History view · Only in this browser";
+    $("#worldHistoryToggle").textContent = worldHistoryReset ? "Restore history" : "Hide earlier texts";
+    $("#worldHistoryToggle").disabled = !worldHistoryReset && (state.loading || loadingChannels.has("global") || !(state.messages.global || []).some(item => !item.pending && !item.failed));
+  }
+  function initializeWorldHistory(channel, items) {
+    if (channel !== "global" || worldHistoryInitialized) return;
+    worldHistoryInitialized = true;
+    const earlier = items.filter(item => !item.pending && !item.failed);
+    if (earlier.length) worldHistoryReset = { through: Math.max(0, ...earlier.map(item => Date.parse(item.createdAt) || 0)), ids: earlier.map(item => item.id), hiddenAt: new Date().toISOString() };
+    save();
+  }
+  function hideWorldHistory() {
+    if (state.active !== "global" || state.loading || loadingChannels.has("global")) return;
+    const items = (state.messages.global || []).filter(item => !item.pending && !item.failed);
+    if (!items.length) return;
+    worldHistoryInitialized = true;
+    worldHistoryReset = { through: Math.max(0, ...items.map(item => Date.parse(item.createdAt) || 0)), ids: items.map(item => item.id), hiddenAt: new Date().toISOString() };
+    save(); renderMessages({ scrollToBottom: true });
+    toast(`Earlier World texts hidden in this ${state.storageAvailable === false ? "tab" : "browser"}. Restore them anytime.`);
+  }
+  function restoreWorldHistory() { worldHistoryInitialized = true; worldHistoryReset = null; save(); renderMessages({ scrollToBottom: true }); toast("The World's history is visible again in this browser."); }
+  function captureReadingAnchor() {
+    const feed = $("#messages"), edge = feed.getBoundingClientRect?.().top;
+    const article = [...(feed.querySelectorAll?.("[data-message-id]") || [])].find(item => item.getBoundingClientRect().bottom > edge);
+    return { id: article?.dataset.messageId, offset: article ? article.getBoundingClientRect().top - edge : 0, top: feed.scrollTop };
+  }
+  function restoreReadingAnchor(anchor) {
+    if (!anchor) return;
+    const feed = $("#messages"), article = anchor.id && [...(feed.querySelectorAll?.("[data-message-id]") || [])].find(item => item.dataset.messageId === anchor.id);
+    feed.scrollTop = article ? feed.scrollTop + article.getBoundingClientRect().top - feed.getBoundingClientRect().top - anchor.offset : anchor.top;
+  }
+  function updateJumpLatest() { $("#jumpLatest").classList.toggle("hidden", messageFollow.pinned || state.view !== "chat"); }
+  function cancelBottomScroll() {
+    messageFollow.generation++;
+    if (messageFollow.frame !== null) cancelAnimationFrame(messageFollow.frame);
+    messageFollow.frame = null; messageFollow.adjusting = false;
+  }
+  function pauseMessageFollow() {
+    cancelBottomScroll(); messageFollow.pinned = false; messageFollow.anchor = captureReadingAnchor(); updateJumpLatest();
+  }
+  function scheduleBottomScroll() {
+    if (!messageFollow.pinned || state.view !== "chat" || messageFollow.room !== state.active) return;
+    cancelBottomScroll(); messageFollow.adjusting = true;
+    const generation = messageFollow.generation, channel = state.active;
+    const settle = remaining => {
+      if (generation !== messageFollow.generation || !messageFollow.pinned || channel !== state.active || state.view !== "chat") return;
+      const feed = $("#messages");
+      feed.scrollTo({ top: Math.max(0, feed.scrollHeight - feed.clientHeight), behavior: "auto" });
+      if (remaining) messageFollow.frame = requestAnimationFrame(() => settle(remaining - 1));
+      else { messageFollow.frame = null; messageFollow.adjusting = false; }
+    };
+    settle(2);
+  }
+  function scrollToLatest(force = true) {
+    if (force) { messageFollow.pinned = true; messageFollow.anchor = null; }
+    updateJumpLatest(); scheduleBottomScroll();
+  }
+  function enterMessageRoom(id) { cancelBottomScroll(); messageFollow.room = id; messageFollow.pinned = true; messageFollow.anchor = null; updateJumpLatest(); }
+  function handleFeedScroll() {
+    if (messageFollow.adjusting || state.view !== "chat") return;
+    const feed = $("#messages"), atBottom = feed.scrollHeight - feed.clientHeight - feed.scrollTop <= 4;
+    if (atBottom) scrollToLatest();
+    else { messageFollow.pinned = false; messageFollow.anchor = captureReadingAnchor(); updateJumpLatest(); }
+  }
+  function initMessageScrolling() {
+    const feed = $("#messages");
+    feed.addEventListener("scroll", handleFeedScroll, { passive: true });
+    feed.addEventListener("wheel", event => { if (event.deltaY < 0) pauseMessageFollow(); }, { passive: true });
+    let touchY = 0;
+    feed.addEventListener("touchstart", event => { touchY = event.touches[0]?.clientY || 0; }, { passive: true });
+    feed.addEventListener("touchmove", event => { if ((event.touches[0]?.clientY || 0) > touchY) pauseMessageFollow(); }, { passive: true });
+    feed.addEventListener("pointerdown", event => { if (event.target === feed) pauseMessageFollow(); }, { passive: true });
+    feed.addEventListener("keydown", event => {
+      if (["ArrowUp", "PageUp", "Home"].includes(event.key) || (event.key === " " && event.shiftKey)) pauseMessageFollow();
+      if (event.key === "End" && !event.shiftKey) { event.preventDefault(); scrollToLatest(); }
+    });
+    const layoutChanged = () => { if (messageFollow.pinned) scheduleBottomScroll(); else restoreReadingAnchor(messageFollow.anchor); };
+    if (typeof ResizeObserver !== "undefined") { const observer = new ResizeObserver(layoutChanged); observer.observe(feed); observer.observe($("#messageList")); }
+    feed.addEventListener("load", layoutChanged, true);
+    document.fonts?.ready.then(layoutChanged);
+    document.fonts?.addEventListener("loadingdone", layoutChanged);
+    window.addEventListener("resize", layoutChanged);
+    $("#jumpLatest").onclick = () => scrollToLatest();
+    $("#worldHistoryToggle").onclick = () => worldHistoryReset ? restoreWorldHistory() : hideWorldHistory();
+  }
   function updateComposer() {
     const input = $("#messageInput");
     $("#charCount").textContent = input.value.length;
@@ -112,15 +207,22 @@
     $("#memberList").innerHTML = members.length ? members.map(row).join("") : `<div class="empty-state">${state.connected ? "You're here first. Say hello." : "Connecting to the chat…"}</div>`;
     $("#peopleList").innerHTML = members.length ? members.map(item => `<div class="person-card"><span class="avatar">${esc(item.emoji || "✦")}</span><b>${esc(item.name)}</b><small>${item.registered ? "Member" : "Guest"}</small></div>`).join("") : `<div class="empty-state">Invite someone to join you.</div>`;
   }
-  function renderMessage(item, i) {
+  function renderMessage(item) {
     const reactions = Object.entries(item.reactions || {}).map(([emoji, list]) => `<button class="reaction" data-react="${esc(item.id)}" data-emoji="${esc(emoji)}">${esc(emoji)} ${list.length}</button>`).join("");
     const stamp = new Date(item.createdAt || Date.now());
-    const actions = item.pending ? `<span class="message-delivery">Sending…</span>` : item.failed ? `<span class="message-delivery failed">Not sent</span><button class="retry-message" data-retry-message="${esc(item.id)}">Try again</button>` : `${reactions}<button class="reaction" data-react="${esc(item.id)}" data-emoji="💜" aria-label="React with a purple heart">💜 +</button><button class="reply-link" data-reply="${i}">↩ Reply</button>`;
+    const actions = item.pending ? `<span class="message-delivery">Sending…</span>` : item.failed ? `<span class="message-delivery failed">Not sent</span><button class="retry-message" data-retry-message="${esc(item.id)}">Try again</button>` : `${reactions}<button class="reaction" data-react="${esc(item.id)}" data-emoji="💜" aria-label="React with a purple heart">💜 +</button><button class="reply-link" data-reply="${esc(item.id)}">↩ Reply</button>`;
     return `<article class="message ${item.failed ? "message-failed" : ""}" data-message-id="${esc(item.id)}"><span class="avatar">${esc(item.emoji || "✦")}</span><div class="message-body"><div class="message-meta"><b>${esc(item.user || "Guest")}</b>${item.registered ? `<i>member</i>` : ""}<time datetime="${esc(stamp.toISOString())}" title="${esc(stamp.toLocaleString())}">${new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" }).format(stamp)}</time></div><p>${esc(item.text)}</p><div class="message-actions">${actions}</div></div></article>`;
   }
   function renderMessages({ scrollToBottom = false } = {}) {
-    const current = room(state.active), items = state.messages[state.active] || [];
-    const feed = $("#messages"), previousTop = feed.scrollTop, wasAtBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 140;
+    const current = room(state.active), rawItems = state.messages[state.active] || [], items = visibleMessages(state.active, rawItems);
+    const feed = $("#messages"), list = $("#messageList");
+    if (messageFollow.room !== state.active) enterMessageRoom(state.active);
+    const anchor = !scrollToBottom && !messageFollow.pinned ? captureReadingAnchor() : null;
+    messageFollow.adjusting = true;
+    const finish = () => {
+      if (scrollToBottom || messageFollow.pinned) scrollToLatest(scrollToBottom);
+      else { restoreReadingAnchor(anchor); messageFollow.anchor = anchor; messageFollow.adjusting = false; updateJumpLatest(); }
+    };
     const channelInfo = info[state.active] || [current.name, current.topic || "Come in and say hello.", current.emoji || "✦", current.topic || "A friendly space for good conversation."];
     renderHeader(); $("#topicText").textContent = channelInfo[3];
     const isFollowing = state.followingRooms.includes(state.active);
@@ -128,18 +230,19 @@
     $("#followButton").classList.toggle("following", isFollowing);
     $("#followButton").setAttribute("aria-pressed", String(isFollowing));
     $("#messageInput").placeholder = `Message ${channelInfo[0]}…`; $("#musicPanel").classList.toggle("hidden", state.active !== "music");
-    if (!items.length && (state.loading || loadingChannels.has(state.active))) {
-      feed.setAttribute("aria-busy", "true"); feed.innerHTML = `<div class="conversation-loading" role="status"><span class="loading-orbit" aria-hidden="true">◌</span><b>Finding your conversations</b><p>A little hello is on its way.</p><div class="skeleton-message"></div><div class="skeleton-message short"></div><div class="skeleton-message"></div></div>`; return;
+    renderWorldHistory();
+    if (!rawItems.length && (state.loading || loadingChannels.has(state.active))) {
+      feed.setAttribute("aria-busy", "true"); list.innerHTML = `<div class="conversation-loading" role="status"><span class="loading-orbit" aria-hidden="true">◌</span><b>Finding your conversations</b><p>A little hello is on its way.</p><div class="skeleton-message"></div><div class="skeleton-message short"></div><div class="skeleton-message"></div></div>`; finish(); return;
     }
     feed.setAttribute("aria-busy", "false");
-    if (!items.length && state.channelErrors[state.active]) {
-      feed.innerHTML = `<div class="offline-card"><img src="assets/turbochat-mark.svg" alt="" width="60" height="60"><small>LET’S RECONNECT</small><h2>Your conversation can wait.<br>Your words are still here.</h2><p>We couldn’t load this room. ${state.storageAvailable === false ? "Keep this tab open to keep your draft." : "Your draft stays on this device while you reconnect."}</p><p class="connection-detail">${esc(state.channelErrors[state.active])}</p><button data-retry-channel>Try this room again ↻</button></div>`; return;
+    if (!rawItems.length && state.channelErrors[state.active]) {
+      list.innerHTML = `<div class="offline-card"><img src="assets/turbochat-mark.svg" alt="" width="60" height="60"><small>LET’S RECONNECT</small><h2>Your conversation can wait.<br>Your words are still here.</h2><p>We couldn’t load this room. ${state.storageAvailable === false ? "Keep this tab open to keep your draft." : "Your draft stays on this device while you reconnect."}</p><p class="connection-detail">${esc(state.channelErrors[state.active])}</p><button data-retry-channel>Try this room again ↻</button></div>`; finish(); return;
     }
-    const greeting = `<div class="welcome-card ${items.length ? "has-history" : "is-empty"}"><span>${esc(channelInfo[2])}</span><div><small>${items.length ? "YOUR CONVERSATION" : "A FRESH START"}</small><h2>${state.active === "global" ? "Good conversations start with a hello." : `Make yourself at home in ${esc(channelInfo[0])}.`}</h2><p>${items.length ? "Pick up where the conversation left off." : esc(channelInfo[3])}</p>${items.length ? "" : `<div class="empty-actions"><button class="primary-action" data-compose>Write the first hello <span>↗</span></button><button class="text-action" data-search-open>Find another room</button></div><div class="empty-note">Your message is sent only when you press Send.</div>`}</div></div>${items.length ? `<div class="day-label">CONVERSATION HISTORY</div>` : ""}`;
+    const hiddenHistory = state.active === "global" && worldHistoryReset;
+    const greeting = `<div class="welcome-card ${items.length ? "has-history" : "is-empty"}"><span>${esc(channelInfo[2])}</span><div><small>${items.length ? "YOUR CONVERSATION" : "A FRESH START"}</small><h2>${hiddenHistory && !items.length ? "A fresh view of The World." : state.active === "global" ? "Good conversations start with a hello." : `Make yourself at home in ${esc(channelInfo[0])}.`}</h2><p>${items.length ? "Pick up where the conversation left off." : hiddenHistory ? `Earlier texts are hidden in this ${state.storageAvailable === false ? "tab" : "browser"}. New messages will appear here.` : esc(channelInfo[3])}</p>${items.length ? "" : `<div class="empty-actions"><button class="primary-action" data-compose>${hiddenHistory ? "Write a hello" : "Write the first hello"} <span>↗</span></button><button class="text-action" data-search-open>Find another room</button></div><div class="empty-note">Your message is sent only when you press Send.</div>`}</div></div>${items.length ? `<div class="day-label">CONVERSATION HISTORY</div>` : ""}`;
     let previousDay = "";
-    feed.innerHTML = greeting + items.map((item, i) => { const date = new Date(item.createdAt || Date.now()), day = date.toLocaleDateString(); const label = day !== previousDay ? `<div class="day-label">${esc(date.toLocaleDateString([], { month: "long", day: "numeric", year: "numeric" }))}</div>` : ""; previousDay = day; return label + renderMessage(item, i); }).join("");
-    if (scrollToBottom || wasAtBottom) feed.scrollTo({ top: feed.scrollHeight, behavior: scrollBehavior() });
-    else feed.scrollTop = previousTop;
+    list.innerHTML = greeting + items.map(item => { const date = new Date(item.createdAt || Date.now()), day = date.toLocaleDateString(); const label = day !== previousDay ? `<div class="day-label">${esc(date.toLocaleDateString([], { month: "long", day: "numeric", year: "numeric" }))}</div>` : ""; previousDay = day; return label + renderMessage(item); }).join("");
+    finish();
     $("#voiceRoomName").textContent = `${channelInfo[0]} voice`; renderVoice();
   }
   function mergeMessages(channel, incoming) {
@@ -163,7 +266,7 @@
   async function loadChannel(id) {
     const version = identityVersion;
     loadingChannels.add(id); delete state.channelErrors[id]; if (state.active === id) renderMessages();
-    try { const data = await api(`/api/messages?channel=${encodeURIComponent(id)}&guestId=${encodeURIComponent(state.guest.id)}`); if (version === identityVersion) mergeMessages(id, data.messages || []); }
+    try { const data = await api(`/api/messages?channel=${encodeURIComponent(id)}&guestId=${encodeURIComponent(state.guest.id)}`); if (version === identityVersion) { mergeMessages(id, data.messages || []); initializeWorldHistory(id, data.messages || []); } }
     catch (error) { if (version === identityVersion) state.channelErrors[id] = error.message; }
     finally { loadingChannels.delete(id); if (version === identityVersion && state.active === id) renderMessages(); }
   }
@@ -176,7 +279,7 @@
       data = await api(`/api/bootstrap?channel=global&guestId=${encodeURIComponent(state.guest.id)}`);
     }
     if (version !== identityVersion) return;
-    state.loading = false; delete state.channelErrors[channel];
+    state.loading = false; delete state.channelErrors[channel]; initializeWorldHistory(channel, data.messages || []);
     state.rooms = data.rooms || []; state.parties = data.parties || []; state.servers = [...new Map((data.servers || []).map(server => [server.id, server])).values()]; mergeMessages(channel, data.messages || []); state.members = data.members || []; state.registered = Number(data.registeredCount) || 1428; state.goal = Number(data.memberGoal) || 1500; state.music = data.music || null; renderRoomList(); renderMessages(); renderMembers(); renderMusic(); restoreDraft();
   }
   function connectLive() {
@@ -251,7 +354,7 @@
     if (!allRooms().some(item => item.id === id)) return;
     saveDraft(); clearTyping();
     if (state.voiceRoom && state.voiceRoom !== id) await leaveVoice(true);
-    state.active = id; save(); restoreDraft(); renderRoomList();
+    state.active = id; enterMessageRoom(id); save(); restoreDraft(); renderRoomList();
     if (room(id).type === "voice") { $("#voiceTabRoomName").textContent = room(id).name; setView("voice"); renderVoiceRooms(); return; }
     setView("chat"); renderMessages(); await loadChannel(id);
   }
@@ -415,11 +518,14 @@
   }
   function setView(view) {
     if (!["discover", "chat", "people", "voice"].includes(view)) return;
+    const previousView = state.view;
     state.view = view; $(".main-panel").dataset.view = view; save(); renderHeader();
     ["discover", "chat", "people", "voice"].forEach(name => $(`#${name}View`).classList.toggle("hidden", name !== view));
     $("#mobileRoomNav").classList.toggle("is-hidden", view !== "chat");
     $$('[data-view]').forEach(button => { button.classList.toggle("active", button.dataset.view === view); button.setAttribute("aria-pressed", String(button.dataset.view === view)); });
     if (view === "voice") renderVoiceRooms();
+    updateJumpLatest();
+    if (view === "chat" && previousView !== "chat") scrollToLatest();
   }
   function renderVoice() {
     const self = !!state.voiceRoom, others = state.voiceMembers.filter(item => item.peerId !== state.peerId);
@@ -637,7 +743,7 @@
     const roomResults = term => allRooms().filter(item => item.name.toLowerCase().includes(term) || (item.topic || "").toLowerCase().includes(term)).map(item => `<button data-search-room="${esc(item.id)}">${esc(item.emoji || "✦")} ${esc(item.name)}<small>${esc(item.topic || "")}</small></button>`).join("") || `<p class="empty-state">No matching room yet.</p>`;
     const messageResults = term => {
       const words = term.split(/\s+/).filter(Boolean), hits = [];
-      for (const [channel, messages] of cache) for (const item of messages) {
+      for (const [channel, messages] of cache) for (const item of visibleMessages(channel, messages)) {
         const content = String(item.text || "").toLowerCase();
         if (words.every(word => content.includes(word))) hits.push({ channel, item });
       }
@@ -669,6 +775,7 @@
     input.oninput = update; input.focus(); update();
   }
   function bind() {
+    initMessageScrolling();
     document.addEventListener("click", event => {
       const showcaseChoice = event.target.closest("[data-showcase-select]"); if (showcaseChoice) selectShowcase(Number(showcaseChoice.dataset.showcaseSelect));
       if (event.target.closest("[data-compose]")) { setView("chat"); $("#messageInput").focus(); }
@@ -683,13 +790,13 @@
         const id = searchMessage.dataset.searchMessage, channelId = searchMessage.dataset.searchChannel; closeModal();
         selectChannel(channelId).then(() => requestAnimationFrame(() => {
           const target = document.querySelector(`[data-message-id="${CSS.escape(id)}"]`);
-          if (target) { target.scrollIntoView({ block: "center", behavior: scrollBehavior() }); target.classList.add("search-highlight"); setTimeout(() => target.classList.remove("search-highlight"), 1800); }
+          if (target) { pauseMessageFollow(); target.scrollIntoView({ block: "center", behavior: scrollBehavior() }); target.classList.add("search-highlight"); setTimeout(() => target.classList.remove("search-highlight"), 1800); }
         }));
       }
       const track = event.target.closest("[data-track]"); if (track) playBuiltin(track.dataset.track);
       const react = event.target.closest("[data-react]"); if (react) api("/api/reactions", { method: "POST", body: JSON.stringify({ channel: state.active, messageId: react.dataset.react, emoji: react.dataset.emoji, guestId: state.guest.id, guestName: name() }) }).catch(error => toast(error.message));
       const retry = event.target.closest("[data-retry-message]"); if (retry) { const item = (state.messages[state.active] || []).find(item => item.id === retry.dataset.retryMessage); if (item?.failed) sendMessage(item.text, item.id); }
-      const reply = event.target.closest("[data-reply]"); if (reply) { const item = (state.messages[state.active] || [])[Number(reply.dataset.reply)]; const input = $("#messageInput"); input.value = (`@${item?.user || "Guest"} ` + input.value).slice(0, 700); saveDraft(); input.focus(); }
+      const reply = event.target.closest("[data-reply]"); if (reply) { const item = visibleMessages(state.active).find(item => item.id === reply.dataset.reply); if (!item) return; const input = $("#messageInput"); input.value = (`@${item?.user || "Guest"} ` + input.value).slice(0, 700); saveDraft(); input.focus(); }
     });
     $("#createSpace").onclick = createRoomMenu; $("#createServer").onclick = $("#railCreate").onclick = createServerModal; $("#searchOpen").onclick = $("#mobileSearch").onclick = search; $("#inviteButton").onclick = $("#peopleInvite").onclick = inviteGeneral;
     $("#followButton").onclick = toggleFollow;
