@@ -128,7 +128,11 @@ function live(req, res, url) {
 async function readBody(req) {
   let raw = "";
   for await (const chunk of req) { raw += chunk; if (raw.length > 65536) throw Object.assign(new Error("Request body is too large."), { status: 413 }); }
-  try { return JSON.parse(raw || "{}"); } catch { throw Object.assign(new Error("Invalid request body."), { status: 400 }); }
+  try {
+    const data = JSON.parse(raw || "{}");
+    if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("Expected a JSON object.");
+    return data;
+  } catch { throw Object.assign(new Error("Invalid request body. Expected a JSON object."), { status: 400 }); }
 }
 function cookieHeader(token, req) { return `orbit_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000${req.socket.encrypted || process.env.COOKIE_SECURE === "true" ? "; Secure" : ""}`; }
 const mime = { ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg", ".wav": "audio/wav", ".ico": "image/x-icon" };
