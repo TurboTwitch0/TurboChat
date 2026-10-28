@@ -5,6 +5,7 @@ const root = path.resolve(__dirname, "..");
 const publish = path.join(root, "dist");
 fs.rmSync(publish, { recursive: true, force: true });
 fs.mkdirSync(publish, { recursive: true });
-for (const file of ["index.html", "app.js", "styles.css"]) fs.copyFileSync(path.join(root, file), path.join(publish, file));
+for (const file of ["index.html", "app.js", "styles.css", "brand.css"]) fs.copyFileSync(path.join(root, file), path.join(publish, file));
+fs.cpSync(path.join(root, "assets"), path.join(publish, "assets"), { recursive: true });
 fs.cpSync(path.join(root, "media"), path.join(publish, "media"), { recursive: true });
 console.log("Netlify static site built in dist/.");

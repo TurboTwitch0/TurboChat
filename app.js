@@ -23,7 +23,8 @@
     makers: ["The Makers Table", "A friendly corner for things in progress.", "✳", "Show us what you’re making, learning, or figuring out."],
     lounge: ["The Slow Lounge", "A softer room for slower conversations.", "☾", "Take a breath. What’s one good thing from today?"]
   };
-  const state = { guest, profile: null, active: saved.active || "global", rooms: [], parties: [], servers: [], messages: {}, music: null, members: [], registered: 1428, goal: 1500, followingRooms: Array.isArray(saved.followingRooms) ? saved.followingRooms : [], connected: false, stream: null, peerId: crypto.randomUUID(), voiceRoom: "", joiningVoice: false, voiceMembers: [], muted: false, deafened: false, voiceError: "", voiceMobileOpen: false };
+  const state = { guest, profile: null, active: saved.active || "global", view: ["discover", "chat", "people", "voice"].includes(saved.view) ? saved.view : "discover", loading: true, channelErrors: {}, rooms: [], parties: [], servers: [], messages: {}, music: null, members: [], registered: 1428, goal: 1500, followingRooms: Array.isArray(saved.followingRooms) ? saved.followingRooms : [], connected: false, stream: null, peerId: crypto.randomUUID(), voiceRoom: "", joiningVoice: false, voiceMembers: [], muted: false, deafened: false, voiceError: "", voiceMobileOpen: false };
+  const loadingChannels = new Set();
   let mic = null, audioContext = null, micSource = null, micProcessor = null, relaySocket = null, outputGain = null, outputSchedule = new Map(), toastTimer, reconnectTimer, typingTimer, typingStopTimer, pollTimer, lastEventSeq = 0, lastHeartbeat = 0, lastMessageSync = 0, lastVoiceHeartbeat = 0, localTyping = false, polling = false;
   const typingPeers = new Map();
   const voicePeers = new Map();
@@ -34,12 +35,13 @@
   const name = () => state.profile?.name || state.guest.name;
   const drafts = saved.drafts && typeof saved.drafts === "object" && !Array.isArray(saved.drafts) ? saved.drafts : {};
   let identityVersion = 0, modalOpener = null;
-  const save = () => { try { localStorage.setItem(storageKey, JSON.stringify({ guest: state.guest, active: state.active, followingRooms: state.followingRooms, drafts })); } catch { /* Chat still works when browser storage is unavailable. */ } };
+  const save = () => { try { localStorage.setItem(storageKey, JSON.stringify({ guest: state.guest, active: state.active, view: state.view, followingRooms: state.followingRooms, drafts })); state.storageAvailable = true; return true; } catch { state.storageAvailable = false; return false; } };
+  const scrollBehavior = () => window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
   function updateComposer() {
     const input = $("#messageInput");
     $("#charCount").textContent = input.value.length;
     input.style.height = "auto"; input.style.height = `${Math.min(input.scrollHeight, 130)}px`;
-    $("#draftHint").textContent = input.value ? "Draft saved on this device" : "";
+    $("#draftHint").textContent = input.value ? state.storageAvailable === false ? "Draft kept in this tab" : "Draft saved on this device" : "";
     $("#sendButton").disabled = !state.connected || !input.value.trim();
   }
   function saveDraft() { const value = $("#messageInput").value; if (value) drafts[state.active] = value; else delete drafts[state.active]; save(); updateComposer(); }
@@ -57,6 +59,10 @@
   function setConnected(value, label) {
     state.connected = value; $("#connectionLabel").textContent = label || (value ? "Connected" : "Reconnecting…");
     $("#connectionLabel").classList.toggle("offline", !value); updateComposer(); renderVoice();
+    $("#connectionBanner").classList.toggle("hidden", value);
+    $("#connectionBanner").classList.toggle("is-loading", state.loading);
+    $("#connectionMessage").textContent = state.loading ? "Finding your conversations…" : state.storageAvailable === false ? "Chat is reconnecting. You can keep writing; your draft stays in this tab." : "Chat is reconnecting. You can keep writing; your draft stays on this device.";
+    $("#retryConnection").classList.toggle("hidden", state.loading);
   }
   function renderRoomList() {
     const rooms = allRooms();
@@ -87,16 +93,23 @@
     const current = room(state.active), items = state.messages[state.active] || [];
     const feed = $("#messages"), previousTop = feed.scrollTop, wasAtBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 140;
     const channelInfo = info[state.active] || [current.name, current.topic || "Come in and say hello.", current.emoji || "✦", current.topic || "A friendly space for good conversation."];
-    $("#channelTitle").textContent = channelInfo[0]; $("#channelSubtitle").textContent = channelInfo[1]; $("#channelGlyph").textContent = channelInfo[2]; $("#topicText").textContent = channelInfo[3];
+    renderHeader(); $("#topicText").textContent = channelInfo[3];
     const isFollowing = state.followingRooms.includes(state.active);
     $("#followButton").textContent = isFollowing ? "✓ Following" : "✧ Follow";
     $("#followButton").classList.toggle("following", isFollowing);
     $("#followButton").setAttribute("aria-pressed", String(isFollowing));
     $("#messageInput").placeholder = `Message ${channelInfo[0]}…`; $("#musicPanel").classList.toggle("hidden", state.active !== "music");
-    const greeting = `<div class="welcome-card"><span>${esc(channelInfo[2])}</span><div><h2>${state.active === "global" ? "The world is a little smaller now." : `Welcome to ${esc(channelInfo[0])}.`}</h2><p>${items.length ? "Join the conversation. Messages arrive live." : "No messages yet. Start the conversation."}</p></div></div><div class="day-label">LIVE CONVERSATION</div>`;
+    if (!items.length && (state.loading || loadingChannels.has(state.active))) {
+      feed.setAttribute("aria-busy", "true"); feed.innerHTML = `<div class="conversation-loading" role="status"><span class="loading-orbit" aria-hidden="true">◌</span><b>Finding your conversations</b><p>A little hello is on its way.</p><div class="skeleton-message"></div><div class="skeleton-message short"></div><div class="skeleton-message"></div></div>`; return;
+    }
+    feed.setAttribute("aria-busy", "false");
+    if (!items.length && state.channelErrors[state.active]) {
+      feed.innerHTML = `<div class="offline-card"><img src="assets/turbochat-mark.svg" alt="" width="60" height="60"><small>LET’S RECONNECT</small><h2>Your conversation can wait.<br>Your words are still here.</h2><p>We couldn’t load this room. ${state.storageAvailable === false ? "Keep this tab open to keep your draft." : "Your draft stays on this device while you reconnect."}</p><p class="connection-detail">${esc(state.channelErrors[state.active])}</p><button data-retry-channel>Try this room again ↻</button></div>`; return;
+    }
+    const greeting = `<div class="welcome-card ${items.length ? "has-history" : "is-empty"}"><span>${esc(channelInfo[2])}</span><div><small>${items.length ? "YOUR CONVERSATION" : "A FRESH START"}</small><h2>${state.active === "global" ? "Good conversations start with a hello." : `Make yourself at home in ${esc(channelInfo[0])}.`}</h2><p>${items.length ? "Pick up where the conversation left off." : esc(channelInfo[3])}</p>${items.length ? "" : `<div class="empty-actions"><button class="primary-action" data-compose>Write the first hello <span>↗</span></button><button class="text-action" data-search-open>Find another room</button></div><div class="empty-note">Your message is sent only when you press Send.</div>`}</div></div>${items.length ? `<div class="day-label">CONVERSATION HISTORY</div>` : ""}`;
     let previousDay = "";
     feed.innerHTML = greeting + items.map((item, i) => { const date = new Date(item.createdAt || Date.now()), day = date.toLocaleDateString(); const label = day !== previousDay ? `<div class="day-label">${esc(date.toLocaleDateString([], { month: "long", day: "numeric", year: "numeric" }))}</div>` : ""; previousDay = day; return label + renderMessage(item, i); }).join("");
-    if (scrollToBottom || wasAtBottom) feed.scrollTo({ top: feed.scrollHeight, behavior: "smooth" });
+    if (scrollToBottom || wasAtBottom) feed.scrollTo({ top: feed.scrollHeight, behavior: scrollBehavior() });
     else feed.scrollTop = previousTop;
     $("#voiceRoomName").textContent = `${channelInfo[0]} voice`; renderVoice();
   }
@@ -120,8 +133,10 @@
   }
   async function loadChannel(id) {
     const version = identityVersion;
-    try { const data = await api(`/api/messages?channel=${encodeURIComponent(id)}&guestId=${encodeURIComponent(state.guest.id)}`); if (version === identityVersion && mergeMessages(id, data.messages || []) && state.active === id) renderMessages(); }
-    catch (error) { toast(error.message); }
+    loadingChannels.add(id); delete state.channelErrors[id]; if (state.active === id) renderMessages();
+    try { const data = await api(`/api/messages?channel=${encodeURIComponent(id)}&guestId=${encodeURIComponent(state.guest.id)}`); if (version === identityVersion) mergeMessages(id, data.messages || []); }
+    catch (error) { if (version === identityVersion) state.channelErrors[id] = error.message; }
+    finally { loadingChannels.delete(id); if (version === identityVersion && state.active === id) renderMessages(); }
   }
   async function bootstrap() {
     let data, channel = state.active; const version = identityVersion;
@@ -132,6 +147,7 @@
       data = await api(`/api/bootstrap?channel=global&guestId=${encodeURIComponent(state.guest.id)}`);
     }
     if (version !== identityVersion) return;
+    state.loading = false; delete state.channelErrors[channel];
     state.rooms = data.rooms || []; state.parties = data.parties || []; state.servers = [...new Map((data.servers || []).map(server => [server.id, server])).values()]; mergeMessages(channel, data.messages || []); state.members = data.members || []; state.registered = Number(data.registeredCount) || 1428; state.goal = Number(data.memberGoal) || 1500; state.music = data.music || null; renderRoomList(); renderMessages(); renderMembers(); renderMusic(); restoreDraft();
   }
   function connectLive() {
@@ -212,7 +228,7 @@
   }
   function modal(title, subtitle, body) {
     if (!$("#modalRoot").childElementCount) modalOpener = document.activeElement;
-    $("#modalRoot").innerHTML = `<div class="modal-backdrop"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle" aria-describedby="modalDescription"><button class="modal-close" data-close aria-label="Close dialog">×</button><small>ORBIT</small><h2 id="modalTitle">${esc(title)}</h2><p id="modalDescription">${esc(subtitle)}</p>${body}</section></div>`;
+    $("#modalRoot").innerHTML = `<div class="modal-backdrop"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle" aria-describedby="modalDescription"><button class="modal-close" data-close aria-label="Close dialog">×</button><div class="modal-brand"><img src="assets/turbochat-mark.svg" alt="" width="30" height="30"><span>TurboChat</span></div><h2 id="modalTitle">${esc(title)}</h2><p id="modalDescription">${esc(subtitle)}</p>${body}</section></div>`;
     $(".app-shell").inert = true; $("#mobileVoice").inert = true;
     $("[data-close]").addEventListener("click", closeModal); $(".modal-backdrop").addEventListener("click", e => { if (e.target.classList.contains("modal-backdrop")) closeModal(); });
     ($(".modal input:not([readonly])") || $(".modal button:not([data-close])") || $("[data-close]")).focus();
@@ -277,7 +293,7 @@
         const result = await api("/api/parties/join", { method: "POST", body: JSON.stringify({ id: data.id, inviteCode: data.inviteCode, guestId: state.guest.id }) });
         state.parties = (state.parties || []).filter(item => item.id !== result.room.id); state.parties.unshift(result.room); state.active = result.room.id;
       }
-      save(); history.replaceState({}, "", location.pathname); toast(`You joined ${data.name || "the server"}.`);
+      state.view = "chat"; save(); history.replaceState({}, "", location.pathname); toast(`You joined ${data.name || "the server"}.`);
     } catch (error) { history.replaceState({}, "", location.pathname); toast(error.message); }
   }
   function inviteGeneral() {
@@ -287,7 +303,8 @@
   }
   function authModal(mode = "login") {
     const register = mode === "register";
-    modal(register ? "Create your account." : "Welcome back.", register ? "Your account follows you on this server." : "Sign in to your Orbit account.", `<div class="auth-tabs"><button id="toLogin" class="${register ? "" : "active"}">Sign in</button><button id="toRegister" class="${register ? "active" : ""}">Create account</button></div><form id="authForm">${register ? `<label>Display name<input id="authName" required minlength="2" maxlength="32" autocomplete="nickname"></label>` : ""}<label>Email<input id="authEmail" type="email" required autocomplete="email" autocapitalize="none" spellcheck="false"></label><label>Password<input id="authPassword" type="password" required minlength="${register ? "8" : "1"}" maxlength="128" autocomplete="${register ? "new-password" : "current-password"}"></label><p id="authError" class="auth-error" role="alert"></p><button class="submit-button">${register ? "Create account" : "Sign in"}</button></form>${state.profile ? `<button id="logout" class="subtle-button">Sign out</button>` : ""}<button id="guestMode" class="subtle-button">Continue as ${esc(state.guest.name)}</button>`);
+    modal(register ? "Make room for you." : "Your people are a hello away.", register ? "Create a TurboChat account to keep your profile and server memberships." : "Sign in to your TurboChat account. You can also keep exploring as a guest.", `<div class="auth-tabs"><button id="toLogin" class="${register ? "" : "active"}">Sign in</button><button id="toRegister" class="${register ? "active" : ""}">Create account</button></div><form id="authForm">${register ? `<label>Display name<input id="authName" required minlength="2" maxlength="32" autocomplete="nickname" placeholder="What should we call you?"></label>` : ""}<label>Email<input id="authEmail" type="email" required autocomplete="email" autocapitalize="none" spellcheck="false" placeholder="you@example.com"></label><label>Password<input id="authPassword" type="password" required minlength="${register ? "8" : "1"}" maxlength="128" autocomplete="${register ? "new-password" : "current-password"}" placeholder="${register ? "At least 8 characters" : "Your password"}"></label><button type="button" id="togglePassword" class="password-toggle" aria-pressed="false">Show password</button><p id="authError" class="auth-error" role="alert"></p><button class="submit-button">${register ? "Create account" : "Sign in"} <span aria-hidden="true">↗</span></button></form>${state.profile ? `<button id="logout" class="subtle-button">Sign out</button>` : ""}<div class="guest-divider"><span>or take a look around</span></div><button id="guestMode" class="subtle-button guest-action">Continue as ${esc(state.guest.name)} →</button>`);
+    $("#togglePassword").onclick = () => { const input = $("#authPassword"), show = input.type === "password"; input.type = show ? "text" : "password"; $("#togglePassword").textContent = show ? "Hide password" : "Show password"; $("#togglePassword").setAttribute("aria-pressed", String(show)); };
     $("#toLogin").onclick = () => authModal("login"); $("#toRegister").onclick = () => authModal("register");
     $("#authForm").onsubmit = async e => {
       e.preventDefault(); const button = e.currentTarget.querySelector(".submit-button"); button.disabled = true; button.textContent = register ? "Creating account…" : "Signing in…";
@@ -331,7 +348,7 @@
       state.active = "global"; restoreDraft(); await refreshIdentity(null); closeModal(); toast("Signed out.");
     } catch (error) { toast(error.message); if (button) button.disabled = false; }
   }
-  function updateIdentity() { $("#identityHint").textContent = state.profile ? `Signed in as ${state.profile.name}` : `Chatting as ${state.guest.name}`; $("#profileButton").textContent = state.profile?.emoji || (state.profile ? state.profile.name[0].toUpperCase() : "G"); $("#topProfile").textContent = state.profile ? `${state.profile.emoji || "◉"} ${state.profile.name}` : "Sign in"; }
+  function updateIdentity() { $("#identityHint").textContent = state.profile ? `Signed in as ${state.profile.name}` : `Chatting as ${state.guest.name}`; $("#profileButton").textContent = state.profile?.emoji || (state.profile ? state.profile.name[0].toUpperCase() : "G"); $("#topProfile").textContent = state.profile ? `${state.profile.emoji || "◉"} ${state.profile.name}` : "Sign in"; $("#discoverAccount").textContent = state.profile ? "Your profile ↗" : "Sign in to your space ↗"; $("#discoverIdentity").textContent = state.profile ? `Welcome back, ${state.profile.name}. Your next conversation is waiting.` : "No introduction needed. Explore as a guest, or sign in to your profile."; }
   function renderMusic() {
     const builtins = [
       ["neon", "Neon Postcards", "Retro pop · 112 BPM", "neon-postcards.wav"], ["midnight", "Midnight Arcade", "Synthwave · 118 BPM", "midnight-arcade.wav"], ["dreamwave", "Dreamwave Radio", "Dream pop · 96 BPM", "dreamwave-radio.wav"], ["orbit", "Slow Orbit", "Ambient pop · 82 BPM", "slow-orbit.wav"]
@@ -361,9 +378,18 @@
   async function selectVoiceRoom(id) {
     await selectChannel(id); renderVoice();
   }
+  function renderHeader() {
+    const current = room(state.active), details = info[state.active] || [current.name, current.topic || "Come in and say hello.", current.emoji || "✦"];
+    const headings = { discover: ["Explore TurboChat", "Find your people. Keep the conversation going.", "✳"], people: ["Your people", "Good conversations bring us a little closer.", "♧"] };
+    const heading = headings[state.view] || details;
+    $("#channelTitle").textContent = heading[0]; $("#channelSubtitle").textContent = heading[1]; $("#channelGlyph").textContent = heading[2];
+  }
   function setView(view) {
-    ["chat", "people", "voice"].forEach(name => $(`#${name}View`).classList.toggle("hidden", name !== view));
-    $$('[data-view]').forEach(button => button.classList.toggle("active", button.dataset.view === view));
+    if (!["discover", "chat", "people", "voice"].includes(view)) return;
+    state.view = view; save(); renderHeader();
+    ["discover", "chat", "people", "voice"].forEach(name => $(`#${name}View`).classList.toggle("hidden", name !== view));
+    $("#mobileRoomNav").classList.toggle("is-hidden", view !== "chat");
+    $$('[data-view]').forEach(button => { button.classList.toggle("active", button.dataset.view === view); button.setAttribute("aria-pressed", String(button.dataset.view === view)); });
     if (view === "voice") renderVoiceRooms();
   }
   function renderVoice() {
@@ -379,7 +405,7 @@
     $("#voiceTabParticipants").innerHTML = participants || `<p>${self ? "You’re connected. Waiting for someone to join." : "It’s quiet here. Be the first to join."}</p>`;
     $("#voiceTabJoin").textContent = state.joiningVoice ? "Joining…" : self ? "Leave voice" : "Join voice"; $("#voiceTabJoin").disabled = state.joiningVoice || (!state.connected && !self);
     $("#voiceTabMute").classList.toggle("hidden", !self); $("#voiceTabDeafen").classList.toggle("hidden", !self); $("#voiceTabMute").textContent = state.muted ? "Unmute" : "Mute"; $("#voiceTabDeafen").textContent = state.deafened ? "Undeafen" : "Deafen";
-    $("#mobileVoice").classList.toggle("joined", self); renderVoiceRooms();
+    $("#mobileVoice").classList.toggle("joined", self); $(".voice-wave").classList.toggle("is-active", self && !state.muted && !state.deafened && !state.voiceError); renderVoiceRooms();
   }
   function voiceSocketUrl() {
     const base = new URL(API_BASE || location.origin);
@@ -573,7 +599,7 @@
   }
   function showRules() { modal("A small promise to each other.", "Orbit works best when everyone gets to be a person here.", `<ul class="rules"><li>Be curious before you judge. People arrive with different stories.</li><li>Make room for quieter voices. A thoughtful reply goes a long way.</li><li>Keep personal information personal. Share only what feels right to you.</li><li>If someone asks you to stop, let the conversation breathe.</li></ul>`); }
   function search() {
-    modal("Find a conversation.", "Search rooms or find a message in your conversations.", `<input id="searchInput" class="search-input" placeholder="Try music, travel, or a message…" autocomplete="off"><div class="search-tabs"><button class="active" data-search-mode="rooms">Rooms</button><button data-search-mode="messages">Messages</button></div><div id="searchResults" class="search-results" aria-live="polite"></div>`);
+    modal("Find a conversation.", "Search rooms or find a message in your conversations.", `<input id="searchInput" class="search-input" aria-label="Search rooms and messages" placeholder="Try music, travel, or a message…" autocomplete="off"><div class="search-tabs"><button class="active" data-search-mode="rooms">Rooms</button><button data-search-mode="messages">Messages</button></div><div id="searchResults" class="search-results" aria-live="polite"></div>`);
     let mode = "rooms", historyPromise = null;
     const cache = new Map(Object.entries(state.messages));
     const results = $("#searchResults"), input = $("#searchInput");
@@ -613,6 +639,9 @@
   }
   function bind() {
     document.addEventListener("click", event => {
+      if (event.target.closest("[data-compose]")) { setView("chat"); $("#messageInput").focus(); }
+      if (event.target.closest("[data-search-open]")) search();
+      if (event.target.closest("[data-retry-channel]")) state.connected ? loadChannel(state.active) : start();
       const addChannel = event.target.closest("[data-add-channel]"); if (addChannel) addServerChannelModal(addChannel.dataset.addChannel);
       const inviteServer = event.target.closest("[data-server-invite]"); if (inviteServer) inviteToServer(inviteServer.dataset.serverInvite);
       const channel = event.target.closest("[data-channel]"); if (channel) selectChannel(channel.dataset.channel);
@@ -622,7 +651,7 @@
         const id = searchMessage.dataset.searchMessage, channelId = searchMessage.dataset.searchChannel; closeModal();
         selectChannel(channelId).then(() => requestAnimationFrame(() => {
           const target = document.querySelector(`[data-message-id="${CSS.escape(id)}"]`);
-          if (target) { target.scrollIntoView({ block: "center", behavior: "smooth" }); target.classList.add("search-highlight"); setTimeout(() => target.classList.remove("search-highlight"), 1800); }
+          if (target) { target.scrollIntoView({ block: "center", behavior: scrollBehavior() }); target.classList.add("search-highlight"); setTimeout(() => target.classList.remove("search-highlight"), 1800); }
         }));
       }
       const track = event.target.closest("[data-track]"); if (track) playBuiltin(track.dataset.track);
@@ -632,6 +661,8 @@
     });
     $("#createSpace").onclick = createRoomMenu; $("#createServer").onclick = $("#railCreate").onclick = createServerModal; $("#searchOpen").onclick = $("#mobileSearch").onclick = search; $("#inviteButton").onclick = $("#peopleInvite").onclick = inviteGeneral;
     $("#followButton").onclick = toggleFollow;
+    $("#retryConnection").onclick = start;
+    $("#discoverAccount").onclick = () => state.profile ? profileModal() : authModal();
     $("#helpButton").onclick = showRules; $("#profileButton").onclick = $("#topProfile").onclick = () => state.profile ? profileModal() : authModal();
     $("#messageForm").onsubmit = e => { e.preventDefault(); sendMessage($("#messageInput").value); };
     $("#messageInput").oninput = e => { saveDraft(); clearTimeout(typingStopTimer); if (e.currentTarget.value.trim()) { if (!localTyping) { clearTimeout(typingTimer); typingTimer = setTimeout(() => sendTyping(true), 180); } typingStopTimer = setTimeout(() => sendTyping(false), 1600); } else { clearTimeout(typingTimer); sendTyping(false); } };
@@ -648,9 +679,9 @@
     window.addEventListener("pagehide", () => { if (state.voiceRoom) navigator.sendBeacon(`${API_BASE}/api/voice/leave`, new Blob([JSON.stringify({ room: state.voiceRoom, peerId: state.peerId, guestId: state.guest.id })], { type: "application/json" })); relaySocket?.close(); micProcessor?.disconnect(); micSource?.disconnect(); mic?.getTracks().forEach(track => track.stop()); audioContext?.close(); state.stream?.close(); });
   }
   async function start() {
-    setConnected(false, "Connecting…"); save();
-    try { const me = await api("/api/me"); state.profile = me.user; await processInvite(); await bootstrap(); updateIdentity(); connectLive(); }
-    catch (error) { setConnected(false, "Offline"); $("#messages").innerHTML = `<div class="offline-card"><span>↻</span><h2>Chat is reconnecting.</h2><p>${esc(error.message)} The chat service at this address is unavailable.</p><button id="retry">Try again</button></div>`; $("#retry").onclick = start; clearTimeout(reconnectTimer); reconnectTimer = setTimeout(start, 4000); }
+    clearTimeout(reconnectTimer); state.loading = true; setConnected(false, "Connecting…"); save(); setView(state.view); renderMessages();
+    try { const me = await api("/api/me"); state.profile = me.user; await processInvite(); await bootstrap(); updateIdentity(); setView(state.view); connectLive(); }
+    catch (error) { state.loading = false; state.channelErrors[state.active] = error.message; setConnected(false, "Reconnecting…"); renderMessages(); reconnectTimer = setTimeout(start, 8000); }
   }
   bind(); renderMessages(); restoreDraft(); updateIdentity(); start();
 })();

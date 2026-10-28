@@ -8,7 +8,7 @@ const source = await readFile(new URL("../app.js", import.meta.url), "utf8");
 const entry = "bind(); renderMessages(); restoreDraft(); updateIdentity(); start();";
 assert.ok(source.includes(entry), "The test harness must replace only the application startup.");
 // Expose functions in the test-only copy; production does not export internals.
-const testSource = source.replace(entry, "globalThis.app = { state, drafts, saveDraft, restoreDraft, selectChannel, pollUpdates, sendMessage, receiveLiveEvent, typingPeers, bind };");
+const testSource = source.replace(entry, "globalThis.app = { state, drafts, saveDraft, restoreDraft, selectChannel, pollUpdates, sendMessage, receiveLiveEvent, typingPeers, bind, renderMessages, renderVoice, setConnected, loadChannel, scrollBehavior };");
 
 function deferred() {
   let resolve, reject;
@@ -16,12 +16,12 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-function fixture({ storage = new Map(), request = () => undefined } = {}) {
+function fixture({ storage = new Map(), request = () => undefined, reducedMotion = false, storageBlocked = false } = {}) {
   const elements = new Map(), requests = [], timers = new Map(), listeners = new Map();
   let timerId = 0;
   const element = selector => {
     if (!elements.has(selector)) {
-      const classes = new Set();
+      const classes = new Set(), attributes = new Map();
       elements.set(selector, {
         value: "", textContent: "", innerHTML: "", style: {}, dataset: {},
         scrollTop: 0, scrollHeight: 180, clientHeight: 120, disabled: false,
@@ -30,8 +30,10 @@ function fixture({ storage = new Map(), request = () => undefined } = {}) {
           contains: name => classes.has(name),
           toggle(name, enabled) { if (enabled ?? !classes.has(name)) classes.add(name); else classes.delete(name); }
         },
-        setAttribute() {}, addEventListener() {}, focus() {},
-        scrollTo({ top }) { this.scrollTop = top; },
+        setAttribute: (name, value) => attributes.set(name, value),
+        getAttribute: name => attributes.get(name),
+        addEventListener() {}, focus() { this.focused = true; },
+        scrollTo(options) { this.scrollTop = options.top; this.lastScroll = options; },
         dispatchEvent(event) { this[`on${event.type}`]?.({ ...event, currentTarget: this }); }
       });
     }
@@ -39,14 +41,14 @@ function fixture({ storage = new Map(), request = () => undefined } = {}) {
   };
   const context = vm.createContext({
     location: { hostname: "orbit.test", protocol: "https:", port: "", origin: "https://orbit.test", pathname: "/", search: "" },
-    localStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) },
+    localStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => { if (storageBlocked) throw new Error("Browser storage is unavailable"); storage.set(key, value); } },
     crypto: { randomUUID }, URL, URLSearchParams, console, Event,
     document: {
       querySelector: selector => selector === ".modal" ? null : element(selector),
       querySelectorAll: () => [],
       addEventListener: (type, listener) => listeners.set(type, listener)
     },
-    window: { addEventListener() {} }, navigator: {},
+    window: { addEventListener() {}, matchMedia: () => ({ matches: reducedMotion }) }, navigator: {},
     setTimeout: callback => { timers.set(++timerId, callback); return timerId; },
     clearTimeout: id => timers.delete(id), setInterval: () => ++timerId, clearInterval() {},
     requestAnimationFrame: callback => callback(),
@@ -60,7 +62,7 @@ function fixture({ storage = new Map(), request = () => undefined } = {}) {
     }
   });
   vm.runInContext(testSource, context, { filename: "app.js" });
-  return { app: context.app, element, requests, timers, storage };
+  return { app: context.app, element, requests, timers, storage, listeners };
 }
 
 test("a delayed room poll cannot put the previous room's messages in the newly selected room", async () => {
@@ -158,4 +160,112 @@ test("Enter during IME composition does not send or suppress text confirmation",
   assert.equal(input.value, "入力中");
   assert.equal(requests.length, 0);
   assert.equal(app.state.messages.global, undefined);
+});
+
+test("initial loading does not claim an empty conversation or offer a premature first message", () => {
+  const { app, element } = fixture();
+  app.renderMessages();
+  assert.equal(element("#messages").getAttribute("aria-busy"), "true");
+  assert.match(element("#messages").innerHTML, /Finding your conversations/);
+  assert.doesNotMatch(element("#messages").innerHTML, /A FRESH START|data-compose|Write the first hello/);
+  app.state.loading = false;
+  app.renderMessages();
+  assert.equal(element("#messages").getAttribute("aria-busy"), "false");
+  assert.match(element("#messages").innerHTML, /A FRESH START|data-compose/);
+});
+
+test("the first-hello action focuses the composer without sending a message", () => {
+  const { app, element, listeners, requests } = fixture();
+  app.bind(); app.state.loading = false;
+  const action = { dataset: {} };
+  listeners.get("click")({ target: { closest: selector => selector === "[data-compose]" ? action : null } });
+  assert.equal(app.state.view, "chat");
+  assert.equal(element("#messageInput").focused, true);
+  assert.equal(requests.length, 0);
+});
+
+test("a failed room load shows a recoverable error and leaves the saved draft intact", async () => {
+  const pending = deferred();
+  let attempts = 0;
+  const { app, element } = fixture({ request(record) {
+    if (record.url.pathname === "/api/messages") return ++attempts === 1 ? pending.promise : { messages: [] };
+  } });
+  app.state.loading = false;
+  element("#messageInput").value = "Keep this draft"; app.saveDraft();
+  const loading = app.loadChannel("global");
+  assert.equal(element("#messages").getAttribute("aria-busy"), "true");
+  pending.reject(new Error("Network <unavailable>"));
+  await loading;
+  assert.equal(element("#messages").getAttribute("aria-busy"), "false");
+  assert.match(element("#messages").innerHTML, /data-retry-channel/);
+  assert.match(element("#messages").innerHTML, /Network &lt;unavailable&gt;/);
+  assert.doesNotMatch(element("#messages").innerHTML, /data-compose/);
+  assert.equal(element("#messageInput").value, "Keep this draft");
+  assert.equal(app.drafts.global, "Keep this draft");
+  await app.loadChannel("global");
+  assert.equal(app.state.channelErrors.global, undefined);
+  assert.match(element("#messages").innerHTML, /data-compose/);
+});
+
+test("connection feedback explains offline sending while keeping composition available", () => {
+  const { app, element } = fixture();
+  element("#messageInput").value = "Draft during a reconnect";
+  app.setConnected(false);
+  assert.equal(element("#connectionBanner").classList.contains("hidden"), false);
+  assert.match(element("#connectionMessage").textContent, /Finding your conversations/);
+  assert.equal(element("#retryConnection").classList.contains("hidden"), true);
+  app.state.loading = false; app.setConnected(false);
+  assert.match(element("#connectionMessage").textContent, /keep writing/);
+  assert.equal(element("#retryConnection").classList.contains("hidden"), false);
+  assert.equal(element("#sendButton").disabled, true);
+  assert.equal(element("#messageInput").disabled, false);
+  app.setConnected(true);
+  assert.equal(element("#connectionBanner").classList.contains("hidden"), true);
+  assert.equal(element("#sendButton").disabled, false);
+});
+
+test("conversation scrolling respects the reduced-motion preference", () => {
+  for (const reducedMotion of [false, true]) {
+    const { app, element } = fixture({ reducedMotion });
+    app.state.loading = false;
+    app.renderMessages({ scrollToBottom: true });
+    assert.equal(app.scrollBehavior(), reducedMotion ? "auto" : "smooth");
+    assert.equal(element("#messages").lastScroll.behavior, reducedMotion ? "auto" : "smooth");
+  }
+});
+
+test("voice animation represents only a joined, unmuted, healthy voice session", () => {
+  const { app, element } = fixture();
+  app.state.connected = true;
+  app.renderVoice();
+  assert.equal(element(".voice-wave").classList.contains("is-active"), false);
+  app.state.voiceRoom = "global"; app.renderVoice();
+  assert.equal(element(".voice-wave").classList.contains("is-active"), true);
+  for (const [key, value] of [["muted", true], ["deafened", true], ["voiceError", "Audio disconnected"]]) {
+    app.state[key] = value; app.renderVoice();
+    assert.equal(element(".voice-wave").classList.contains("is-active"), false);
+    app.state[key] = key === "voiceError" ? "" : false;
+  }
+});
+
+test("blocked browser storage keeps the draft in memory and never claims it was saved on the device", async () => {
+  const { app, element, storage } = fixture({ storageBlocked: true });
+  app.state.loading = false;
+  element("#messageInput").value = "A draft kept in this tab";
+  app.saveDraft();
+  assert.equal(app.state.storageAvailable, false);
+  assert.equal(app.drafts.global, "A draft kept in this tab");
+  assert.equal(storage.size, 0);
+  assert.equal(element("#draftHint").textContent, "Draft kept in this tab");
+  app.setConnected(false);
+  assert.match(element("#connectionMessage").textContent, /stays in this tab/);
+  assert.doesNotMatch(element("#connectionMessage").textContent, /on this device/);
+  app.state.channelErrors.global = "The room could not load";
+  app.renderMessages();
+  assert.match(element("#messages").innerHTML, /Keep this tab open to keep your draft/);
+  assert.doesNotMatch(element("#messages").innerHTML, /stays on this device/);
+  await app.selectChannel("music");
+  await app.selectChannel("global");
+  assert.equal(element("#messageInput").value, "A draft kept in this tab");
+  assert.equal(element("#draftHint").textContent, "Draft kept in this tab");
 });
