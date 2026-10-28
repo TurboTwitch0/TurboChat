@@ -32,7 +32,19 @@
   const blockedVoicePeers = new Map();
   const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const name = () => state.profile?.name || state.guest.name;
-  const save = () => localStorage.setItem(storageKey, JSON.stringify({ guest: state.guest, active: state.active, followingRooms: state.followingRooms }));
+  const drafts = saved.drafts && typeof saved.drafts === "object" && !Array.isArray(saved.drafts) ? saved.drafts : {};
+  let identityVersion = 0, modalOpener = null;
+  const save = () => { try { localStorage.setItem(storageKey, JSON.stringify({ guest: state.guest, active: state.active, followingRooms: state.followingRooms, drafts })); } catch { /* Chat still works when browser storage is unavailable. */ } };
+  function updateComposer() {
+    const input = $("#messageInput");
+    $("#charCount").textContent = input.value.length;
+    input.style.height = "auto"; input.style.height = `${Math.min(input.scrollHeight, 130)}px`;
+    $("#draftHint").textContent = input.value ? "Draft saved on this device" : "";
+    $("#sendButton").disabled = !state.connected || !input.value.trim();
+  }
+  function saveDraft() { const value = $("#messageInput").value; if (value) drafts[state.active] = value; else delete drafts[state.active]; save(); updateComposer(); }
+  function restoreDraft() { $("#messageInput").value = typeof drafts[state.active] === "string" ? drafts[state.active].slice(0, 700) : ""; updateComposer(); }
+  function clearTyping() { clearTimeout(typingTimer); clearTimeout(typingStopTimer); sendTyping(false); for (const [key, value] of typingPeers) if (key.endsWith(":timer")) clearTimeout(value); typingPeers.clear(); renderTyping(); }
   function toast(message) { const el = $("#toast"); el.textContent = message; el.classList.add("show"); clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove("show"), 3000); }
   async function api(path, options = {}) {
     const response = await fetch(`${API_BASE}${path}`, { credentials: "include", headers: { "Content-Type": "application/json", ...(options.headers || {}) }, ...options });
@@ -44,12 +56,12 @@
   function room(id) { return allRooms().find(x => x.id === id) || { id, name: "Party", emoji: "✦", topic: "A private room for good people." }; }
   function setConnected(value, label) {
     state.connected = value; $("#connectionLabel").textContent = label || (value ? "Connected" : "Reconnecting…");
-    $("#connectionLabel").classList.toggle("offline", !value); $("#messageInput").disabled = !value; $("#sendButton").disabled = !value; renderVoice();
+    $("#connectionLabel").classList.toggle("offline", !value); updateComposer(); renderVoice();
   }
   function renderRoomList() {
     const rooms = allRooms();
     const row = item => `<button class="space-row ${state.active === item.id ? "selected" : ""}" data-channel="${esc(item.id)}"><span style="--tile:${esc(item.color || "#6758ad")}">${esc(item.emoji || "✦")}</span><b>${esc(item.name)}</b></button>`;
-    $("#spaceList").innerHTML = rooms.map(row).join("");
+    $("#spaceList").innerHTML = [...defaultRooms, ...state.rooms, ...state.parties].map(row).join("");
     $("#mobileRoomNav").innerHTML = rooms.map(item => `<button class="mobile-room-chip ${state.active === item.id ? "selected" : ""}" data-channel="${esc(item.id)}" title="${esc(item.name)}"><span>${esc(item.emoji || "✦")}</span>${esc(item.name)}${state.followingRooms.includes(item.id) ? `<i aria-label="Following">★</i>` : ""}</button>`).join("");
     const followed = rooms.filter(item => state.followingRooms.includes(item.id));
     $("#followingSection").classList.toggle("hidden", followed.length === 0);
@@ -67,7 +79,9 @@
   }
   function renderMessage(item, i) {
     const reactions = Object.entries(item.reactions || {}).map(([emoji, list]) => `<button class="reaction" data-react="${esc(item.id)}" data-emoji="${esc(emoji)}">${esc(emoji)} ${list.length}</button>`).join("");
-    return `<article class="message" data-message-id="${esc(item.id)}"><span class="avatar">${esc(item.emoji || "✦")}</span><div class="message-body"><div class="message-meta"><b>${esc(item.user || "Guest")}</b>${item.registered ? `<i>member</i>` : ""}<time>${new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" }).format(new Date(item.createdAt || Date.now()))}</time></div><p>${esc(item.text)}</p><div class="message-actions">${reactions}<button class="reaction" data-react="${esc(item.id)}" data-emoji="💜">💜 +</button><button class="reply-link" data-reply="${i}">↩ Reply</button></div></div></article>`;
+    const stamp = new Date(item.createdAt || Date.now());
+    const actions = item.pending ? `<span class="message-delivery">Sending…</span>` : item.failed ? `<span class="message-delivery failed">Not sent</span><button class="retry-message" data-retry-message="${esc(item.id)}">Try again</button>` : `${reactions}<button class="reaction" data-react="${esc(item.id)}" data-emoji="💜" aria-label="React with a purple heart">💜 +</button><button class="reply-link" data-reply="${i}">↩ Reply</button>`;
+    return `<article class="message ${item.failed ? "message-failed" : ""}" data-message-id="${esc(item.id)}"><span class="avatar">${esc(item.emoji || "✦")}</span><div class="message-body"><div class="message-meta"><b>${esc(item.user || "Guest")}</b>${item.registered ? `<i>member</i>` : ""}<time datetime="${esc(stamp.toISOString())}" title="${esc(stamp.toLocaleString())}">${new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" }).format(stamp)}</time></div><p>${esc(item.text)}</p><div class="message-actions">${actions}</div></div></article>`;
   }
   function renderMessages({ scrollToBottom = false } = {}) {
     const current = room(state.active), items = state.messages[state.active] || [];
@@ -80,7 +94,8 @@
     $("#followButton").setAttribute("aria-pressed", String(isFollowing));
     $("#messageInput").placeholder = `Message ${channelInfo[0]}…`; $("#musicPanel").classList.toggle("hidden", state.active !== "music");
     const greeting = `<div class="welcome-card"><span>${esc(channelInfo[2])}</span><div><h2>${state.active === "global" ? "The world is a little smaller now." : `Welcome to ${esc(channelInfo[0])}.`}</h2><p>${items.length ? "Join the conversation. Messages arrive live." : "No messages yet. Start the conversation."}</p></div></div><div class="day-label">LIVE CONVERSATION</div>`;
-    feed.innerHTML = greeting + items.map(renderMessage).join("");
+    let previousDay = "";
+    feed.innerHTML = greeting + items.map((item, i) => { const date = new Date(item.createdAt || Date.now()), day = date.toLocaleDateString(); const label = day !== previousDay ? `<div class="day-label">${esc(date.toLocaleDateString([], { month: "long", day: "numeric", year: "numeric" }))}</div>` : ""; previousDay = day; return label + renderMessage(item, i); }).join("");
     if (scrollToBottom || wasAtBottom) feed.scrollTo({ top: feed.scrollHeight, behavior: "smooth" });
     else feed.scrollTop = previousTop;
     $("#voiceRoomName").textContent = `${channelInfo[0]} voice`; renderVoice();
@@ -104,18 +119,20 @@
     save(); renderRoomList(); renderMessages();
   }
   async function loadChannel(id) {
-    try { const data = await api(`/api/messages?channel=${encodeURIComponent(id)}&guestId=${encodeURIComponent(state.guest.id)}`); if (mergeMessages(id, data.messages || []) && state.active === id) renderMessages(); }
+    const version = identityVersion;
+    try { const data = await api(`/api/messages?channel=${encodeURIComponent(id)}&guestId=${encodeURIComponent(state.guest.id)}`); if (version === identityVersion && mergeMessages(id, data.messages || []) && state.active === id) renderMessages(); }
     catch (error) { toast(error.message); }
   }
   async function bootstrap() {
-    let data;
-    try { data = await api(`/api/bootstrap?channel=${encodeURIComponent(state.active)}&guestId=${encodeURIComponent(state.guest.id)}`); }
+    let data, channel = state.active; const version = identityVersion;
+    try { data = await api(`/api/bootstrap?channel=${encodeURIComponent(channel)}&guestId=${encodeURIComponent(state.guest.id)}`); }
     catch (error) {
-      if (state.active === "global" || ![403, 404].includes(error.status)) throw error;
-      state.active = "global"; save(); toast("That saved room is no longer available. You’re back in World chat.");
+      if (channel === "global" || ![403, 404].includes(error.status)) throw error;
+      if (state.active === channel) state.active = "global"; channel = "global"; save(); toast("That saved room is no longer available. You’re back in World chat.");
       data = await api(`/api/bootstrap?channel=global&guestId=${encodeURIComponent(state.guest.id)}`);
     }
-    state.rooms = data.rooms || []; state.parties = data.parties || []; state.servers = [...new Map((data.servers || []).map(server => [server.id, server])).values()]; mergeMessages(state.active, data.messages || []); state.members = data.members || []; state.registered = Number(data.registeredCount) || 1428; state.goal = Number(data.memberGoal) || 1500; state.music = data.music || null; renderRoomList(); renderMessages(); renderMembers(); renderMusic();
+    if (version !== identityVersion) return;
+    state.rooms = data.rooms || []; state.parties = data.parties || []; state.servers = [...new Map((data.servers || []).map(server => [server.id, server])).values()]; mergeMessages(channel, data.messages || []); state.members = data.members || []; state.registered = Number(data.registeredCount) || 1428; state.goal = Number(data.memberGoal) || 1500; state.music = data.music || null; renderRoomList(); renderMessages(); renderMembers(); renderMusic(); restoreDraft();
   }
   function connectLive() {
     state.stream?.close();
@@ -129,7 +146,7 @@
   function receiveLiveEvent(data) {
       if (data.type === "message") addMessage(data.channel, data.message);
       if (data.type === "typing" && data.channel === state.active && data.id !== `guest-${state.guest.id}` && data.id !== `user-${state.profile?.id}`) { typingPeers.set(data.id, data.name); renderTyping(); clearTimeout(typingPeers.get(`${data.id}:timer`)); typingPeers.set(`${data.id}:timer`, setTimeout(() => { typingPeers.delete(data.id); renderTyping(); }, 2800)); }
-      if (data.type === "typing-stop") { const timer = typingPeers.get(`${data.id}:timer`); if (timer) clearTimeout(timer); typingPeers.delete(`${data.id}:timer`); if (data.channel === state.active) renderTyping(); }
+      if (data.type === "typing-stop") { const timer = typingPeers.get(`${data.id}:timer`); if (timer) clearTimeout(timer); typingPeers.delete(data.id); typingPeers.delete(`${data.id}:timer`); if (data.channel === state.active) renderTyping(); }
       if (data.type === "reaction") { const item = (state.messages[data.channel] || []).find(m => m.id === data.messageId); if (item) { item.reactions = data.reactions; if (state.active === data.channel) renderMessages(); } }
       if (data.type === "presence") { state.members = data.members || []; state.registered = Number(data.registeredCount) || 1428; renderMembers(); }
       if (data.type === "room" && data.room?.type !== "party" && !state.rooms.some(r => r.id === data.room.id)) { state.rooms.unshift(data.room); renderRoomList(); }
@@ -149,9 +166,11 @@
   }
   async function pollUpdates() {
     if (polling) return; polling = true;
+    const version = identityVersion;
     try {
       if (Date.now() - lastHeartbeat > 10000) { await api("/api/presence", { method: "POST", body: JSON.stringify({ guestId: state.guest.id, guestName: name() }) }); lastHeartbeat = Date.now(); }
       const result = await api(`/api/updates?after=${lastEventSeq}&guestId=${encodeURIComponent(state.guest.id)}&peerId=${encodeURIComponent(state.peerId)}`);
+      if (version !== identityVersion) return;
       for (const event of result.events || []) receiveLiveEvent(event);
       if (state.voiceRoom && Date.now() - lastVoiceHeartbeat > 5000) {
         const voice = await api("/api/voice/join", { method: "POST", body: JSON.stringify({ room: state.voiceRoom, peerId: state.peerId, guestId: state.guest.id, guestName: name() }) });
@@ -161,8 +180,10 @@
       const presenceChanged = JSON.stringify(state.members) !== JSON.stringify(result.members || []);
       state.members = result.members || []; state.registered = Number(result.registeredCount) || state.registered; if (presenceChanged) renderMembers();
       if (Date.now() - lastMessageSync > 4500) {
-        const latest = await api(`/api/messages?channel=${encodeURIComponent(state.active)}&guestId=${encodeURIComponent(state.guest.id)}`);
-        if (mergeMessages(state.active, latest.messages || [])) renderMessages();
+        const channel = state.active;
+        const latest = await api(`/api/messages?channel=${encodeURIComponent(channel)}&guestId=${encodeURIComponent(state.guest.id)}`);
+        if (version !== identityVersion) return;
+        if (mergeMessages(channel, latest.messages || []) && state.active === channel) renderMessages();
         lastMessageSync = Date.now();
       }
       lastEventSeq = Math.max(lastEventSeq, Number(result.nextSeq) || 0); setConnected(true, "Live");
@@ -170,23 +191,33 @@
   }
   function renderTyping() { const names = [...typingPeers.entries()].filter(([key]) => !key.endsWith(":timer")).map(([, value]) => value); $("#typingIndicator").textContent = names.length ? `${names.slice(0, 2).join(", ")}${names.length > 2 ? ` and ${names.length - 2} others` : names.length === 1 ? " is" : " are"} typing…` : ""; }
   function sendTyping(typing) { if (localTyping === typing) return; localTyping = typing; api("/api/typing", { method: "POST", body: JSON.stringify({ channel: state.active, typing, guestId: state.guest.id, guestName: name() }) }).catch(() => {}); }
-  async function sendMessage(value) {
+  async function sendMessage(value, retryId = "") {
     const content = value.trim(); if (!content || !state.connected) return;
-    const input = $("#messageInput"); input.value = ""; $("#charCount").textContent = "0"; input.style.height = "auto";
-    const channel = state.active, tempId = `pending-${crypto.randomUUID()}`, pending = { id: tempId, user: name(), emoji: state.profile?.emoji || "✦", text: content, createdAt: new Date().toISOString(), reactions: {}, pending: true };
+    const channel = state.active, version = identityVersion;
+    if (retryId) state.messages[channel] = (state.messages[channel] || []).filter(item => item.id !== retryId);
+    else { $("#messageInput").value = ""; saveDraft(); }
+    clearTyping();
+    const tempId = `pending-${crypto.randomUUID()}`, pending = { id: tempId, user: name(), emoji: state.profile?.emoji || "✦", text: content, createdAt: new Date().toISOString(), reactions: {}, pending: true };
     mergeMessages(channel, [pending]); if (state.active === channel) renderMessages({ scrollToBottom: true });
-    try { const result = await api("/api/messages", { method: "POST", body: JSON.stringify({ channel, text: content, guestId: state.guest.id, guestName: name() }) }); state.messages[channel] = (state.messages[channel] || []).filter(item => item.id !== tempId); mergeMessages(channel, [result.message]); if (state.active === channel) renderMessages({ scrollToBottom: true }); }
-    catch (error) { state.messages[channel] = (state.messages[channel] || []).filter(item => item.id !== tempId); if (state.active === channel) renderMessages(); input.value = content; toast(error.message); }
+    try { const result = await api("/api/messages", { method: "POST", body: JSON.stringify({ channel, text: content, guestId: state.guest.id, guestName: name() }) }); if (version !== identityVersion) return; state.messages[channel] = (state.messages[channel] || []).filter(item => item.id !== tempId); mergeMessages(channel, [result.message]); if (state.active === channel) renderMessages({ scrollToBottom: true }); }
+    catch (error) { if (version !== identityVersion) return; const item = (state.messages[channel] || []).find(item => item.id === tempId); if (item) { item.pending = false; item.failed = true; } if (state.active === channel) renderMessages(); toast(`${error.message} Your message is kept above. Use Try again to resend.`); }
   }
   async function selectChannel(id) {
     if (!allRooms().some(item => item.id === id)) return;
+    saveDraft(); clearTyping();
     if (state.voiceRoom && state.voiceRoom !== id) await leaveVoice(true);
-    state.active = id; save(); renderRoomList();
+    state.active = id; save(); restoreDraft(); renderRoomList();
     if (room(id).type === "voice") { $("#voiceTabRoomName").textContent = room(id).name; setView("voice"); renderVoiceRooms(); return; }
     setView("chat"); renderMessages(); await loadChannel(id);
   }
-  function modal(title, subtitle, body) { $("#modalRoot").innerHTML = `<div class="modal-backdrop"><section class="modal"><button class="modal-close" data-close>×</button><small>ORBIT</small><h2>${esc(title)}</h2><p>${esc(subtitle)}</p>${body}</section></div>`; $("[data-close]").addEventListener("click", closeModal); $(".modal-backdrop").addEventListener("click", e => { if (e.target.classList.contains("modal-backdrop")) closeModal(); }); }
-  function closeModal() { $("#modalRoot").innerHTML = ""; }
+  function modal(title, subtitle, body) {
+    if (!$("#modalRoot").childElementCount) modalOpener = document.activeElement;
+    $("#modalRoot").innerHTML = `<div class="modal-backdrop"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle" aria-describedby="modalDescription"><button class="modal-close" data-close aria-label="Close dialog">×</button><small>ORBIT</small><h2 id="modalTitle">${esc(title)}</h2><p id="modalDescription">${esc(subtitle)}</p>${body}</section></div>`;
+    $(".app-shell").inert = true; $("#mobileVoice").inert = true;
+    $("[data-close]").addEventListener("click", closeModal); $(".modal-backdrop").addEventListener("click", e => { if (e.target.classList.contains("modal-backdrop")) closeModal(); });
+    ($(".modal input:not([readonly])") || $(".modal button:not([data-close])") || $("[data-close]")).focus();
+  }
+  function closeModal() { $("#modalRoot").innerHTML = ""; $(".app-shell").inert = false; $("#mobileVoice").inert = false; if (modalOpener?.isConnected) modalOpener.focus(); modalOpener = null; }
   function createRoomMenu() {
     modal("Make a place for your people.", "Create an open room or a private party.", `<div class="modal-actions"><button id="makeRoom" class="modal-choice"><b>✳ Community room</b><small>Anyone can find and join.</small></button><button id="makeParty" class="modal-choice"><b>✦ Invite-only party</b><small>Only people with your invite can enter.</small></button></div>`);
     $("#makeRoom").onclick = () => roomForm(false); $("#makeParty").onclick = () => roomForm(true);
@@ -223,7 +254,7 @@
       try {
         const result = await api(isParty ? "/api/parties" : "/api/rooms", { method: "POST", body: JSON.stringify({ name: $("#roomName").value.trim(), topic: $("#roomTopic").value.trim(), owner: name(), guestId: state.guest.id }) });
         if (isParty) state.parties.unshift(result.room); else state.rooms.unshift(result.room);
-        state.active = result.room.id; save(); await loadChannel(state.active); closeModal(); renderMessages();
+        saveDraft(); clearTyping(); state.active = result.room.id; save(); restoreDraft(); await loadChannel(state.active); closeModal(); renderRoomList(); renderMessages();
         if (isParty) inviteCreated(result.room, result.inviteCode); else toast("Your room is open to everyone.");
       } catch (error) { toast(error.message); button.disabled = false; }
     };
@@ -265,11 +296,11 @@
         const result = await api(endpoint, { method: "POST", body: JSON.stringify({ name: register ? $("#authName").value.trim() : undefined, email: $("#authEmail").value.trim(), password: $("#authPassword").value, guestId: state.guest.id }) });
         const session = await api("/api/me");
         if (!session.user || session.user.id !== result.user?.id) throw new Error("Your account was accepted, but this browser did not receive its sign-in session. Check cookies for this site and try again.");
-        state.profile = session.user; closeModal(); connectLive(); updateIdentity(); toast(`Welcome, ${session.user.name}.`);
-      } catch (error) { $("#authError").textContent = error.message; button.disabled = false; button.textContent = register ? "Create account" : "Sign in"; }
+        await refreshIdentity(session.user); closeModal(); toast(`Welcome, ${session.user.name}.`);
+      } catch (error) { if ($("#authError")) $("#authError").textContent = error.message; button.disabled = false; button.textContent = register ? "Create account" : "Sign in"; }
     };
-    $("#guestMode").onclick = () => { state.profile = null; updateIdentity(); closeModal(); };
-    if ($("#logout")) $("#logout").onclick = async () => { const button = $("#logout"); button.disabled = true; try { await api("/api/logout", { method: "POST", body: "{}" }); state.profile = null; connectLive(); updateIdentity(); closeModal(); } catch (error) { toast(error.message); button.disabled = false; } };
+    $("#guestMode").onclick = () => state.profile ? signOut() : closeModal();
+    if ($("#logout")) $("#logout").onclick = signOut;
   }
   function profileModal() {
     if (!state.profile) return authModal("login");
@@ -282,9 +313,25 @@
         state.profile = result.user; closeModal(); updateIdentity(); renderMembers(); renderMessages(); connectLive(); toast("Profile saved.");
       } catch (error) { $("#profileError").textContent = error.message; button.disabled = false; button.textContent = "Save profile"; }
     };
-    $("#profileSignOut").onclick = async () => { try { await api("/api/logout", { method: "POST", body: "{}" }); state.profile = null; updateIdentity(); closeModal(); connectLive(); toast("Signed out."); } catch (error) { toast(error.message); } };
+    $("#profileSignOut").onclick = signOut;
   }
-  function updateIdentity() { $("#identityHint").textContent = state.profile ? `Signed in as ${state.profile.name}. Say something kind.` : `Chatting as ${state.guest.name}. Your name is saved in this browser.`; $("#profileButton").textContent = state.profile?.emoji || (state.profile ? state.profile.name[0].toUpperCase() : "G"); $("#topProfile").textContent = state.profile?.emoji || (state.profile ? state.profile.name[0].toUpperCase() : "◉"); }
+  async function refreshIdentity(profile) {
+    saveDraft(); clearTyping(); identityVersion++; state.stream?.close(); clearInterval(pollTimer);
+    state.profile = profile; state.messages = {}; state.parties = []; state.servers = []; state.members = []; lastEventSeq = 0; lastHeartbeat = 0; lastMessageSync = 0;
+    updateIdentity(); renderRoomList(); renderMessages(); renderMembers();
+    try { await bootstrap(); } finally { connectLive(); }
+  }
+  async function signOut() {
+    const button = $("#profileSignOut") || $("#logout"); if (button) button.disabled = true;
+    try {
+      saveDraft(); clearTyping();
+      if (state.voiceRoom) await leaveVoice(true);
+      await api("/api/logout", { method: "POST", body: "{}" });
+      for (const id of [...state.parties.map(item => item.id), ...state.servers.flatMap(item => item.channels.map(channel => channel.id))]) delete drafts[id];
+      state.active = "global"; restoreDraft(); await refreshIdentity(null); closeModal(); toast("Signed out.");
+    } catch (error) { toast(error.message); if (button) button.disabled = false; }
+  }
+  function updateIdentity() { $("#identityHint").textContent = state.profile ? `Signed in as ${state.profile.name}` : `Chatting as ${state.guest.name}`; $("#profileButton").textContent = state.profile?.emoji || (state.profile ? state.profile.name[0].toUpperCase() : "G"); $("#topProfile").textContent = state.profile ? `${state.profile.emoji || "◉"} ${state.profile.name}` : "Sign in"; }
   function renderMusic() {
     const builtins = [
       ["neon", "Neon Postcards", "Retro pop · 112 BPM", "neon-postcards.wav"], ["midnight", "Midnight Arcade", "Synthwave · 118 BPM", "midnight-arcade.wav"], ["dreamwave", "Dreamwave Radio", "Dream pop · 96 BPM", "dreamwave-radio.wav"], ["orbit", "Slow Orbit", "Ambient pop · 82 BPM", "slow-orbit.wav"]
@@ -312,11 +359,7 @@
     $("#voiceRoomList").innerHTML = rooms.map(item => `<button class="voice-room-option ${state.active === item.id ? "selected" : ""}" data-voice-room="${esc(item.id)}"><span>${esc(item.emoji || "✦")}</span><b>${esc(item.name)}</b><small>${state.voiceRoom === item.id ? "● In voice" : "Open room"}</small></button>`).join("");
   }
   async function selectVoiceRoom(id) {
-    if (!allRooms().some(item => item.id === id)) return;
-    if (state.voiceRoom && state.voiceRoom !== id) await leaveVoice(true);
-    state.active = id; save(); renderRoomList();
-    if (room(id).type === "voice") { $("#voiceTabRoomName").textContent = room(id).name; setView("voice"); renderVoiceRooms(); renderVoice(); return; }
-    setView("chat"); renderMessages(); await loadChannel(id);
+    await selectChannel(id); renderVoice();
   }
   function setView(view) {
     ["chat", "people", "voice"].forEach(name => $(`#${name}View`).classList.toggle("hidden", name !== view));
@@ -584,19 +627,24 @@
       }
       const track = event.target.closest("[data-track]"); if (track) playBuiltin(track.dataset.track);
       const react = event.target.closest("[data-react]"); if (react) api("/api/reactions", { method: "POST", body: JSON.stringify({ channel: state.active, messageId: react.dataset.react, emoji: react.dataset.emoji, guestId: state.guest.id, guestName: name() }) }).catch(error => toast(error.message));
-      const reply = event.target.closest("[data-reply]"); if (reply) { const item = (state.messages[state.active] || [])[Number(reply.dataset.reply)]; $("#messageInput").value = `@${item?.user || "Guest"} `; $("#messageInput").focus(); }
+      const retry = event.target.closest("[data-retry-message]"); if (retry) { const item = (state.messages[state.active] || []).find(item => item.id === retry.dataset.retryMessage); if (item?.failed) sendMessage(item.text, item.id); }
+      const reply = event.target.closest("[data-reply]"); if (reply) { const item = (state.messages[state.active] || [])[Number(reply.dataset.reply)]; const input = $("#messageInput"); input.value = (`@${item?.user || "Guest"} ` + input.value).slice(0, 700); saveDraft(); input.focus(); }
     });
-    $("#createSpace").onclick = createRoomMenu; $("#createServer").onclick = $("#railCreate").onclick = createServerModal; $("#searchOpen").onclick = search; $("#inviteButton").onclick = $("#peopleInvite").onclick = inviteGeneral;
+    $("#createSpace").onclick = createRoomMenu; $("#createServer").onclick = $("#railCreate").onclick = createServerModal; $("#searchOpen").onclick = $("#mobileSearch").onclick = search; $("#inviteButton").onclick = $("#peopleInvite").onclick = inviteGeneral;
     $("#followButton").onclick = toggleFollow;
     $("#helpButton").onclick = showRules; $("#profileButton").onclick = $("#topProfile").onclick = () => state.profile ? profileModal() : authModal();
     $("#messageForm").onsubmit = e => { e.preventDefault(); sendMessage($("#messageInput").value); };
-    $("#messageInput").oninput = e => { $("#charCount").textContent = e.currentTarget.value.length; e.currentTarget.style.height = "auto"; e.currentTarget.style.height = `${Math.min(e.currentTarget.scrollHeight, 130)}px`; clearTimeout(typingStopTimer); if (e.currentTarget.value.trim()) { if (!localTyping) { clearTimeout(typingTimer); typingTimer = setTimeout(() => sendTyping(true), 180); } typingStopTimer = setTimeout(() => sendTyping(false), 1600); } else { clearTimeout(typingTimer); sendTyping(false); } };
-    $("#messageInput").onkeydown = e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); clearTimeout(typingTimer); clearTimeout(typingStopTimer); sendTyping(false); sendMessage(e.currentTarget.value); } };
+    $("#messageInput").oninput = e => { saveDraft(); clearTimeout(typingStopTimer); if (e.currentTarget.value.trim()) { if (!localTyping) { clearTimeout(typingTimer); typingTimer = setTimeout(() => sendTyping(true), 180); } typingStopTimer = setTimeout(() => sendTyping(false), 1600); } else { clearTimeout(typingTimer); sendTyping(false); } };
+    $("#messageInput").onkeydown = e => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); clearTimeout(typingTimer); clearTimeout(typingStopTimer); sendTyping(false); sendMessage(e.currentTarget.value); } };
     $("#emojiButton").onclick = () => { $("#messageInput").value += "👋"; $("#messageInput").dispatchEvent(new Event("input")); $("#messageInput").focus(); };
     $("#musicForm").onsubmit = shareMusic; $("#memberSearch").oninput = e => renderMembers(e.target.value.toLowerCase());
     $("#voiceToggle").onclick = $("#voiceTabJoin").onclick = joinVoice; $("#voiceMute").onclick = $("#voiceTabMute").onclick = () => { state.muted = !state.muted; setVoiceDevice(); }; $("#voiceDeafen").onclick = $("#voiceTabDeafen").onclick = () => { state.deafened = !state.deafened; setVoiceDevice(); }; $("#mobileVoice").onclick = () => { if (state.voiceRoom) { joinVoice(); return; } state.voiceMobileOpen = !state.voiceMobileOpen; renderVoice(); };
     $$("[data-view]").forEach(button => button.onclick = () => setView(button.dataset.view));
-    document.addEventListener("keydown", e => { if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); search(); } if (e.key === "Escape") closeModal(); });
+    document.addEventListener("keydown", e => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); search(); }
+      if (e.key === "Escape") closeModal();
+      if (e.key === "Tab" && $(".modal")) { const controls = $$(".modal button:not([disabled]), .modal input:not([disabled]), .modal select:not([disabled]), .modal textarea:not([disabled]), .modal a[href]").filter(item => item.getClientRects().length); const first = controls[0], last = controls.at(-1); if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last?.focus(); } else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first?.focus(); } }
+    });
     window.addEventListener("pagehide", () => { if (state.voiceRoom) navigator.sendBeacon(`${API_BASE}/api/voice/leave`, new Blob([JSON.stringify({ room: state.voiceRoom, peerId: state.peerId, guestId: state.guest.id })], { type: "application/json" })); relaySocket?.close(); micProcessor?.disconnect(); micSource?.disconnect(); mic?.getTracks().forEach(track => track.stop()); audioContext?.close(); state.stream?.close(); });
   }
   async function start() {
@@ -604,5 +652,5 @@
     try { const me = await api("/api/me"); state.profile = me.user; await processInvite(); await bootstrap(); updateIdentity(); connectLive(); }
     catch (error) { setConnected(false, "Offline"); $("#messages").innerHTML = `<div class="offline-card"><span>↻</span><h2>Chat is reconnecting.</h2><p>${esc(error.message)} The chat service at this address is unavailable.</p><button id="retry">Try again</button></div>`; $("#retry").onclick = start; clearTimeout(reconnectTimer); reconnectTimer = setTimeout(start, 4000); }
   }
-  bind(); renderMessages(); updateIdentity(); start();
+  bind(); renderMessages(); restoreDraft(); updateIdentity(); start();
 })();

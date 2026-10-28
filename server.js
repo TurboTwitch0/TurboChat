@@ -12,8 +12,8 @@ const port = Number(process.env.PORT || 3001);
 const memberBaseline = 1428;
 const memberGoal = 1500;
 const online = new Map();
-const sessions = new Map();
-const emptyStore = () => ({ users: [], messages: {}, rooms: [], parties: [], servers: [], music: null });
+const sessionLifetime = 30 * 24 * 60 * 60 * 1000;
+const emptyStore = () => ({ users: [], messages: {}, rooms: [], parties: [], servers: [], music: null, sessions: {} });
 let store = emptyStore();
 try { store = { ...emptyStore(), ...JSON.parse(fs.readFileSync(dataFile, "utf8")) }; }
 catch (error) { if (error.code !== "ENOENT") console.error("Store read failed:", error.message); }
@@ -30,7 +30,22 @@ function cookie(req, key) {
   const part = (req.headers.cookie || "").split(";").map(item => item.trim()).find(item => item.startsWith(`${key}=`));
   try { return part ? decodeURIComponent(part.slice(key.length + 1)) : ""; } catch { return ""; }
 }
-function userFor(req) { const id = sessions.get(cookie(req, "orbit_session")); return store.users.find(user => user.id === id) || null; }
+const sessionKey = token => crypto.createHash("sha256").update(token).digest("hex");
+function userFor(req) {
+  const token = cookie(req, "orbit_session");
+  const session = token && store.sessions?.[sessionKey(token)];
+  return session && session.expiresAt > Date.now() ? store.users.find(user => user.id === session.userId) || null : null;
+}
+function createSession(req, userId) {
+  store.sessions ||= {};
+  const previous = cookie(req, "orbit_session");
+  if (previous) delete store.sessions[sessionKey(previous)];
+  for (const [key, session] of Object.entries(store.sessions)) if (session.expiresAt <= Date.now()) delete store.sessions[key];
+  const token = crypto.randomBytes(32).toString("base64url");
+  store.sessions[sessionKey(token)] = { userId, expiresAt: Date.now() + sessionLifetime };
+  persist();
+  return token;
+}
 function identity(req, data = {}) { const user = userFor(req); return user ? `user-${user.id}` : safeId(data.guestId) ? `guest-${safeId(data.guestId)}` : ""; }
 function safeUser(user) { return user && { id: user.id, name: user.name, email: user.email, emoji: user.emoji, about: user.about || "", status: user.status || "online" }; }
 function sendJson(res, status, value, extra = {}) {
@@ -94,7 +109,7 @@ function live(req, res, url) {
   const guestId = safeId(url.searchParams.get("guestId")) || crypto.randomUUID();
   const peerId = safeId(url.searchParams.get("peerId")) || crypto.randomUUID();
   const name = text(user?.name || url.searchParams.get("name"), 32) || "Guest";
-  const item = { res, id: user ? `user-${user.id}` : `guest-${guestId}`, memberKey: user ? `user-${user.id}` : `guest-${guestId}`, peerId, name, emoji: user?.emoji || [...name][0].toUpperCase(), about: user?.about || "", status: user?.status || "online", registered: !!user, voiceRoom: "", muted: false, deafened: false };
+  const item = { res, sessionKey: user ? sessionKey(cookie(req, "orbit_session")) : "", id: user ? `user-${user.id}` : `guest-${guestId}`, memberKey: user ? `user-${user.id}` : `guest-${guestId}`, peerId, name, emoji: user?.emoji || [...name][0].toUpperCase(), about: user?.about || "", status: user?.status || "online", registered: !!user, voiceRoom: "", muted: false, deafened: false };
   res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive", "X-Accel-Buffering": "no" });
   res.write(": connected\n\n");
   const old = online.get(peerId);
@@ -244,19 +259,26 @@ const server = http.createServer(async (req, res) => {
       if (password.length < 8 || password.length > 128) return sendJson(res, 400, { error: "Use a password between 8 and 128 characters." });
       if (store.users.some(item => item.email === email)) return sendJson(res, 409, { error: "That email already has an account. Sign in instead." });
       const salt = crypto.randomBytes(16).toString("hex"), hash = (await scrypt(password, salt, 64)).toString("hex");
+      // Hashing yields to other requests; recheck before claiming the email.
+      if (store.users.some(item => item.email === email)) return sendJson(res, 409, { error: "That email already has an account. Sign in instead." });
       const user = { id: crypto.randomUUID(), name, email, salt, passwordHash: hash, emoji: [...name][0].toUpperCase(), about: "", status: "online" };
       migrateGuestMemberships(data.guestId, user.id);
-      store.users.push(user); persist(); const token = crypto.randomBytes(32).toString("base64url"); sessions.set(token, user.id); presence();
+      store.users.push(user); const token = createSession(req, user.id); presence();
       return sendJson(res, 201, { user: safeUser(user) }, { "Set-Cookie": cookieHeader(token, req) });
     }
     if (req.method === "POST" && url.pathname === "/api/login") {
       const data = await readBody(req), email = text(data.email, 120).toLowerCase(), password = typeof data.password === "string" ? data.password : "", user = store.users.find(item => item.email === email);
-      if (!user || !(await scrypt(password, user.salt, 64)).equals(Buffer.from(user.passwordHash, "hex"))) return sendJson(res, 401, { error: "Email or password didn’t match." });
+      if (!user || password.length > 128 || !(await scrypt(password, user.salt, 64)).equals(Buffer.from(user.passwordHash, "hex"))) return sendJson(res, 401, { error: "Email or password didn’t match." });
       migrateGuestMemberships(data.guestId, user.id); if (data.guestId) persist();
-      const token = crypto.randomBytes(32).toString("base64url"); sessions.set(token, user.id); return sendJson(res, 200, { user: safeUser(user) }, { "Set-Cookie": cookieHeader(token, req) });
+      const token = createSession(req, user.id); return sendJson(res, 200, { user: safeUser(user) }, { "Set-Cookie": cookieHeader(token, req) });
     }
     if (req.method === "POST" && url.pathname === "/api/logout") {
-      sessions.delete(cookie(req, "orbit_session")); return sendJson(res, 200, { ok: true }, { "Set-Cookie": "orbit_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0" });
+      const token = cookie(req, "orbit_session"), key = token && sessionKey(token);
+      if (key) {
+        delete store.sessions[key]; persist();
+        for (const peer of online.values()) if (peer.sessionKey === key) { peer.audioSocket?.end(); peer.res.end(); }
+      }
+      return sendJson(res, 200, { ok: true }, { "Set-Cookie": cookieHeader("", req).replace("Max-Age=2592000", "Max-Age=0") });
     }
     if (req.method === "POST" && url.pathname === "/api/profile") {
       const user = userFor(req); if (!user) return sendJson(res, 401, { error: "Sign in to edit your profile." });

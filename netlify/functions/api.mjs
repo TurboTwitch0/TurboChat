@@ -6,6 +6,7 @@ const scrypt = promisify(scryptCallback);
 const baseline = 1428;
 const goal = 1500;
 const maxEvents = 500;
+const sessionLifetime = 30 * 24 * 60 * 60 * 1000;
 const clean = (value, size = 200) => typeof value === "string" ? value.trim().slice(0, size) : "";
 const validId = value => typeof value === "string" && /^[\w-]{1,100}$/.test(value) ? value : "";
 const publicUser = user => user ? { id: user.id, name: user.name, email: user.email, emoji: user.emoji, about: user.about || "", status: user.status || "online" } : null;
@@ -35,7 +36,8 @@ async function readMessages(store, db, channel) {
   return [...merged.values()].sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt)).slice(-250);
 }
 
-export default async function handler(request) {
+export function createApiHandler(storeFactory = getStore) {
+return async function handler(request) {
   const url = new URL(request.url);
   const path = url.pathname.replace(/^\/.netlify\/functions\/api/, "/api").replace(/\/$/, "") || "/";
   const method = request.method.toUpperCase();
@@ -46,15 +48,28 @@ export default async function handler(request) {
     catch { return reply(400, { error: "Invalid request body." }); }
   }
   try {
-    const store = getStore("orbit-chat");
+    const store = storeFactory("orbit-chat");
     const db = await store.get("state", { type: "json" }) || { users: [], messages: {}, rooms: [], parties: [], servers: [], music: null, events: [], presence: {} };
     db.users ||= []; db.messages ||= {}; db.rooms ||= []; db.parties ||= []; db.servers ||= []; db.events ||= []; db.presence ||= {}; db.voicePeers ||= {};
     if (!db.eventSequenceVersion) { db.nextEventSeq = 0; for (const event of db.events) event.seq = ++db.nextEventSeq; db.eventSequenceVersion = 1; await store.setJSON("state", db); }
     const session = parseCookie(request.headers.get("cookie"), "orbit_session");
-    const sessionUserId = session ? await store.get(`auth/sessions/${session}`, { type: "text" }) : null;
-    const userId = sessionUserId || db.sessions?.[session];
-    const user = userId ? (await store.get(`auth/users/${userId}`, { type: "json" }) || db.users.find(item => item.id === userId)) : null;
-    const who = identity(data, user);
+    const validSession = /^[\w-]{43}$/.test(session);
+    const [sessionValue, sessionRevoked] = validSession ? await Promise.all([
+      store.get(`auth/sessions/${session}`, { type: "text", consistency: "strong" }),
+      store.get(`auth/revoked-sessions/${session}`, { type: "text", consistency: "strong" })
+    ]) : [null, null];
+    let sessionRecord = null;
+    if (sessionValue) {
+      try { sessionRecord = JSON.parse(sessionValue); }
+      catch { sessionRecord = { userId: sessionValue, expiresAt: Date.now() + sessionLifetime }; }
+    } else if (sessionValue === null && /^[\w-]{43}$/.test(session) && db.sessions?.[session]) {
+      sessionRecord = { userId: db.sessions[session], expiresAt: Date.now() + sessionLifetime };
+    }
+    const userId = !sessionRevoked && sessionRecord && !sessionRecord.revoked && sessionRecord.expiresAt > Date.now() ? sessionRecord.userId : null;
+    const user = userId ? (await store.get(`auth/users/${userId}`, { type: "json", consistency: "strong" }) || db.users.find(item => item.id === userId)) : null;
+    // Older releases used a bare user id. Migrate without invalidating existing accounts.
+    if (user && (!sessionValue || sessionValue[0] !== "{")) await store.setJSON(`auth/sessions/${session}`, sessionRecord);
+    const who = identity(method === "GET" || method === "HEAD" ? { guestId: url.searchParams.get("guestId") } : data, user);
     const setCookie = token => ({ "set-cookie": `orbit_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000; Secure` });
     const save = () => store.setJSON("state", db);
     const getParty = channel => db.parties.find(item => item.id === channel);
@@ -75,7 +90,7 @@ export default async function handler(request) {
     db.presence = Object.fromEntries(Object.entries(db.presence).filter(([, member]) => Date.now() - member.seenAt < 30000));
     db.voicePeers = Object.fromEntries(Object.entries(db.voicePeers).filter(([, peer]) => Date.now() - peer.seenAt < 30000));
 
-    if (method === "GET" && ["/health", "/api/health"].includes(path)) return reply(200, { ok: true, service: "orbit-netlify" });
+    if (method === "GET" && ["/health", "/api/health"].includes(path)) return reply(200, { ok: true, service: "orbit-netlify", release: "turbochat-13" });
     if (method === "GET" && path === "/api/me") return reply(200, { user: publicUser(user) });
     if (method === "POST" && path === "/api/presence") {
       if (!who) return reply(400, { error: "Refresh the page and try again." });
@@ -189,25 +204,33 @@ export default async function handler(request) {
       if (name.length < 2) return reply(400, { error: "Choose a name with at least two characters." });
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return reply(400, { error: "Enter a valid email address." });
       if (password.length < 8 || password.length > 128) return reply(400, { error: "Use a password between 8 and 128 characters." });
-      const indexedUser = email ? await store.get(`auth/emails/${emailKey(email)}`, { type: "json" }) : null;
+      const indexedUser = email ? await store.get(`auth/emails/${emailKey(email)}`, { type: "json", consistency: "strong" }) : null;
       if (indexedUser || db.users.some(item => item.email === email)) return reply(409, { error: "That email already has an account. Sign in instead." });
       const salt = randomBytes(16).toString("hex"), hash = (await scrypt(password, salt, 64)).toString("hex");
       const created = { id: randomUUID(), name, email, salt, passwordHash: hash, emoji: [...name][0].toUpperCase(), about: "", status: "online" };
       migrateGuestMemberships(data.guestId, created.id);
-      db.users.push(created); db.sessions ||= {}; const token = randomBytes(32).toString("base64url"); db.sessions[token] = created.id;
-      await Promise.all([store.setJSON(`auth/users/${created.id}`, created), store.setJSON(`auth/emails/${emailKey(email)}`, created), store.set(`auth/sessions/${token}`, created.id)]);
+      db.users.push(created); const token = randomBytes(32).toString("base64url");
+      await Promise.all([store.setJSON(`auth/users/${created.id}`, created), store.setJSON(`auth/emails/${emailKey(email)}`, created), store.setJSON(`auth/sessions/${token}`, { userId: created.id, expiresAt: Date.now() + sessionLifetime })]);
       pushEvent(db, { type: "presence", members: online.map(publicMember), registeredCount: baseline + db.users.length }); await save().catch(() => {});
       return reply(201, { user: publicUser(created) }, setCookie(token));
     }
     if (method === "POST" && path === "/api/login") {
       const email = clean(data.email, 120).toLowerCase(), password = typeof data.password === "string" ? data.password : "";
-      const found = await store.get(`auth/emails/${emailKey(email)}`, { type: "json" }) || db.users.find(item => item.email === email);
+      const found = await store.get(`auth/emails/${emailKey(email)}`, { type: "json", consistency: "strong" }) || db.users.find(item => item.email === email);
       if (!found || password.length > 128 || !(await scrypt(password, found.salt, 64)).equals(Buffer.from(found.passwordHash, "hex"))) return reply(401, { error: "Email or password didn’t match." });
       migrateGuestMemberships(data.guestId, found.id);
-      const token = randomBytes(32).toString("base64url"); await store.set(`auth/sessions/${token}`, found.id); db.sessions ||= {}; db.sessions[token] = found.id; await save().catch(() => {}); return reply(200, { user: publicUser(found) }, setCookie(token));
+      const token = randomBytes(32).toString("base64url"); await store.setJSON(`auth/sessions/${token}`, { userId: found.id, expiresAt: Date.now() + sessionLifetime }); await save().catch(() => {}); return reply(200, { user: publicUser(found) }, setCookie(token));
     }
     if (method === "POST" && path === "/api/logout") {
-      if (session) await store.delete(`auth/sessions/${session}`); if (db.sessions) delete db.sessions[session]; await save().catch(() => {}); return reply(200, { ok: true }, { "set-cookie": "orbit_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0; Secure" });
+      // Keep an authoritative tombstone: another in-flight state save may still
+      // contain the old legacy session, but it must never restore access.
+      if (validSession) await Promise.all([
+        store.setJSON(`auth/sessions/${session}`, { revoked: true }),
+        store.set(`auth/revoked-sessions/${session}`, "1")
+      ]);
+      if (db.sessions) delete db.sessions[session];
+      if (who) delete db.presence[who];
+      await save().catch(() => {}); return reply(200, { ok: true }, { "set-cookie": "orbit_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0; Secure" });
     }
     if (method === "POST" && path === "/api/profile") {
       if (!user) return reply(401, { error: "Sign in to edit your profile." });
@@ -262,4 +285,6 @@ export default async function handler(request) {
     console.error("Netlify API error:", error);
     return reply(500, { error: "The chat service could not complete this request. Check Netlify function logs." });
   }
+};
 }
+export default createApiHandler();

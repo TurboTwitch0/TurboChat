@@ -1,5 +1,7 @@
 # Orbit
 
+TurboChat's Orbit community keeps its existing Vercel frontend and Netlify API. The current interface includes room-specific drafts saved on this device, retry controls for failed messages, mobile conversation search, and keyboard-accessible account dialogs.
+
 Orbit is a real-time world chat with guest access, registered accounts, open rooms, invite-only parties, reactions, shared music, browser voice, and followed rooms saved in each browser.
 
 ## Run
@@ -11,6 +13,8 @@ npm run start:cloud
 ```
 
 Then open `http://localhost:3001`. The command starts the page, API, events, and voice relay together, and confirms the health endpoint is ready. For a foreground server, use `npm start`.
+
+Run `npm ci`, `npm test`, and `npm run build` before publishing. Tests use isolated local data and in-memory hosted storage, and never create production accounts or send production messages. They cover sign-in errors, session persistence, expiry and logout revocation, private room access, room-switching races, drafts, failed sends, and IME input. Sessions last up to 30 days and local sessions survive server restarts; passwords are stored as salted hashes.
 
 There are no third-party runtime packages. `data/orbit.json` is created as people use chat. Keep that folder on persistent storage to retain accounts, rooms, parties, messages, and shared music. The header starts at 1,428 registered members toward the 1,500 community goal; live presence is counted separately.
 
