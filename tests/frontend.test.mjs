@@ -8,7 +8,7 @@ const source = await readFile(new URL("../app.js", import.meta.url), "utf8");
 const entry = "bind(); renderMessages(); restoreDraft(); updateIdentity(); start();";
 assert.ok(source.includes(entry), "The test harness must replace only the application startup.");
 // Expose functions in the test-only copy; production does not export internals.
-const testSource = source.replace(entry, "globalThis.app = { state, drafts, saveDraft, restoreDraft, selectChannel, pollUpdates, sendMessage, receiveLiveEvent, typingPeers, bind, renderMessages, renderVoice, setConnected, loadChannel, scrollBehavior };");
+const testSource = source.replace(entry, "globalThis.app = { state, drafts, saveDraft, restoreDraft, selectChannel, pollUpdates, sendMessage, receiveLiveEvent, typingPeers, bind, renderMessages, renderVoice, setConnected, loadChannel, scrollBehavior, renderShowcase, selectShowcase, showcaseKeydown };");
 
 function deferred() {
   let resolve, reject;
@@ -17,7 +17,7 @@ function deferred() {
 }
 
 function fixture({ storage = new Map(), request = () => undefined, reducedMotion = false, storageBlocked = false } = {}) {
-  const elements = new Map(), requests = [], timers = new Map(), listeners = new Map();
+  const elements = new Map(), requests = [], timers = new Map(), intervals = new Map(), listeners = new Map();
   let timerId = 0;
   const element = selector => {
     if (!elements.has(selector)) {
@@ -39,18 +39,25 @@ function fixture({ storage = new Map(), request = () => undefined, reducedMotion
     }
     return elements.get(selector);
   };
+  const showcaseChoices = Array.from({ length: 5 }, (_, index) => {
+    const choice = element(`#showcaseChoices [data-showcase-select="${index}"]`);
+    choice.dataset.showcaseSelect = String(index);
+    return choice;
+  });
   const context = vm.createContext({
     location: { hostname: "orbit.test", protocol: "https:", port: "", origin: "https://orbit.test", pathname: "/", search: "" },
     localStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => { if (storageBlocked) throw new Error("Browser storage is unavailable"); storage.set(key, value); } },
     crypto: { randomUUID }, URL, URLSearchParams, console, Event,
     document: {
       querySelector: selector => selector === ".modal" ? null : element(selector),
-      querySelectorAll: () => [],
+      querySelectorAll: selector => selector === "#showcaseChoices [data-showcase-select]" ? showcaseChoices : [],
       addEventListener: (type, listener) => listeners.set(type, listener)
     },
     window: { addEventListener() {}, matchMedia: () => ({ matches: reducedMotion }) }, navigator: {},
     setTimeout: callback => { timers.set(++timerId, callback); return timerId; },
-    clearTimeout: id => timers.delete(id), setInterval: () => ++timerId, clearInterval() {},
+    clearTimeout: id => timers.delete(id),
+    setInterval: callback => { intervals.set(++timerId, callback); return timerId; },
+    clearInterval: id => intervals.delete(id),
     requestAnimationFrame: callback => callback(),
     fetch: async (url, options = {}) => {
       const parsed = new URL(url, "https://orbit.test");
@@ -62,7 +69,7 @@ function fixture({ storage = new Map(), request = () => undefined, reducedMotion
     }
   });
   vm.runInContext(testSource, context, { filename: "app.js" });
-  return { app: context.app, element, requests, timers, storage, listeners };
+  return { app: context.app, element, requests, timers, intervals, storage, listeners };
 }
 
 test("a delayed room poll cannot put the previous room's messages in the newly selected room", async () => {
@@ -268,4 +275,83 @@ test("blocked browser storage keeps the draft in memory and never claims it was 
   await app.selectChannel("global");
   assert.equal(element("#messageInput").value, "A draft kept in this tab");
   assert.equal(element("#draftHint").textContent, "Draft kept in this tab");
+});
+
+test("public room previews wrap selection and update the open action without navigating or autoplay", () => {
+  const { app, element, requests, timers, intervals } = fixture();
+  app.bind();
+  assert.equal(element("#showcaseOpen").dataset.channel, "global");
+  element("#showcasePrevious").onclick();
+  assert.equal(element("#showcaseOpen").dataset.channel, "lounge");
+  assert.match(element("#showcaseSelection").textContent, /05 \/ 05 — The Slow Lounge/);
+  element("#showcaseNext").onclick();
+  assert.equal(element("#showcaseOpen").dataset.channel, "global");
+  app.selectShowcase(2);
+  assert.equal(element("#showcaseOpen").dataset.channel, "travel");
+  assert.match(element("#showcaseOpen").textContent, /Open Somewhere New/);
+  for (let index = 0; index < 5; index++) {
+    assert.equal(element(`#showcaseChoices [data-showcase-select="${index}"]`).getAttribute("aria-pressed"), String(index === 2));
+  }
+  assert.equal(app.state.active, "global");
+  assert.equal(app.state.view, "discover");
+  assert.equal(requests.length, 0);
+  assert.equal(timers.size, 0);
+  assert.equal(intervals.size, 0);
+});
+
+test("the room showcase contains public descriptions and never includes private content or identities", () => {
+  const { app, element } = fixture();
+  app.state.rooms = [{ id: "custom-room", name: "Custom sensitive name" }];
+  app.state.parties = [{ id: "private-party", name: "Private party name", type: "party" }];
+  app.state.servers = [{ id: "private-server", name: "Private server name", channels: [{ id: "secret-channel", name: "Secret channel name" }] }];
+  app.state.messages.global = [{ id: "private-message", user: "Private member name", text: "Private message contents" }];
+  app.state.profile = { id: "private-person", name: "Private profile name" };
+  for (let index = 0; index < 5; index++) {
+    app.selectShowcase(index);
+    const markup = element("#showcaseCards").innerHTML;
+    assert.match(markup, /PUBLIC ROOM/);
+    assert.match(markup, /aria-label="Selected public room:/);
+    assert.match(markup, /aria-label="Preview /);
+    assert.doesNotMatch(markup, /Custom sensitive|Private party|Private server|Secret channel|Private member|Private message|Private profile/);
+  }
+});
+
+test("showcase keyboard selection stays inside its controls and respects modifiers and composition", () => {
+  const { app, element, requests } = fixture();
+  app.bind();
+  const handler = element("#roomShowcase").onkeydown;
+  let prevented = 0;
+  const event = (key, inside = true, extra = {}) => ({
+    key, target: { closest: selector => inside && selector === "#showcaseChoices [data-showcase-select]" ? {} : null },
+    preventDefault: () => prevented++, ...extra
+  });
+  handler(event("ArrowRight"));
+  assert.equal(element("#showcaseOpen").dataset.channel, "music");
+  assert.equal(element('#showcaseChoices [data-showcase-select="1"]').focused, true);
+  handler(event("End"));
+  assert.equal(element("#showcaseOpen").dataset.channel, "lounge");
+  handler(event("Home"));
+  assert.equal(element("#showcaseOpen").dataset.channel, "global");
+  handler(event("ArrowLeft"));
+  assert.equal(element("#showcaseOpen").dataset.channel, "lounge");
+  assert.equal(prevented, 4);
+  for (const ignored of [event("ArrowRight", false), event("ArrowRight", true, { ctrlKey: true }), event("ArrowRight", true, { metaKey: true }), event("ArrowRight", true, { altKey: true }), event("ArrowRight", true, { isComposing: true }), event("a"), event("Enter")]) handler(ignored);
+  assert.equal(prevented, 4);
+  assert.equal(element("#showcaseOpen").dataset.channel, "lounge");
+  assert.equal(app.state.active, "global");
+  assert.equal(requests.length, 0);
+});
+
+test("touch or click previews select only, while the explicit open action navigates to that public room", () => {
+  const { app, element, listeners, requests } = fixture();
+  app.bind();
+  const click = listeners.get("click");
+  click({ target: { closest: selector => selector === "[data-showcase-select]" ? { dataset: { showcaseSelect: "1" } } : null } });
+  assert.equal(element("#showcaseOpen").dataset.channel, "music");
+  assert.equal(app.state.active, "global");
+  assert.equal(requests.length, 0);
+  click({ target: { closest: selector => selector === "[data-channel]" ? element("#showcaseOpen") : null } });
+  assert.equal(app.state.active, "music");
+  assert.equal(app.state.view, "chat");
+  assert.ok(requests.some(request => request.url.pathname === "/api/messages" && request.url.searchParams.get("channel") === "music"));
 });

@@ -25,6 +25,40 @@
   };
   const state = { guest, profile: null, active: saved.active || "global", view: ["discover", "chat", "people", "voice"].includes(saved.view) ? saved.view : "discover", loading: true, channelErrors: {}, rooms: [], parties: [], servers: [], messages: {}, music: null, members: [], registered: 1428, goal: 1500, followingRooms: Array.isArray(saved.followingRooms) ? saved.followingRooms : [], connected: false, stream: null, peerId: crypto.randomUUID(), voiceRoom: "", joiningVoice: false, voiceMembers: [], muted: false, deafened: false, voiceError: "", voiceMobileOpen: false };
   const loadingChannels = new Set();
+  let showcaseIndex = 0;
+  const showcaseNotes = {
+    global: ["START ANYWHERE", "A big world. One open conversation.", "#b5a0ff"],
+    music: ["FIND YOUR SOUNDTRACK", "Share a song. Listen a little closer.", "#d2b2ff"],
+    travel: ["A CHANGE OF SCENERY", "Places you’ve been. Places you dream of.", "#93e0cd"],
+    makers: ["THINGS IN PROGRESS", "Ideas, projects, and your next little win.", "#e2b58b"],
+    lounge: ["TAKE YOUR TIME", "Slow down. There’s room for you here.", "#a4b5ff"]
+  };
+  function renderShowcase() {
+    const current = defaultRooms[showcaseIndex];
+    const card = (offset, position) => {
+      const index = (showcaseIndex + offset + defaultRooms.length) % defaultRooms.length;
+      const item = defaultRooms[index], [kicker, description, accent] = showcaseNotes[item.id];
+      const content = `<span class="stage-card-kicker">${esc(kicker)}</span><div class="room-object" aria-hidden="true"><span class="room-object-ring"></span><span class="room-object-glyph">${esc(item.emoji)}</span><i></i></div><h3>${esc(item.name)}</h3><p>${esc(description)}</p><span class="stage-card-footer"><img src="assets/turbochat-mark.svg" alt="" width="20" height="20">PUBLIC ROOM <span>${String(index + 1).padStart(2, "0")}</span></span>`;
+      return position === "current" ? `<article class="stage-room-card is-current" style="--room-accent:${accent}" aria-label="Selected public room: ${esc(item.name)}">${content}</article>` : `<button class="stage-room-card is-${position}" style="--room-accent:${accent}" data-showcase-select="${index}" aria-label="Preview ${esc(item.name)}">${content}</button>`;
+    };
+    $("#showcaseCards").innerHTML = card(-1, "previous") + card(0, "current") + card(1, "next");
+    $("#showcaseOpen").dataset.channel = current.id;
+    $("#showcaseOpen").textContent = `Open ${current.name} ↗`;
+    $("#showcaseSelection").textContent = `${String(showcaseIndex + 1).padStart(2, "0")} / ${String(defaultRooms.length).padStart(2, "0")} — ${current.name}`;
+    $$("#showcaseChoices [data-showcase-select]").forEach(button => { const selected = Number(button.dataset.showcaseSelect) === showcaseIndex; button.setAttribute("aria-pressed", String(selected)); button.classList.toggle("selected", selected); });
+  }
+  function selectShowcase(index, focus = false) {
+    if (!Number.isInteger(index)) return;
+    showcaseIndex = (index % defaultRooms.length + defaultRooms.length) % defaultRooms.length;
+    renderShowcase();
+    if (focus) $(`#showcaseChoices [data-showcase-select="${showcaseIndex}"]`)?.focus();
+  }
+  function showcaseKeydown(event) {
+    if (!event.target.closest("#showcaseChoices [data-showcase-select]") || event.isComposing || event.altKey || event.ctrlKey || event.metaKey) return;
+    const keyIndex = { ArrowRight: showcaseIndex + 1, ArrowLeft: showcaseIndex - 1, Home: 0, End: defaultRooms.length - 1 };
+    if (!Object.hasOwn(keyIndex, event.key)) return;
+    event.preventDefault(); selectShowcase(keyIndex[event.key], true);
+  }
   let mic = null, audioContext = null, micSource = null, micProcessor = null, relaySocket = null, outputGain = null, outputSchedule = new Map(), toastTimer, reconnectTimer, typingTimer, typingStopTimer, pollTimer, lastEventSeq = 0, lastHeartbeat = 0, lastMessageSync = 0, lastVoiceHeartbeat = 0, localTyping = false, polling = false;
   const typingPeers = new Map();
   const voicePeers = new Map();
@@ -386,7 +420,7 @@
   }
   function setView(view) {
     if (!["discover", "chat", "people", "voice"].includes(view)) return;
-    state.view = view; save(); renderHeader();
+    state.view = view; $(".main-panel").dataset.view = view; save(); renderHeader();
     ["discover", "chat", "people", "voice"].forEach(name => $(`#${name}View`).classList.toggle("hidden", name !== view));
     $("#mobileRoomNav").classList.toggle("is-hidden", view !== "chat");
     $$('[data-view]').forEach(button => { button.classList.toggle("active", button.dataset.view === view); button.setAttribute("aria-pressed", String(button.dataset.view === view)); });
@@ -639,6 +673,7 @@
   }
   function bind() {
     document.addEventListener("click", event => {
+      const showcaseChoice = event.target.closest("[data-showcase-select]"); if (showcaseChoice) selectShowcase(Number(showcaseChoice.dataset.showcaseSelect));
       if (event.target.closest("[data-compose]")) { setView("chat"); $("#messageInput").focus(); }
       if (event.target.closest("[data-search-open]")) search();
       if (event.target.closest("[data-retry-channel]")) state.connected ? loadChannel(state.active) : start();
@@ -662,6 +697,10 @@
     $("#createSpace").onclick = createRoomMenu; $("#createServer").onclick = $("#railCreate").onclick = createServerModal; $("#searchOpen").onclick = $("#mobileSearch").onclick = search; $("#inviteButton").onclick = $("#peopleInvite").onclick = inviteGeneral;
     $("#followButton").onclick = toggleFollow;
     $("#retryConnection").onclick = start;
+    $("#showcasePrevious").onclick = () => selectShowcase(showcaseIndex - 1);
+    $("#showcaseNext").onclick = () => selectShowcase(showcaseIndex + 1);
+    $("#roomShowcase").onkeydown = showcaseKeydown;
+    renderShowcase();
     $("#discoverAccount").onclick = () => state.profile ? profileModal() : authModal();
     $("#helpButton").onclick = showRules; $("#profileButton").onclick = $("#topProfile").onclick = () => state.profile ? profileModal() : authModal();
     $("#messageForm").onsubmit = e => { e.preventDefault(); sendMessage($("#messageInput").value); };

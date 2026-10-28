@@ -4,6 +4,8 @@ TurboChat's Orbit community keeps its existing Vercel frontend and Netlify API. 
 
 The product design uses the original TurboChat speech/orbit mark in `assets/`, warm ink, lilac and mint, with Manrope headings and DM Sans body text. `brand.css` carries this system through the discovery home, real room navigation, chat, accounts, loading, reconnect, empty and mobile states. The home screen links directly to existing conversations and search. Voice motion starts only in an active unmuted session; motion and scrolling respect reduced-motion preferences. Draft copy distinguishes device persistence from tab-only storage when browser storage is blocked. The published social preview is included in `assets/`; editable launch artwork is maintained with the release deliverables.
 
+`showcase.css` adds a dimensional public-room stage to discovery. Five public room previews use native CSS lighting and perspective, with explicit previous/next and room-choice buttons. Arrow keys, Home and End work only on those choices; selection never opens a room until its Open button is activated. There is no autoplay or pointer tracking. Private rooms, people and message content never appear in this stage. Reduced-motion mode keeps the composition static. Daily chat, drafts, search, accounts and voice retain their existing controls.
+
 Orbit is a real-time world chat with guest access, registered accounts, open rooms, invite-only parties, reactions, shared music, browser voice, and followed rooms saved in each browser.
 
 ## Run
