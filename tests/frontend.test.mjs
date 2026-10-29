@@ -8,7 +8,10 @@ const source = await readFile(new URL("../app.js", import.meta.url), "utf8");
 const entry = "bind(); renderMessages(); updateIdentity(); start();";
 assert.ok(source.includes(entry), "The test harness must replace only the application startup.");
 // Expose functions in the test-only copy; production does not export internals.
-const testSource = source.replace(entry, "globalThis.app = { state, drafts, chooseDrafts, saveDraft, restoreDraft, selectChannel, addMessage, setView, renderRoomList, pollUpdates, sendMessage, receiveLiveEvent, typingPeers, bind, renderMessages, renderVoice, setConnected, loadChannel, bootstrap, scrollBehavior, renderShowcase, selectShowcase, showcaseKeydown, messageFollow, scrollToLatest, scheduleBottomScroll, handleFeedScroll, pauseMessageFollow, initMessageScrolling, enterMessageRoom, visibleMessages, hideWorldHistory, restoreWorldHistory };");
+const testSource = source.replace(entry, "globalThis.app = { state, drafts, chooseDrafts, addMessage, setView, renderRoomList, saveDraft, restoreDraft, selectChannel, pollUpdates, sendMessage, receiveLiveEvent, typingPeers, bind, renderMessages, renderVoice, setConnected, loadChannel, bootstrap, scrollBehavior, renderShowcase, selectShowcase, showcaseKeydown, messageFollow, scrollToLatest, scheduleBottomScroll, handleFeedScroll, pauseMessageFollow, initMessageScrolling, enterMessageRoom, visibleMessages, hideWorldHistory, restoreWorldHistory, api, authModal, refreshIdentity, start, signOut, roomForm };");
+
+// Response metadata is a fixture-only wrapper; application payloads stay unchanged.
+const mockHttp = (data, options = {}) => ({ fixtureResponse: { data, status: 200, ...options } });
 
 function deferred() {
   let resolve, reject;
@@ -16,8 +19,8 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-function fixture({ storage = new Map(), request = () => undefined, reducedMotion = false, storageBlocked = false } = {}) {
-  const elements = new Map(), requests = [], timers = new Map(), intervals = new Map(), listeners = new Map();
+function fixture({ storage = new Map(), request = () => undefined, reducedMotion = false, storageBlocked = false, locationSearch = "" } = {}) {
+  const elements = new Map(), requests = [], timers = new Map(), timerDelays = new Map(), intervals = new Map(), listeners = new Map(), historyChanges = [];
   const frames = new Map(), windowListeners = new Map(), fontListeners = new Map(), resizeObservers = [], fontReady = deferred();
   let timerId = 0, frameId = 0;
   const addListener = (collection, type, listener) => {
@@ -32,7 +35,7 @@ function fixture({ storage = new Map(), request = () => undefined, reducedMotion
       const classes = new Set(), attributes = new Map(), eventListeners = new Map();
       let scrollTop = 0;
       const node = {
-        value: "", textContent: "", innerHTML: "", style: {}, dataset: {},
+        value: "", textContent: "", innerHTML: "", style: {}, dataset: {}, isConnected: true,
         scrollHeight: 180, clientHeight: 120, disabled: false,
         classList: {
           add: name => classes.add(name), remove: name => classes.delete(name),
@@ -43,13 +46,14 @@ function fixture({ storage = new Map(), request = () => undefined, reducedMotion
         getAttribute: name => attributes.get(name),
         addEventListener: (type, listener) => addListener(eventListeners, type, listener),
         focus() { this.focused = true; },
+        replaceChildren() { this.innerHTML = ""; },
         scrollTo(options) { this.scrollTop = options.top; this.lastScroll = options; },
         dispatchEvent(event) {
           const detail = { target: this, ...event, currentTarget: this };
           this[`on${event.type}`]?.(detail);
           dispatch(eventListeners, event.type, detail);
         },
-        querySelector: child => element(`${selector} ${child}`),
+        querySelector: child => element(child.startsWith("#") ? child : `${selector} ${child}`),
         querySelectorAll: () => []
       };
       Object.defineProperty(node, "scrollTop", {
@@ -69,9 +73,10 @@ function fixture({ storage = new Map(), request = () => undefined, reducedMotion
     const tab = element(`[data-search-mode="${mode}"]`); tab.dataset.searchMode = mode; return tab;
   });
   const context = vm.createContext({
-    location: { hostname: "orbit.test", protocol: "https:", port: "", origin: "https://orbit.test", pathname: "/", search: "" },
+    location: { hostname: "orbit.test", protocol: "https:", port: "", origin: "https://orbit.test", pathname: "/", search: locationSearch },
+    history: { replaceState: (...args) => historyChanges.push(args) },
     localStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => { if (storageBlocked) throw new Error("Browser storage is unavailable"); storage.set(key, value); } },
-    crypto: { randomUUID }, URL, URLSearchParams, console, Event,
+    crypto: { randomUUID }, URL, URLSearchParams, console, Event, AbortController, btoa, atob,
     document: {
       querySelector: selector => selector === ".modal" ? null : element(selector),
       querySelectorAll: selector => selector === "#showcaseChoices [data-showcase-select]" ? showcaseChoices : selector === "[data-search-mode]" ? searchModes : [],
@@ -79,8 +84,8 @@ function fixture({ storage = new Map(), request = () => undefined, reducedMotion
       fonts: { ready: fontReady.promise, addEventListener: (type, listener) => addListener(fontListeners, type, listener) }
     },
     window: { addEventListener: (type, listener) => addListener(windowListeners, type, listener), matchMedia: () => ({ matches: reducedMotion }) }, navigator: {},
-    setTimeout: callback => { timers.set(++timerId, callback); return timerId; },
-    clearTimeout: id => timers.delete(id),
+    setTimeout: (callback, delay) => { timers.set(++timerId, callback); timerDelays.set(timerId, delay); return timerId; },
+    clearTimeout: id => { timers.delete(id); timerDelays.delete(id); },
     setInterval: callback => { intervals.set(++timerId, callback); return timerId; },
     clearInterval: id => intervals.delete(id),
     requestAnimationFrame: callback => { frames.set(++frameId, callback); return frameId; },
@@ -93,9 +98,26 @@ function fixture({ storage = new Map(), request = () => undefined, reducedMotion
     },
     fetch: async (url, options = {}) => {
       const parsed = new URL(url, "https://orbit.test");
-      const record = { url: parsed, method: options.method || "GET", body: options.body ? JSON.parse(options.body) : null };
+      const record = { url: parsed, method: options.method || "GET", body: options.body ? JSON.parse(options.body) : null, signal: options.signal };
       requests.push(record);
-      const custom = await request(record);
+      const abortable = async work => {
+        let onAbort;
+        try {
+          return await Promise.race([Promise.resolve().then(work), new Promise((resolve, reject) => {
+            onAbort = () => reject(options.signal.reason);
+            if (options.signal?.aborted) onAbort();
+            else options.signal?.addEventListener("abort", onAbort, { once: true });
+          })]);
+        } finally { options.signal?.removeEventListener("abort", onAbort); }
+      };
+      const custom = await abortable(() => request(record));
+      if (custom?.fixtureResponse) {
+        const response = custom.fixtureResponse;
+        return { ok: response.status >= 200 && response.status < 300, status: response.status, json: () => abortable(() => {
+          if (response.jsonError) throw response.jsonError;
+          return response.data;
+        }) };
+      }
       const data = custom ?? (parsed.pathname === "/api/messages" ? { messages: [] } : { events: [], members: [], nextSeq: 0 });
       return { ok: true, status: 200, json: async () => data };
     }
@@ -114,8 +136,172 @@ function fixture({ storage = new Map(), request = () => undefined, reducedMotion
       if (targets.length) observer.callback(targets.map(node => ({ target: node })), observer);
     }
   };
-  return { app: context.app, element, requests, timers, intervals, storage, listeners, frames, flushFrames, resize, windowEvent: (type, event) => dispatch(windowListeners, type, event), fontEvent: type => dispatch(fontListeners, type), finishFonts: async () => { fontReady.resolve(); await fontReady.promise; } };
+  return { app: context.app, element, requests, timers, timerDelays, intervals, storage, listeners, frames, flushFrames, resize, historyChanges, windowEvent: (type, event) => dispatch(windowListeners, type, event), fontEvent: type => dispatch(fontListeners, type), finishFonts: async () => { fontReady.resolve(); await fontReady.promise; } };
 }
+
+test("a stalled poll times out, releases its lock, and reconnects on the next attempt", async () => {
+  const started = deferred(), stalled = deferred(); let attempts = 0;
+  const testCase = fixture({ request(record) {
+    if (record.url.pathname === "/api/updates" && ++attempts === 1) { started.resolve(); return stalled.promise; }
+  } });
+  const { app, element, requests, timers, timerDelays } = testCase;
+  app.state.connected = true;
+  const poll = app.pollUpdates(); await started.promise;
+  const deadline = [...timerDelays].find(([, delay]) => delay === 15000)?.[0];
+  assert.ok(deadline, "A stalled request must have a bounded deadline");
+  timers.get(deadline)(); await poll;
+  assert.equal(app.state.connected, false);
+  assert.match(element("#connectionLabel").textContent, /Reconnecting/);
+  assert.equal(requests.find(record => record.url.pathname === "/api/updates").signal.aborted, true);
+  assert.equal(timers.size, 0, "Request deadlines are removed after failure");
+  await app.pollUpdates();
+  assert.equal(requests.filter(record => record.url.pathname === "/api/updates").length, 2);
+  assert.equal(app.state.connected, true);
+  assert.equal(timers.size, 0, "Successful requests also remove their deadlines");
+});
+
+test("unreadable responses fail clearly while a valid server rejection keeps its message and status", async () => {
+  const cases = [
+    [mockHttp(null, { jsonError: new SyntaxError("Unexpected HTML") }), /unreadable response/],
+    [mockHttp([]), /unreadable response/], [mockHttp(null), /unreadable response/],
+    [mockHttp("proxy response"), /unreadable response/],
+    [mockHttp(null, { status: 502, jsonError: new SyntaxError("Unexpected HTML") }), /unavailable \(502\)/]
+  ];
+  for (const [response, message] of cases) {
+    const { app, timers } = fixture({ request: () => response });
+    await assert.rejects(app.api("/api/me"), message);
+    assert.equal(timers.size, 0);
+  }
+  const { app, timers } = fixture({ request: () => mockHttp({ error: "That password was not accepted." }, { status: 401 }) });
+  await assert.rejects(app.api("/api/login", { method: "POST", body: "{}" }), error => {
+    assert.equal(error.message, "That password was not accepted.");
+    assert.equal(error.status, 401); assert.notEqual(error.uncertain, true); return true;
+  });
+  assert.equal(timers.size, 0);
+});
+
+test("an unconfirmed send retains its text, warns about delivery, and never retries automatically", async () => {
+  const started = deferred(), stalled = deferred();
+  const { app, element, requests, timers, timerDelays } = fixture({ request(record) {
+    if (record.url.pathname === "/api/messages" && record.method === "POST") { started.resolve(); return stalled.promise; }
+  } });
+  app.state.connected = true; app.state.loading = false; app.state.view = "chat";
+  element("#messageInput").value = "Keep this unconfirmed message";
+  const send = app.sendMessage(element("#messageInput").value); await started.promise;
+  element("#messageInput").value = "A newer draft"; app.saveDraft();
+  const deadline = [...timerDelays].find(([, delay]) => delay === 15000)?.[0]; assert.ok(deadline);
+  timers.get(deadline)(); await send;
+  const item = app.state.messages.global[0];
+  assert.equal(item.text, "Keep this unconfirmed message"); assert.equal(item.failed, true); assert.equal(item.uncertain, true);
+  assert.equal(element("#messageInput").value, "A newer draft");
+  assert.match(element("#messageList").innerHTML, /Delivery unconfirmed/);
+  assert.match(element("#toast").textContent, /Check the conversation before using Try again/);
+  for (const callback of [...timers.values()]) callback();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(requests.filter(record => record.method === "POST" && record.url.pathname === "/api/messages").length, 1);
+});
+
+test("creating a room or party opens its chat, leaves the old voice room, and preserves the old draft", async () => {
+  for (const isParty of [false, true]) {
+    const created = { id: isParty ? "party-created" : "room-created", name: "A new conversation", type: isParty ? "party" : "channel" };
+    const { app, element, requests } = fixture({ request: record => record.url.pathname === (isParty ? "/api/parties" : "/api/rooms") ? { room: created, inviteCode: "test-invite" } : undefined });
+    app.state.view = "discover"; app.state.voiceRoom = "global";
+    element("#messageInput").value = "Keep my World draft";
+    app.roomForm(isParty); element("#roomName").value = created.name; element("#roomTopic").value = "A topic";
+    const form = element("#roomForm"); await form.onsubmit({ preventDefault() {}, currentTarget: form });
+    assert.equal(app.state.active, created.id); assert.equal(app.state.view, "chat");
+    assert.equal(app.messageFollow.room, created.id); assert.equal(app.state.voiceRoom, "");
+    assert.equal(app.drafts.global, "Keep my World draft"); assert.equal(element("#messageInput").value, "");
+    assert.ok(requests.some(record => record.url.pathname === "/api/voice/leave" && record.body.room === "global"));
+    assert.ok(requests.some(record => record.url.pathname === "/api/messages" && record.url.searchParams.get("channel") === created.id));
+    assert.equal(element("#chatView").classList.contains("hidden"), false);
+    if (isParty) assert.match(element("#modalRoot").innerHTML, /Invite someone to A new conversation/);
+  }
+});
+
+test("a rejected room creation keeps the form values and presents its error beside the form", async () => {
+  const { app, element } = fixture({ request: record => record.url.pathname === "/api/rooms" ? mockHttp({ error: "Choose another room name." }, { status: 400 }) : undefined });
+  app.roomForm(false); element("#roomName").value = "My room"; element("#roomTopic").value = "Keep this topic";
+  const form = element("#roomForm"); await form.onsubmit({ preventDefault() {}, currentTarget: form });
+  assert.equal(element("#roomError").textContent, "Choose another room name.");
+  assert.equal(form.querySelector("button").disabled, false);
+  assert.equal(element("#roomName").value, "My room"); assert.equal(element("#roomTopic").value, "Keep this topic");
+  assert.equal(app.state.active, "global"); assert.equal(app.state.rooms.length, 0);
+});
+
+test("a confirmed sign-in survives a conversation outage and schedules recovery without claiming sign-in failed", async () => {
+  const profile = { id: "verified-test-person", name: "Test person" };
+  const { app, element, requests, timerDelays, intervals, storage } = fixture({ request(record) {
+    if (["/api/login", "/api/me"].includes(record.url.pathname)) return { user: profile };
+    if (record.url.pathname === "/api/bootstrap") return mockHttp({ error: "Conversations are unavailable." }, { status: 503 });
+  } });
+  app.chooseDrafts(null); element("#messageInput").value = "Keep this guest draft";
+  app.authModal(); element("#authEmail").value = "person@example.test"; element("#authPassword").value = "fixture-password";
+  const form = element("#authForm"); await form.onsubmit({ preventDefault() {}, currentTarget: form });
+  assert.equal(app.state.profile.id, profile.id); assert.equal(app.state.connected, false); assert.equal(app.state.loading, false);
+  assert.equal(app.drafts.global, undefined);
+  assert.equal(JSON.parse(storage.get("orbit.chat.v3")).draftsByIdentity[`guest-${app.state.guest.id}`].global, "Keep this guest draft");
+  assert.match(element("#identityHint").textContent, /Signed in as Test person/);
+  assert.equal(element("#modalRoot").innerHTML, ""); assert.equal(element("#authError").textContent, "");
+  assert.match(element("#toast").textContent, /Signed in as Test person.*conversations are reconnecting/);
+  assert.equal(element("#connectionBanner").classList.contains("hidden"), false);
+  assert.ok([...timerDelays.values()].includes(8000)); assert.equal(intervals.size, 0);
+  assert.equal(requests.filter(record => record.url.pathname === "/api/login").length, 1);
+  element("#messageInput").value = "Keep this account draft"; app.saveDraft();
+  await app.signOut();
+  assert.equal(app.state.profile, null); assert.equal(app.state.connected, false);
+  assert.equal(element("#messageInput").value, "Keep this guest draft");
+  assert.equal(JSON.parse(storage.get("orbit.chat.v3")).draftsByIdentity[`user-${profile.id}`].global, "Keep this account draft");
+  assert.match(element("#toast").textContent, /Signed out.*conversations are reconnecting/);
+});
+
+test("an accepted login without a confirmed session stays a guest and offers a truthful retry", async () => {
+  const { app, element, requests } = fixture({ request(record) {
+    if (record.url.pathname === "/api/login") return { user: { id: "unconfirmed-person", name: "Test person" } };
+    if (record.url.pathname === "/api/me") return { user: null };
+  } });
+  app.authModal(); const form = element("#authForm");
+  await form.onsubmit({ preventDefault() {}, currentTarget: form });
+  assert.equal(app.state.profile, null);
+  assert.match(element("#authError").textContent, /Sign-in could not be confirmed/);
+  assert.equal(form.querySelector(".submit-button").disabled, false);
+  assert.equal(requests.some(record => record.url.pathname === "/api/bootstrap"), false);
+});
+
+test("stale startup session results and failures cannot overwrite a newer confirmed identity", async () => {
+  for (const fails of [false, true]) {
+    const session = deferred(), started = deferred(), profile = { id: "new-person", name: "New identity" };
+    const { app, element, timerDelays } = fixture({ request(record) {
+      if (record.url.pathname === "/api/me") { started.resolve(); return session.promise; }
+      if (record.url.pathname === "/api/bootstrap") return mockHttp({ error: "Reconnect later" }, { status: 503 });
+    } });
+    const startup = app.start(); await started.promise;
+    assert.equal(await app.refreshIdentity(profile), false);
+    const before = [...timerDelays].filter(([, delay]) => delay === 8000);
+    if (fails) session.reject(new Error("Stale connection failure")); else session.resolve({ user: null });
+    await startup;
+    assert.equal(app.state.profile.id, profile.id); assert.equal(app.state.channelErrors.global, "Reconnect later");
+    assert.match(element("#identityHint").textContent, /New identity/);
+    assert.deepEqual([...timerDelays].filter(([, delay]) => delay === 8000), before, "The stale startup cannot replace the current recovery timer");
+  }
+});
+
+test("an invite response from an earlier identity cannot join a room after identity changes", async () => {
+  const join = deferred(), started = deferred(), profile = { id: "new-person", name: "New identity" };
+  const invite = btoa(JSON.stringify({ kind: "party", id: "old-private-party", inviteCode: "old-code", name: "Old invitation" }));
+  const { app, requests, historyChanges } = fixture({ locationSearch: `?invite=${encodeURIComponent(invite)}`, request(record) {
+    if (record.url.pathname === "/api/me") return { user: null };
+    if (record.url.pathname === "/api/parties/join") { started.resolve(); return join.promise; }
+    if (record.url.pathname === "/api/bootstrap") return mockHttp({ error: "Reconnect later" }, { status: 503 });
+  } });
+  const startup = app.start(); await started.promise;
+  await app.refreshIdentity(profile);
+  join.resolve({ room: { id: "old-private-party", name: "Old invitation", type: "party" } }); await startup;
+  assert.equal(app.state.profile.id, profile.id); assert.equal(app.state.active, "global");
+  assert.equal(app.state.parties.length, 0); assert.equal(app.state.view, "discover");
+  assert.equal(historyChanges.length, 0);
+  assert.equal(requests.filter(record => record.url.pathname === "/api/bootstrap").length, 1);
+});
 
 test("a delayed room poll cannot put the previous room's messages in the newly selected room", async () => {
   const response = deferred(), started = deferred();

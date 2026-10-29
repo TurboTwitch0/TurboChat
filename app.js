@@ -189,15 +189,25 @@
   function clearTyping() { clearTimeout(typingTimer); clearTimeout(typingStopTimer); sendTyping(false); for (const [key, value] of typingPeers) if (key.endsWith(":timer")) clearTimeout(value); typingPeers.clear(); renderTyping(); }
   function toast(message) { const el = $("#toast"); el.textContent = message; el.classList.add("show"); clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove("show"), 3000); }
   async function api(path, options = {}) {
-    const controller = typeof AbortController === "function" ? new AbortController() : null;
-    const timer = controller && setTimeout(() => controller.abort(), 15000);
+    const controller = typeof AbortController === "function" ? new AbortController() : null, method = (options.method || "GET").toUpperCase();
+    const deadline = controller && setTimeout(() => controller.abort(), 15000);
     try {
-      const response = await fetch(`${API_BASE}${path}`, { credentials: "include", ...(controller ? { signal: controller.signal } : {}), ...options, headers: { "Content-Type": "application/json", ...(options.headers || {}) } });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) { const error = new Error(data.error || `Request failed (${response.status}).`); error.status = response.status; throw error; }
+      const response = await fetch(`${API_BASE}${path}`, { ...options, credentials: "include", headers: { "Content-Type": "application/json", ...(options.headers || {}) }, signal: controller?.signal });
+      let data;
+      try { data = await response.json(); }
+      catch (error) { if (controller?.signal.aborted) throw error; throw new Error(response.ok ? "Chat returned an unreadable response. Please try again." : `Chat is unavailable (${response.status}). Please try again.`); }
+      if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("Chat returned an unreadable response. Please try again.");
+      if (!response.ok) { const error = new Error(typeof data.error === "string" ? data.error : `Request failed (${response.status}).`); error.status = response.status; throw error; }
       return data;
-    } catch (error) { if (error.name === "AbortError") throw new Error("The connection timed out. Please try again."); throw error; }
-    finally { if (timer) clearTimeout(timer); }
+    } catch (error) {
+      if (controller?.signal.aborted) {
+        const timeout = new Error(method === "GET" ? "The connection took too long. Please try again." : "The request took too long to confirm. Check for changes before trying again.");
+        timeout.code = "REQUEST_TIMEOUT"; timeout.uncertain = method !== "GET"; throw timeout;
+      }
+      if (error instanceof TypeError) { const network = new Error("Couldn’t reach chat. Check your connection and try again."); network.uncertain = method !== "GET"; throw network; }
+      if (method !== "GET" && !error.status) error.uncertain = true;
+      throw error;
+    } finally { if (deadline) clearTimeout(deadline); }
   }
   function allRooms() { return [...defaultRooms, ...state.rooms, ...state.parties, ...state.servers.flatMap(server => server.channels.map(channel => ({ ...channel, serverId: server.id, serverName: server.name, emoji: channel.type === "voice" ? "◖" : "#", topic: server.description || `A channel in ${server.name}.` })))]; }
   function room(id) { return allRooms().find(x => x.id === id) || { id, name: "Party", emoji: "✦", topic: "A private room for good people." }; }
@@ -231,7 +241,7 @@
   function renderMessage(item) {
     const reactions = Object.entries(item.reactions || {}).map(([emoji, list]) => `<button class="reaction" data-react="${esc(item.id)}" data-emoji="${esc(emoji)}">${esc(emoji)} ${list.length}</button>`).join("");
     const stamp = new Date(item.createdAt || Date.now());
-    const actions = item.pending ? `<span class="message-delivery">Sending…</span>` : item.failed ? `<span class="message-delivery failed">Not sent</span><button class="retry-message" data-retry-message="${esc(item.id)}">Try again</button>` : `${reactions}<button class="reaction" data-react="${esc(item.id)}" data-emoji="💜" aria-label="React with a purple heart">💜 +</button><button class="reply-link" data-reply="${esc(item.id)}">↩ Reply</button>`;
+    const actions = item.pending ? `<span class="message-delivery">Sending…</span>` : item.failed ? `<span class="message-delivery failed">${item.uncertain ? "Delivery unconfirmed" : "Not sent"}</span><button class="retry-message" data-retry-message="${esc(item.id)}">Try again</button>` : `${reactions}<button class="reaction" data-react="${esc(item.id)}" data-emoji="💜" aria-label="React with a purple heart">💜 +</button><button class="reply-link" data-reply="${esc(item.id)}">↩ Reply</button>`;
     return `<article class="message ${item.failed ? "message-failed" : ""}" data-message-id="${esc(item.id)}"><span class="avatar">${esc(item.emoji || "✦")}</span><div class="message-body"><div class="message-meta"><b>${esc(item.user || "Guest")}</b>${item.registered ? `<i>member</i>` : ""}<time datetime="${esc(stamp.toISOString())}" title="${esc(stamp.toLocaleString())}">${new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" }).format(stamp)}</time></div><p>${esc(item.text)}</p><div class="message-actions">${actions}</div></div></article>`;
   }
   function renderMessages({ scrollToBottom = false } = {}) {
@@ -301,6 +311,7 @@
     let data, channel = state.active; const version = identityVersion;
     try { data = await api(`/api/bootstrap?channel=${encodeURIComponent(channel)}&guestId=${encodeURIComponent(state.guest.id)}`); }
     catch (error) {
+      if (version !== identityVersion) return;
       if (channel === "global" || ![403, 404].includes(error.status)) throw error;
       if (state.active === channel) state.active = "global"; channel = "global"; save(); toast("That saved room is no longer available. You’re back in World chat.");
       data = await api(`/api/bootstrap?channel=global&guestId=${encodeURIComponent(state.guest.id)}`);
@@ -376,7 +387,7 @@
     const tempId = `pending-${crypto.randomUUID()}`, pending = { id: tempId, user: name(), emoji: state.profile?.emoji || "✦", text: content, createdAt: new Date().toISOString(), reactions: {}, pending: true };
     mergeMessages(channel, [pending]); if (state.active === channel) renderMessages({ scrollToBottom: true });
     try { const result = await api("/api/messages", { method: "POST", body: JSON.stringify({ channel, text: content, guestId: state.guest.id, guestName: name() }) }); if (version !== identityVersion) return; state.messages[channel] = (state.messages[channel] || []).filter(item => item.id !== tempId); mergeMessages(channel, [result.message]); if (state.active === channel) renderMessages({ scrollToBottom: true }); }
-    catch (error) { if (version !== identityVersion) return; const item = (state.messages[channel] || []).find(item => item.id === tempId); if (item) { item.pending = false; item.failed = true; } if (state.active === channel) renderMessages(); toast(`${error.message} Your message is kept above. Use Try again to resend.`); }
+    catch (error) { if (version !== identityVersion) return; const item = (state.messages[channel] || []).find(item => item.id === tempId); if (item) { item.pending = false; item.failed = true; item.uncertain = error.uncertain === true; } if (state.active === channel) renderMessages(); toast(error.uncertain ? `${error.message} Your text is kept above. Check the conversation before using Try again.` : `${error.message} Your message is kept above. Use Try again to resend.`); }
   }
   async function selectChannel(id) {
     if (!allRooms().some(item => item.id === id)) return;
@@ -398,6 +409,7 @@
     accountBusy = busy;
     $$("#modalRoot button, #modalRoot input, #modalRoot select").forEach(control => control.disabled = busy);
     $("#modalRoot").setAttribute("aria-busy", String(busy));
+    if (busy && $(".modal")) { $(".modal").setAttribute("tabindex", "-1"); $(".modal").focus(); }
   }
   function createRoomMenu() {
     modal("Make a place for your people.", "Create an open room or a private party.", `<div class="modal-actions"><button id="makeRoom" class="modal-choice"><b>✳ Community room</b><small>Anyone can find and join.</small></button><button id="makeParty" class="modal-choice"><b>✦ Invite-only party</b><small>Only people with your invite can enter.</small></button></div>`);
@@ -429,15 +441,15 @@
     catch (error) { toast(error.message); }
   }
   function roomForm(isParty) {
-    modal(isParty ? "Start a party." : "Start a community room.", "Give people a good reason to join the conversation.", `<form id="roomForm"><label>Name<input id="roomName" required minlength="2" maxlength="42" placeholder="${isParty ? "Friday night crew" : "Book lovers unite"}"></label><label>Conversation starter<input id="roomTopic" maxlength="100" placeholder="What should people talk about?"></label><button class="submit-button">Create ${isParty ? "party" : "room"} →</button></form>`);
+    modal(isParty ? "Start a party." : "Start a community room.", "Give people a good reason to join the conversation.", `<form id="roomForm"><label>Name<input id="roomName" required minlength="2" maxlength="42" placeholder="${isParty ? "Friday night crew" : "Book lovers unite"}"></label><label>Conversation starter<input id="roomTopic" maxlength="100" placeholder="What should people talk about?"></label><p id="roomError" class="auth-error" role="alert"></p><button class="submit-button">Create ${isParty ? "party" : "room"} →</button></form>`);
     $("#roomForm").onsubmit = async event => {
-      event.preventDefault(); const button = event.currentTarget.querySelector("button"); button.disabled = true;
+      event.preventDefault(); const form = event.currentTarget, button = form.querySelector("button"), errorNode = $("#roomError"); button.disabled = true; errorNode.textContent = "";
       try {
         const result = await api(isParty ? "/api/parties" : "/api/rooms", { method: "POST", body: JSON.stringify({ name: $("#roomName").value.trim(), topic: $("#roomTopic").value.trim(), owner: name(), guestId: state.guest.id }) });
         if (isParty) state.parties.unshift(result.room); else state.rooms.unshift(result.room);
-        saveDraft(); clearTyping(); state.active = result.room.id; save(); restoreDraft(); await loadChannel(state.active); closeModal(); renderRoomList(); renderMessages();
+        closeModal(); await selectChannel(result.room.id);
         if (isParty) inviteCreated(result.room, result.inviteCode); else toast("Your room is open to everyone.");
-      } catch (error) { toast(error.message); button.disabled = false; }
+      } catch (error) { if (form.isConnected) errorNode.textContent = error.message; button.disabled = false; }
     };
   }
   function packInvite(data) { return btoa(unescape(encodeURIComponent(JSON.stringify(data)))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, ""); }
@@ -447,19 +459,21 @@
     $("#copyInvite").onclick = async () => { try { await navigator.clipboard.writeText(link); toast("Invite copied."); } catch { $("#inviteLink").select(); document.execCommand("copy"); toast("Invite copied."); } };
     $("#doneInvite").onclick = closeModal;
   }
-  async function processInvite() {
+  async function processInvite(version = identityVersion) {
     const encoded = new URLSearchParams(location.search).get("invite"); if (!encoded) return;
     try {
       const data = JSON.parse(decodeURIComponent(escape(atob(encoded.replace(/-/g, "+").replace(/_/g, "/")))));
       if (data.kind === "server") {
         const result = await api("/api/servers/join", { method: "POST", body: JSON.stringify({ id: data.id, inviteCode: data.inviteCode, guestId: state.guest.id }) });
+        if (version !== identityVersion) return;
         state.servers = state.servers.filter(server => server.id !== result.server.id); state.servers.unshift(result.server); state.active = result.server.channels[0].id; renderRoomList();
       } else {
         const result = await api("/api/parties/join", { method: "POST", body: JSON.stringify({ id: data.id, inviteCode: data.inviteCode, guestId: state.guest.id }) });
+        if (version !== identityVersion) return;
         state.parties = (state.parties || []).filter(item => item.id !== result.room.id); state.parties.unshift(result.room); state.active = result.room.id;
       }
       state.view = "chat"; save(); history.replaceState({}, "", location.pathname); toast(`You joined ${data.name || "the server"}.`);
-    } catch (error) { history.replaceState({}, "", location.pathname); toast(error.message); }
+    } catch (error) { if (version !== identityVersion) return; history.replaceState({}, "", location.pathname); toast(error.message); }
   }
   function inviteGeneral() {
     const link = `${appOrigin}${location.pathname}`;
@@ -472,14 +486,17 @@
     $("#togglePassword").onclick = () => { const input = $("#authPassword"), show = input.type === "password"; input.type = show ? "text" : "password"; $("#togglePassword").textContent = show ? "Hide password" : "Show password"; $("#togglePassword").setAttribute("aria-pressed", String(show)); };
     $("#toLogin").onclick = () => authModal("login"); $("#toRegister").onclick = () => authModal("register");
     $("#authForm").onsubmit = async e => {
-      e.preventDefault(); const form = e.currentTarget, button = form.querySelector(".submit-button"), errorField = form.querySelector("#authError"); setAccountBusy(true); errorField.textContent = ""; button.textContent = register ? "Creating account…" : "Signing in…";
+      e.preventDefault(); if (accountBusy) return; const form = e.currentTarget, button = form.querySelector(".submit-button"), errorField = form.querySelector("#authError"); setAccountBusy(true); errorField.textContent = ""; button.textContent = register ? "Creating account…" : "Signing in…";
+      let signedIn = null, synced = false;
       try {
         const endpoint = register ? "/api/register" : "/api/login";
         const result = await api(endpoint, { method: "POST", body: JSON.stringify({ name: register ? $("#authName").value.trim() : undefined, email: $("#authEmail").value.trim(), password: $("#authPassword").value, guestId: state.guest.id }) });
         const session = await api("/api/me");
-        if (!session.user || session.user.id !== result.user?.id) throw new Error("Your account was accepted, but this browser did not receive its sign-in session. Check cookies for this site and try again.");
-        await refreshIdentity(session.user); setAccountBusy(false); closeModal(); toast(`Welcome, ${session.user.name}.`);
-      } catch (error) { setAccountBusy(false); if (form.isConnected) errorField.textContent = error.message; button.textContent = register ? "Create account" : "Sign in"; }
+        if (!session.user || session.user.id !== result.user?.id) throw new Error("Sign-in could not be confirmed. The service may not have kept the session, or this browser may be blocking cookies. You can continue as a guest and try again later.");
+        signedIn = session.user; synced = await refreshIdentity(session.user);
+      } catch (error) { if (form.isConnected) errorField.textContent = error.message; button.textContent = register ? "Create account" : "Sign in"; }
+      finally { setAccountBusy(false); }
+      if (signedIn) { if (form.isConnected) closeModal(); toast(synced ? `Welcome, ${signedIn.name}.` : `Signed in as ${signedIn.name}. Your conversations are reconnecting.`); }
     };
     $("#guestMode").onclick = () => state.profile ? signOut() : closeModal();
     if ($("#logout")) $("#logout").onclick = signOut;
@@ -489,30 +506,44 @@
     const emojis = ["✦","🌙","🌻","🦊","🐸","🐈","🎧","🚀","🌊","⭐","🍄","🪐"];
     modal("Your profile", "Make your little corner feel like you.", `<form id="profileForm"><label>Display name<input id="profileName" required minlength="2" maxlength="32" value="${esc(state.profile.name)}" autocomplete="nickname"></label><label>Avatar<select id="profileEmoji">${emojis.map(emoji => `<option value="${emoji}" ${state.profile.emoji === emoji ? "selected" : ""}>${emoji}</option>`).join("")}</select></label><label>About me<input id="profileAbout" maxlength="100" value="${esc(state.profile.about || "")}" placeholder="A little about you"></label><label>Status<select id="profileStatus"><option value="online" ${state.profile.status !== "idle" && state.profile.status !== "dnd" ? "selected" : ""}>Online</option><option value="idle" ${state.profile.status === "idle" ? "selected" : ""}>Idle</option><option value="dnd" ${state.profile.status === "dnd" ? "selected" : ""}>Do not disturb</option></select></label><p id="profileError" class="auth-error" role="alert"></p><button class="submit-button">Save profile</button></form><button id="profileSignOut" class="subtle-button">Sign out</button>`);
     $("#profileForm").onsubmit = async event => {
-      event.preventDefault(); const form = event.currentTarget, button = form.querySelector(".submit-button"), errorField = form.querySelector("#profileError"); setAccountBusy(true); button.textContent = "Saving…";
+      event.preventDefault(); if (accountBusy) return; const form = event.currentTarget, button = form.querySelector(".submit-button"), errorField = form.querySelector("#profileError"); setAccountBusy(true); button.textContent = "Saving…";
+      let savedProfile = false;
       try {
         const result = await api("/api/profile", { method: "POST", body: JSON.stringify({ name: $("#profileName").value.trim(), emoji: $("#profileEmoji").value, about: $("#profileAbout").value.trim(), status: $("#profileStatus").value }) });
-        state.profile = result.user; setAccountBusy(false); closeModal(); updateIdentity(); renderMembers(); renderMessages(); connectLive(); toast("Profile saved.");
-      } catch (error) { setAccountBusy(false); if (form.isConnected) errorField.textContent = error.message; button.textContent = "Save profile"; }
+        state.profile = result.user; updateIdentity(); renderMembers(); renderMessages(); connectLive(); savedProfile = true;
+      } catch (error) { if (form.isConnected) errorField.textContent = error.message; button.textContent = "Save profile"; }
+      finally { setAccountBusy(false); }
+      if (savedProfile) { closeModal(); toast("Profile saved."); }
     };
     $("#profileSignOut").onclick = signOut;
   }
   async function refreshIdentity(profile, resetChannel = false) {
-    saveDraft(); clearTyping(); identityVersion++; state.stream?.close(); clearInterval(pollTimer);
+    clearTimeout(reconnectTimer); saveDraft(); clearTyping(); identityVersion++; state.stream?.close(); clearInterval(pollTimer);
+    const version = identityVersion; let synced = false;
     if (state.voiceRoom) await leaveVoice(true);
+    if (version !== identityVersion) return false;
     state.profile = profile; if (resetChannel) state.active = "global"; chooseDrafts(profile);
     state.messages = {}; state.parties = []; state.servers = []; state.members = []; state.unread = {}; lastEventSeq = 0; lastHeartbeat = 0; lastMessageSync = 0;
+    state.loading = true; setConnected(false, "Loading conversations…");
     updateIdentity(); renderRoomList(); renderMessages(); renderMembers();
-    try { await bootstrap(); } catch (error) { state.loading = false; state.channelErrors[state.active] = error.message; renderMessages(); } finally { connectLive(); }
+    try { await bootstrap(); if (version !== identityVersion) return false; synced = true; return true; }
+    catch (error) {
+      if (version !== identityVersion) return false;
+      state.loading = false; state.channelErrors[state.active] = error.message; setConnected(false, "Reconnecting…"); renderMessages();
+      reconnectTimer = setTimeout(() => { if (version === identityVersion) start(); }, 8000); return false;
+    } finally { if (synced && version === identityVersion) connectLive(); }
   }
   async function signOut() {
     if (accountBusy) return; setAccountBusy(true);
+    let signedOut = false, synced = false;
     try {
       saveDraft(); clearTyping();
       if (state.voiceRoom) await leaveVoice(true);
       await api("/api/logout", { method: "POST", body: "{}" });
-      await refreshIdentity(null, true); setAccountBusy(false); closeModal(); toast("Signed out.");
-    } catch (error) { setAccountBusy(false); toast(error.message); }
+      signedOut = true; synced = await refreshIdentity(null, true);
+    } catch (error) { toast(error.message); }
+    finally { setAccountBusy(false); }
+    if (signedOut) { closeModal(); toast(synced ? "Signed out." : "Signed out. Your conversations are reconnecting."); }
   }
   function updateIdentity() { $("#identityHint").textContent = state.profile ? `Signed in as ${state.profile.name}` : `Chatting as ${state.guest.name}`; $("#profileButton").textContent = state.profile?.emoji || (state.profile ? state.profile.name[0].toUpperCase() : "G"); $("#topProfile").textContent = state.profile ? `${state.profile.emoji || "◉"} ${state.profile.name}` : "Sign in"; $("#discoverAccount").textContent = state.profile ? "Your profile ↗" : "Sign in to your space ↗"; $("#discoverIdentity").textContent = state.profile ? `Welcome back, ${state.profile.name}. Your next conversation is waiting.` : "No introduction needed. Explore as a guest, or sign in to your profile."; }
   function renderMusic() {
@@ -851,7 +882,7 @@
     $("#voiceToggle").onclick = $("#voiceTabJoin").onclick = joinVoice; $("#voiceMute").onclick = $("#voiceTabMute").onclick = () => { state.muted = !state.muted; setVoiceDevice(); }; $("#voiceDeafen").onclick = $("#voiceTabDeafen").onclick = () => { state.deafened = !state.deafened; setVoiceDevice(); }; $("#mobileVoice").onclick = () => { state.voiceMobileOpen = !state.voiceMobileOpen; renderVoice(); };
     $$("[data-view]").forEach(button => button.onclick = () => setView(button.dataset.view));
     document.addEventListener("keydown", e => {
-      if (accountBusy) return;
+      if (accountBusy) { if (e.key === "Tab") { e.preventDefault(); $(".modal")?.focus(); } return; }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); search(); }
       if (e.key === "Escape") { closeModal(); state.voiceMobileOpen = false; renderVoice(); }
       if (e.key === "Tab" && $(".modal")) { const controls = $$(".modal button:not([disabled]), .modal input:not([disabled]), .modal select:not([disabled]), .modal textarea:not([disabled]), .modal a[href]").filter(item => item.getClientRects().length); const first = controls[0], last = controls.at(-1); if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last?.focus(); } else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first?.focus(); } }
@@ -861,8 +892,12 @@
   async function start() {
     const version = identityVersion;
     clearTimeout(reconnectTimer); state.loading = true; setConnected(false, "Connecting…"); save(); setView(state.view); renderMessages();
-    try { const me = await api("/api/me"); if (version !== identityVersion) return; state.profile = me.user; chooseDrafts(me.user); await processInvite(); await bootstrap(); if (version !== identityVersion) return; updateIdentity(); setView(state.view); connectLive(); }
-    catch (error) { if (version !== identityVersion) return; state.loading = false; state.channelErrors[state.active] = error.message; setConnected(false, "Reconnecting…"); renderMessages(); reconnectTimer = setTimeout(start, 8000); }
+    try {
+      const me = await api("/api/me"); if (version !== identityVersion) return;
+      state.profile = me.user; chooseDrafts(me.user); await processInvite(version); if (version !== identityVersion) return;
+      await bootstrap(); if (version !== identityVersion) return;
+      updateIdentity(); setView(state.view); connectLive();
+    } catch (error) { if (version !== identityVersion) return; state.loading = false; state.channelErrors[state.active] = error.message; setConnected(false, "Reconnecting…"); renderMessages(); reconnectTimer = setTimeout(start, 8000); }
   }
   bind(); renderMessages(); updateIdentity(); start();
 })();
