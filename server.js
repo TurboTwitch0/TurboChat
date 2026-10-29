@@ -8,6 +8,7 @@ const scrypt = promisify(crypto.scrypt);
 const root = __dirname;
 const dataDir = process.env.ORBIT_DATA_DIR || path.join(root, "data");
 const dataFile = path.join(dataDir, "orbit.json");
+const deletionFile = path.join(dataDir, "deletions.json");
 const port = Number(process.env.PORT || 3001);
 const memberBaseline = 1428;
 const memberGoal = 1500;
@@ -15,8 +16,14 @@ const online = new Map();
 const sessionLifetime = 30 * 24 * 60 * 60 * 1000;
 const emptyStore = () => ({ users: [], messages: {}, rooms: [], parties: [], servers: [], music: null, sessions: {} });
 let store = emptyStore();
+let deletions = { users: {}, emails: {}, parties: {} };
+try { deletions = { ...deletions, ...JSON.parse(fs.readFileSync(deletionFile, "utf8")) }; }
+catch (error) { if (error.code !== "ENOENT") throw error; }
 try { store = { ...emptyStore(), ...JSON.parse(fs.readFileSync(dataFile, "utf8")) }; }
 catch (error) { if (error.code !== "ENOENT") console.error("Store read failed:", error.message); }
+store.users = store.users.filter(user => !deletions.users[user.id]);
+store.parties = store.parties.filter(party => !deletions.parties[party.id]);
+for (const id of Object.keys(deletions.parties)) delete store.messages[id];
 const text = (value, max = 200) => typeof value === "string" ? value.trim().slice(0, max) : "";
 const safeId = value => typeof value === "string" && /^[\w-]{1,100}$/.test(value) ? value : "";
 const registeredCount = () => memberBaseline + store.users.length;
@@ -26,6 +33,11 @@ function persist() {
   fs.writeFileSync(tmp, JSON.stringify(store), { mode: 0o600 });
   fs.renameSync(tmp, dataFile);
 }
+function persistDeletions() {
+  fs.mkdirSync(dataDir, { recursive: true });
+  const tmp = `${deletionFile}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(deletions), { mode: 0o600 }); fs.renameSync(tmp, deletionFile);
+}
 function cookie(req, key) {
   const part = (req.headers.cookie || "").split(";").map(item => item.trim()).find(item => item.startsWith(`${key}=`));
   try { return part ? decodeURIComponent(part.slice(key.length + 1)) : ""; } catch { return ""; }
@@ -34,7 +46,7 @@ const sessionKey = token => crypto.createHash("sha256").update(token).digest("he
 function userFor(req) {
   const token = cookie(req, "orbit_session");
   const session = token && store.sessions?.[sessionKey(token)];
-  return session && session.expiresAt > Date.now() ? store.users.find(user => user.id === session.userId) || null : null;
+  return session && !deletions.users[session.userId] && session.expiresAt > Date.now() ? store.users.find(user => user.id === session.userId) || null : null;
 }
 function createSession(req, userId) {
   store.sessions ||= {};
@@ -70,7 +82,7 @@ function voiceUpdate(room) {
 function roomMember(room, who) { return !!who && (room.memberKeys || []).includes(who); }
 function canReadRoom(room, who) { return room.type !== "party" || roomMember(room, who); }
 function serverForChannel(channel) { return (store.servers || []).find(server => (server.channels || []).some(item => item.id === channel)); }
-function canReadChannel(channel, who) { const party = store.parties.find(item => item.id === channel), server = serverForChannel(channel); return party ? roomMember(party, who) : !server || roomMember(server, who); }
+function canReadChannel(channel, who) { const party = store.parties.find(item => item.id === channel), server = serverForChannel(channel); return !deletions.parties[channel] && (party ? roomMember(party, who) : server ? roomMember(server, who) : !/^(?:party|channel|voice)-/.test(channel)); }
 function publicServer(server) { return { id: server.id, name: server.name, emoji: server.emoji, description: server.description || "", ownerId: server.ownerId, channels: server.channels || [] }; }
 function migrateGuestMemberships(guestId, userId) {
   const guestKey = `guest-${safeId(guestId)}`;
@@ -79,6 +91,7 @@ function migrateGuestMemberships(guestId, userId) {
     if (!(party.memberKeys || []).includes(guestKey)) continue;
     party.memberKeys = party.memberKeys.filter(key => key !== guestKey);
     if (!party.memberKeys.includes(`user-${userId}`)) party.memberKeys.push(`user-${userId}`);
+    if (party.ownerId === guestKey) party.ownerId = userId;
   }
   for (const server of store.servers || []) {
     if (!(server.memberKeys || []).includes(guestKey)) continue;
@@ -88,6 +101,8 @@ function migrateGuestMemberships(guestId, userId) {
   }
 }
 function eventVisible(item, value) {
+  const channel = value.channel || (typeof value.room === "string" ? value.room : value.room?.type === "party" ? value.room.id : "");
+  if (channel && !canReadChannel(channel, item.memberKey)) return false;
   if (value.channel) {
     const room = store.parties.find(part => part.id === value.channel);
     if (room && !roomMember(room, item.memberKey)) return false;
@@ -152,14 +167,14 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "OPTIONS") { res.writeHead(204); return res.end(); }
   try {
-    if (req.method === "GET" && url.pathname === "/health") return sendJson(res, 200, { ok: true, service: "orbit-chat", features: { messageReplies: true } });
+    if (req.method === "GET" && ["/health", "/api/health"].includes(url.pathname)) return sendJson(res, 200, { ok: true, service: "orbit-chat", release: "turbochat-21", features: { messageReplies: true, safeSelfCleanup: true } });
     if (req.method === "GET" && url.pathname === "/api/events") return live(req, res, url);
     if (req.method === "GET" && url.pathname === "/api/me") return sendJson(res, 200, { user: safeUser(userFor(req)) });
     if (req.method === "GET" && url.pathname === "/api/bootstrap") {
       const who = identity(req, { guestId: url.searchParams.get("guestId") });
       const channel = safeId(url.searchParams.get("channel")) || "global";
       if (!canReadChannel(channel, who)) return sendJson(res, 403, { error: "Join this server from its invite link first." });
-      return sendJson(res, 200, { messages: (store.messages[channel] || []).slice(-250), rooms: store.rooms, parties: store.parties.filter(item => roomMember(item, who)), servers: (store.servers || []).filter(item => roomMember(item, who)).map(publicServer), music: store.music, members: publicMembers(), registeredCount: registeredCount(), memberGoal, features: { messageReplies: true } });
+      return sendJson(res, 200, { messages: (store.messages[channel] || []).slice(-250), rooms: store.rooms, parties: store.parties.filter(item => roomMember(item, who)), servers: (store.servers || []).filter(item => roomMember(item, who)).map(publicServer), music: store.music, members: publicMembers(), registeredCount: registeredCount(), memberGoal, features: { messageReplies: true, safeSelfCleanup: true } });
     }
     if (req.method === "GET" && url.pathname === "/api/messages") {
       const channel = safeId(url.searchParams.get("channel")) || "global", who = identity(req, { guestId: url.searchParams.get("guestId") });
@@ -206,11 +221,12 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { reactions: message.reactions });
     }
     if (req.method === "POST" && ["/api/rooms", "/api/parties"].includes(url.pathname)) {
-      const data = await readBody(req), party = url.pathname.endsWith("parties"), name = text(data.name, 42), who = identity(req, data);
+      const data = await readBody(req), party = url.pathname.endsWith("parties"), name = text(data.name, 42), who = identity(req, data), user = userFor(req);
       if (!who) return sendJson(res, 400, { error: "Refresh the page and try again." });
       if (name.length < 2) return sendJson(res, 400, { error: "Give the room a name with at least two characters." });
       const inviteCode = party ? crypto.randomBytes(18).toString("base64url") : "";
       const room = { id: `${party ? "party" : "room"}-${crypto.randomUUID()}`, name, title: name, topic: text(data.topic, 100), emoji: party ? "✦" : "✳", color: party ? "#8069bd" : "#3c998b", type: party ? "party" : "channel", owner: userFor(req)?.name || text(data.owner, 32) || "Guest", memberKeys: [who], inviteCode, createdAt: new Date().toISOString() };
+      if (party) room.ownerId = user?.id || who;
       (party ? store.parties : store.rooms).unshift(room); persist();
       const publicRoom = { ...room }; delete publicRoom.inviteCode;
       broadcast({ type: "room", room: publicRoom });
@@ -256,6 +272,20 @@ const server = http.createServer(async (req, res) => {
       broadcast({ type: "room", room: item }, connection => roomMember(room, connection.memberKey));
       return sendJson(res, 200, { room: publicRoom });
     }
+    if (req.method === "POST" && url.pathname === "/api/parties/delete") {
+      const data = await readBody(req), user = userFor(req);
+      if (!user) return sendJson(res, 401, { error: "Sign in to manage your own private party." });
+      const room = store.parties.find(item => item.id === safeId(data.id));
+      if (!room || deletions.parties[room.id]) return sendJson(res, 404, { error: "That party is no longer available." });
+      if (!room.ownerId) return sendJson(res, 409, { error: "Legacy parties cannot be deleted automatically." });
+      if (room.ownerId !== user.id) return sendJson(res, 403, { error: "Only the account that created this party can delete it." });
+      if (data.confirmName !== room.name) return sendJson(res, 400, { error: "Type the party name exactly to confirm." });
+      if ((room.memberKeys || []).some(key => key !== `user-${user.id}`) || (store.messages[room.id] || []).some(message => message.userId !== user.id)) return sendJson(res, 409, { error: "This party has other people or their messages. It cannot be deleted here." });
+      deletions.parties[room.id] = true; persistDeletions();
+      store.parties = store.parties.filter(item => item.id !== room.id); delete store.messages[room.id];
+      for (const peer of online.values()) if (peer.voiceRoom === room.id) { peer.voiceRoom = ""; peer.audioSocket?.end(); peer.audioSocket = null; }
+      persist(); return sendJson(res, 200, { ok: true });
+    }
     if (req.method === "POST" && url.pathname === "/api/music") {
       const data = await readBody(req), rawUrl = text(data.url, 1000), title = text(data.title, 100); let parsed;
       try { parsed = new URL(rawUrl); } catch { return sendJson(res, 400, { error: "Paste a valid audio, YouTube, or SoundCloud link." }); }
@@ -281,7 +311,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "POST" && url.pathname === "/api/login") {
       const data = await readBody(req), email = text(data.email, 120).toLowerCase(), password = typeof data.password === "string" ? data.password : "", user = store.users.find(item => item.email === email);
-      if (!user || password.length > 128 || !(await scrypt(password, user.salt, 64)).equals(Buffer.from(user.passwordHash, "hex"))) return sendJson(res, 401, { error: "Email or password didn’t match." });
+      if (!user || deletions.users[user.id] || password.length > 128 || !(await scrypt(password, user.salt, 64)).equals(Buffer.from(user.passwordHash, "hex")) || deletions.users[user.id]) return sendJson(res, 401, { error: "Email or password didn’t match." });
       migrateGuestMemberships(data.guestId, user.id); if (data.guestId) persist();
       const token = createSession(req, user.id); return sendJson(res, 200, { user: safeUser(user) }, { "Set-Cookie": cookieHeader(token, req) });
     }
@@ -292,6 +322,20 @@ const server = http.createServer(async (req, res) => {
         for (const peer of online.values()) if (peer.sessionKey === key) { peer.audioSocket?.end(); peer.res.end(); }
       }
       return sendJson(res, 200, { ok: true }, { "Set-Cookie": cookieHeader("", req).replace("Max-Age=2592000", "Max-Age=0") });
+    }
+    if (req.method === "POST" && url.pathname === "/api/account/delete") {
+      const data = await readBody(req), user = userFor(req);
+      if (!user) return sendJson(res, 401, { error: "Sign in before deleting an unused account." });
+      if (data.confirmation !== "DELETE") return sendJson(res, 400, { error: "Type DELETE exactly to confirm." });
+      const password = typeof data.password === "string" ? data.password : "";
+      if (!password || password.length > 128 || !(await scrypt(password, user.salt, 64)).equals(Buffer.from(user.passwordHash, "hex"))) return sendJson(res, 401, { error: "Your current password did not match." });
+      const memberKey = `user-${user.id}`;
+      if ([...store.parties, ...store.servers].some(group => roomMember(group, memberKey) || [user.id, memberKey].includes(group.ownerId)) || Object.values(store.messages).some(messages => messages.some(message => message.userId === user.id))) return sendJson(res, 409, { error: "Only unused accounts can be deleted here. Your account still has messages or belongs to a server or party." });
+      deletions.users[user.id] = true; deletions.emails[sessionKey(user.email)] = user.id; persistDeletions();
+      store.users = store.users.filter(item => item.id !== user.id);
+      for (const [key, value] of Object.entries(store.sessions)) if (value.userId === user.id) delete store.sessions[key];
+      for (const peer of online.values()) if (peer.memberKey === memberKey) { peer.audioSocket?.end(); peer.res.end(); }
+      persist(); presence(); return sendJson(res, 200, { ok: true }, { "Set-Cookie": cookieHeader("", req).replace("Max-Age=2592000", "Max-Age=0") });
     }
     if (req.method === "POST" && url.pathname === "/api/profile") {
       const user = userFor(req); if (!user) return sendJson(res, 401, { error: "Sign in to edit your profile." });
@@ -304,8 +348,8 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "POST" && url.pathname.startsWith("/api/voice/")) {
       const data = await readBody(req), who = identity(req, data), room = safeId(data.room), peerId = safeId(data.peerId);
-      const peer = online.get(peerId), roomStore = store.parties.find(item => item.id === room);
-      if (roomStore && !roomMember(roomStore, who) || serverForChannel(room) && !canReadChannel(room, who)) return sendJson(res, 403, { error: "Join this server before entering voice." });
+      const peer = online.get(peerId);
+      if (room && !canReadChannel(room, who)) return sendJson(res, 403, { error: "Join this server before entering voice." });
       if (url.pathname === "/api/voice/join") {
         if (!peer || peer.memberKey !== who || !room) return sendJson(res, 409, { error: "Your chat connection is still starting. Try again." });
         peer.voiceRoom = room; voiceUpdate(room); return sendJson(res, 200, { participants: participants(room) });
@@ -354,7 +398,7 @@ server.on("upgrade", (req, socket, head) => {
   const peerId = safeId(url.searchParams.get("peerId")), room = safeId(url.searchParams.get("room"));
   const peer = online.get(peerId), who = identity(req, { guestId: url.searchParams.get("guestId") });
   const key = req.headers["sec-websocket-key"];
-  if (url.pathname !== "/api/voice/audio" || !key || !peer || peer.memberKey !== who || peer.voiceRoom !== room) {
+  if (url.pathname !== "/api/voice/audio" || !key || !peer || peer.memberKey !== who || peer.voiceRoom !== room || !canReadChannel(room, who)) {
     socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"); socket.destroy(); return;
   }
   const accept = crypto.createHash("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");

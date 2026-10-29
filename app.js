@@ -69,6 +69,7 @@
   let draftIdentity = typeof saved.draftIdentity === "string" ? saved.draftIdentity : "", accountBusy = false, draftsResolved = false;
   state.unread = {};
   state.replySupport = false;
+  state.cleanupSupport = false;
   let worldHistoryReset = saved.worldHistoryReset && Number.isFinite(saved.worldHistoryReset.through) && Array.isArray(saved.worldHistoryReset.ids) ? saved.worldHistoryReset : null;
   let worldHistoryInitialized = saved.worldHistoryInitialized === true || !!worldHistoryReset;
   const messageFollow = { room: null, pinned: true, generation: 0, adjusting: false, frame: null, anchor: null };
@@ -254,6 +255,7 @@
   }
   function allRooms() { return [...defaultRooms, ...state.rooms, ...state.parties, ...state.servers.flatMap(server => server.channels.map(channel => ({ ...channel, serverId: server.id, serverName: server.name, emoji: channel.type === "voice" ? "◖" : "#", topic: server.description || `A channel in ${server.name}.` })))]; }
   function room(id) { return allRooms().find(x => x.id === id) || { id, name: "Party", emoji: "✦", topic: "A private room for good people." }; }
+  function canManageParty(item = room(state.active)) { return !!(state.cleanupSupport && state.profile && item.type === "party" && item.ownerId === state.profile.id); }
   function setConnected(value, label) {
     state.connected = value; $("#connectionLabel").textContent = label || (value ? "Connected" : "Reconnecting…");
     $("#connectionLabel").classList.toggle("offline", !value); updateComposer(); renderVoice();
@@ -290,6 +292,7 @@
   }
   function renderMessages({ scrollToBottom = false } = {}) {
     const current = room(state.active), rawItems = state.messages[state.active] || [], items = visibleMessages(state.active, rawItems);
+    $("#manageParty").classList.toggle("hidden", !canManageParty(current));
     const feed = $("#messages"), list = $("#messageList");
     if (messageFollow.room !== state.active) enterMessageRoom(state.active);
     const anchor = !scrollToBottom && !messageFollow.pinned ? captureReadingAnchor() : null;
@@ -362,7 +365,7 @@
     }
     if (version !== identityVersion) return;
     state.loading = false; delete state.channelErrors[channel]; initializeWorldHistory(channel, data.messages || []);
-    state.rooms = data.rooms || []; state.parties = data.parties || []; state.servers = [...new Map((data.servers || []).map(server => [server.id, server])).values()]; mergeMessages(channel, data.messages || []); state.members = data.members || []; state.registered = Number(data.registeredCount) || 1428; state.goal = Number(data.memberGoal) || 1500; state.music = data.music || null; state.replySupport = data.features?.messageReplies === true; renderRoomList(); renderMessages(); renderMembers(); renderMusic(); restoreDraft();
+    state.rooms = data.rooms || []; state.parties = data.parties || []; state.servers = [...new Map((data.servers || []).map(server => [server.id, server])).values()]; mergeMessages(channel, data.messages || []); state.members = data.members || []; state.registered = Number(data.registeredCount) || 1428; state.goal = Number(data.memberGoal) || 1500; state.music = data.music || null; state.replySupport = data.features?.messageReplies === true; state.cleanupSupport = data.features?.safeSelfCleanup === true; renderRoomList(); renderMessages(); renderMembers(); renderMusic(); restoreDraft();
   }
   function connectLive() {
     state.stream?.close();
@@ -460,7 +463,8 @@
     if (busy && $(".modal")) { $(".modal").setAttribute("tabindex", "-1"); $(".modal").focus(); }
   }
   function createRoomMenu() {
-    modal("Make a place for your people.", "Create an open room or a private party.", `<div class="modal-actions"><button id="makeRoom" class="modal-choice"><b>✳ Community room</b><small>Anyone can find and join.</small></button><button id="makeParty" class="modal-choice"><b>✦ Invite-only party</b><small>Only people with your invite can enter.</small></button></div>`);
+    modal("Make a place for your people.", "Choose a space that fits your conversation.", `<div class="modal-actions"><button id="makeServer" class="modal-choice"><b>✳ Community server</b><small>Keep text and voice channels together.</small></button><button id="makeRoom" class="modal-choice"><b># Open conversation</b><small>A public room anyone can join.</small></button><button id="makeParty" class="modal-choice"><b>✦ Invite-only party</b><small>A private conversation for people you invite.</small></button></div>`);
+    $("#makeServer").onclick = createServerModal;
     $("#makeRoom").onclick = () => roomForm(false); $("#makeParty").onclick = () => roomForm(true);
   }
   function createServerModal() {
@@ -552,7 +556,7 @@
   function profileModal() {
     if (!state.profile) return authModal("login");
     const emojis = ["✦","🌙","🌻","🦊","🐸","🐈","🎧","🚀","🌊","⭐","🍄","🪐"];
-    modal("Your profile", "Make your little corner feel like you.", `<form id="profileForm"><label>Display name<input id="profileName" required minlength="2" maxlength="32" value="${esc(state.profile.name)}" autocomplete="nickname"></label><label>Avatar<select id="profileEmoji">${emojis.map(emoji => `<option value="${emoji}" ${state.profile.emoji === emoji ? "selected" : ""}>${emoji}</option>`).join("")}</select></label><label>About me<input id="profileAbout" maxlength="100" value="${esc(state.profile.about || "")}" placeholder="A little about you"></label><label>Status<select id="profileStatus"><option value="online" ${state.profile.status !== "idle" && state.profile.status !== "dnd" ? "selected" : ""}>Online</option><option value="idle" ${state.profile.status === "idle" ? "selected" : ""}>Idle</option><option value="dnd" ${state.profile.status === "dnd" ? "selected" : ""}>Do not disturb</option></select></label><p id="profileError" class="auth-error" role="alert"></p><button class="submit-button">Save profile</button></form><button id="profileSignOut" class="subtle-button">Sign out</button>`);
+    modal("Your profile", "Make your little corner feel like you.", `<form id="profileForm"><label>Display name<input id="profileName" required minlength="2" maxlength="32" value="${esc(state.profile.name)}" autocomplete="nickname"></label><label>Avatar<select id="profileEmoji">${emojis.map(emoji => `<option value="${emoji}" ${state.profile.emoji === emoji ? "selected" : ""}>${emoji}</option>`).join("")}</select></label><label>About me<input id="profileAbout" maxlength="100" value="${esc(state.profile.about || "")}" placeholder="A little about you"></label><label>Status<select id="profileStatus"><option value="online" ${state.profile.status !== "idle" && state.profile.status !== "dnd" ? "selected" : ""}>Online</option><option value="idle" ${state.profile.status === "idle" ? "selected" : ""}>Idle</option><option value="dnd" ${state.profile.status === "dnd" ? "selected" : ""}>Do not disturb</option></select></label><p id="profileError" class="auth-error" role="alert"></p><button class="submit-button">Save profile</button></form><button id="profileSignOut" class="subtle-button">Sign out</button>${canManageParty() ? `<button id="profileManageParty" class="subtle-button">Manage this private party</button>` : ""}${state.cleanupSupport ? `<div class="account-danger-zone"><b>Account privacy</b><p>Remove an unused account when you no longer need it. Shared content stays protected.</p><button id="deleteAccountOpen" class="danger-outline" type="button">Delete unused account</button></div>` : ""}`);
     $("#profileForm").onsubmit = async event => {
       event.preventDefault(); if (accountBusy) return; const form = event.currentTarget, button = form.querySelector(".submit-button"), errorField = form.querySelector("#profileError"); setAccountBusy(true); button.textContent = "Saving…";
       let savedProfile = false;
@@ -564,6 +568,48 @@
       if (savedProfile) { closeModal(); toast("Profile saved."); }
     };
     $("#profileSignOut").onclick = signOut;
+    if ($("#profileManageParty")) $("#profileManageParty").onclick = partyDeletionModal;
+    if ($("#deleteAccountOpen")) $("#deleteAccountOpen").onclick = accountDeletionModal;
+  }
+  function partyDeletionModal() {
+    const party = state.parties.find(item => item.id === state.active);
+    if (!party || !canManageParty(party)) return;
+    modal("Remove this private party?", "Only a party used exclusively by you can be removed here. Shared conversations are protected. This permanently removes this party and its saved messages.", `<form id="partyDeleteForm"><label>Type the party name to confirm<input id="partyDeleteName" required maxlength="42" autocomplete="off" spellcheck="false" placeholder="${esc(party.name)}"></label><p id="partyDeleteError" class="auth-error" role="alert"></p><button class="submit-button danger-button">Delete my private party</button></form>`);
+    $("#partyDeleteForm").onsubmit = async event => {
+      event.preventDefault(); if (accountBusy) return;
+      const form = event.currentTarget, errorField = form.querySelector("#partyDeleteError"), button = form.querySelector(".submit-button"), confirmation = $("#partyDeleteName").value;
+      if (confirmation !== party.name) { errorField.textContent = "Type the party name exactly as shown."; return; }
+      setAccountBusy(true); errorField.textContent = ""; button.textContent = "Deleting…"; let removed = false;
+      try {
+        await api("/api/parties/delete", { method: "POST", body: JSON.stringify({ id: party.id, confirmName: confirmation }) });
+        if (state.voiceRoom === party.id) await leaveVoice(true);
+        clearTyping(); state.parties = state.parties.filter(item => item.id !== party.id); delete state.messages[party.id]; delete state.unread[party.id]; delete drafts[party.id]; delete replyDrafts[party.id]; delete state.channelErrors[party.id];
+        state.followingRooms = state.followingRooms.filter(id => id !== party.id);
+        if (state.active === party.id) { state.active = "global"; restoreDraft(); enterMessageRoom("global"); setView("chat"); }
+        save(); renderRoomList(); renderMessages(); removed = true;
+      } catch (error) { if (form.isConnected) errorField.textContent = error.message; button.textContent = "Delete my private party"; }
+      finally { setAccountBusy(false); }
+      if (removed) { closeModal(); toast("Your private party was deleted."); }
+    };
+  }
+  function accountDeletionModal() {
+    if (!state.profile || !state.cleanupSupport) return;
+    const accountId = state.profile.id;
+    modal("Delete an unused account?", "This permanently removes your sign-in and profile. Accounts with saved messages, servers or private parties cannot be removed here. Delete your sole-use private parties first; shared spaces and other people's content are protected.", `<form id="accountDeleteForm"><label>Current password<input id="accountDeletePassword" type="password" required maxlength="128" autocomplete="current-password"></label><label>Type DELETE to confirm<input id="accountDeleteConfirm" required autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="DELETE"></label><p id="accountDeleteError" class="auth-error" role="alert"></p><button class="submit-button danger-button">Permanently delete unused account</button></form>`);
+    $("#accountDeleteForm").onsubmit = async event => {
+      event.preventDefault(); if (accountBusy) return;
+      const form = event.currentTarget, errorField = form.querySelector("#accountDeleteError"), button = form.querySelector(".submit-button");
+      const confirmation = $("#accountDeleteConfirm").value, password = $("#accountDeletePassword").value;
+      if (confirmation !== "DELETE") { errorField.textContent = "Type DELETE to confirm."; return; }
+      setAccountBusy(true); errorField.textContent = ""; button.textContent = "Deleting…"; let removed = false, synced = false;
+      try {
+        await api("/api/account/delete", { method: "POST", body: JSON.stringify({ password, confirmation }) });
+        removed = true; synced = await refreshIdentity(null, true);
+        delete draftBooks[`user-${accountId}`]; delete replyBooks[`user-${accountId}`]; save();
+      } catch (error) { if (form.isConnected) errorField.textContent = error.message; button.textContent = "Permanently delete unused account"; }
+      finally { setAccountBusy(false); }
+      if (removed) { closeModal(); toast(synced ? "Your unused account was deleted. You can continue as a guest." : "Your unused account was deleted. Conversations are reconnecting."); }
+    };
   }
   async function refreshIdentity(profile, resetChannel = false) {
     clearTimeout(reconnectTimer); saveDraft(); clearTyping(); identityVersion++; state.stream?.close(); clearInterval(pollTimer);
@@ -914,8 +960,9 @@
       const reply = event.target.closest("[data-reply]"); if (reply) startReply(reply.dataset.reply);
       const original = event.target.closest("[data-jump-reply]"); if (original) jumpToMessage(original.dataset.jumpReply);
     });
-    $("#createSpace").onclick = createRoomMenu; $("#createServer").onclick = $("#railCreate").onclick = createServerModal; $("#searchOpen").onclick = $("#mobileSearch").onclick = search; $("#inviteButton").onclick = $("#peopleInvite").onclick = inviteGeneral;
+    $("#createSpace").onclick = $("#railCreate").onclick = createRoomMenu; $("#createServer").onclick = createServerModal; $("#searchOpen").onclick = $("#mobileSearch").onclick = search; $("#inviteButton").onclick = $("#peopleInvite").onclick = inviteGeneral;
     $("#followButton").onclick = toggleFollow;
+    $("#manageParty").onclick = partyDeletionModal;
     $("#retryConnection").onclick = start;
     $("#showcasePrevious").onclick = () => selectShowcase(showcaseIndex - 1);
     $("#showcaseNext").onclick = () => selectShowcase(showcaseIndex + 1);

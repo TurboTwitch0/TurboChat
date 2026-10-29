@@ -8,7 +8,7 @@ const source = await readFile(new URL("../app.js", import.meta.url), "utf8");
 const entry = "bind(); renderMessages(); updateIdentity(); start();";
 assert.ok(source.includes(entry), "The test harness must replace only the application startup.");
 // Expose functions in the test-only copy; production does not export internals.
-const testSource = source.replace(entry, "globalThis.app = { state, drafts, replyDrafts, startReply, cancelReply, jumpToMessage, renderMessage, chooseDrafts, addMessage, setView, renderRoomList, saveDraft, restoreDraft, selectChannel, pollUpdates, sendMessage, receiveLiveEvent, typingPeers, bind, renderMessages, renderVoice, setConnected, loadChannel, bootstrap, scrollBehavior, renderShowcase, selectShowcase, showcaseKeydown, messageFollow, scrollToLatest, scheduleBottomScroll, handleFeedScroll, pauseMessageFollow, initMessageScrolling, enterMessageRoom, visibleMessages, hideWorldHistory, restoreWorldHistory, api, authModal, refreshIdentity, start, signOut, roomForm };");
+const testSource = source.replace(entry, "globalThis.app = { state, drafts, canManageParty, partyDeletionModal, accountDeletionModal, profileModal, replyDrafts, startReply, cancelReply, jumpToMessage, renderMessage, chooseDrafts, addMessage, setView, renderRoomList, saveDraft, restoreDraft, selectChannel, pollUpdates, sendMessage, receiveLiveEvent, typingPeers, bind, renderMessages, renderVoice, setConnected, loadChannel, bootstrap, scrollBehavior, renderShowcase, selectShowcase, showcaseKeydown, messageFollow, scrollToLatest, scheduleBottomScroll, handleFeedScroll, pauseMessageFollow, initMessageScrolling, enterMessageRoom, visibleMessages, hideWorldHistory, restoreWorldHistory, api, authModal, refreshIdentity, start, signOut, roomForm };");
 
 // Response metadata is a fixture-only wrapper; application payloads stay unchanged.
 const mockHttp = (data, options = {}) => ({ fixtureResponse: { data, status: 200, ...options } });
@@ -1129,4 +1129,48 @@ test("reply controls follow the API capability declared by bootstrap", async () 
   } });
   await app.bootstrap(); assert.equal(app.state.replySupport, false);
   supported = true; await app.bootstrap(); assert.equal(app.state.replySupport, true);
+});
+
+test("private-party management is shown only for a signed-in owner on a capable backend", () => {
+  const { app, element } = fixture();
+  app.state.loading = false; app.state.active = "party-owned";
+  app.state.parties = [{ id: "party-owned", type: "party", name: "My private party", ownerId: "owner" }];
+  app.state.profile = { id: "owner", name: "Owner" };
+  app.renderMessages(); assert.equal(element("#manageParty").classList.contains("hidden"), true);
+  app.state.cleanupSupport = true;
+  app.renderMessages(); assert.equal(element("#manageParty").classList.contains("hidden"), false);
+  app.state.profile = { id: "another-person" }; app.renderMessages(); assert.equal(element("#manageParty").classList.contains("hidden"), true);
+  app.state.profile = { id: "owner" }; delete app.state.parties[0].ownerId;
+  app.renderMessages(); assert.equal(element("#manageParty").classList.contains("hidden"), true, "legacy display names must not be treated as ownership proof");
+});
+
+test("party removal requires exact confirmation and clears only that party's local state", async () => {
+  const { app, element, requests } = fixture({ request(record) {
+    if (record.url.pathname === "/api/parties/delete") return { ok: true };
+  } });
+  app.state.profile = { id: "owner" }; app.state.cleanupSupport = true; app.state.loading = false; app.state.active = "party-owned";
+  app.state.parties = [{ id: "party-owned", type: "party", name: "My private party", ownerId: "owner" }, { id: "party-retained", type: "party", name: "Keep this party", ownerId: "owner" }];
+  app.state.messages = { "party-owned": [{ id: "mine", text: "Mine" }], "party-retained": [{ id: "keep", text: "Keep this history" }] };
+  app.chooseDrafts(app.state.profile); app.drafts["party-owned"] = "Private draft"; app.drafts.global = "World draft";
+  app.partyDeletionModal(); const form = element("#partyDeleteForm");
+  element("#partyDeleteName").value = "Wrong name"; await form.onsubmit({ preventDefault() {}, currentTarget: form });
+  assert.match(element("#partyDeleteError").textContent, /exactly/); assert.equal(requests.length, 0);
+  element("#partyDeleteName").value = "My private party"; await form.onsubmit({ preventDefault() {}, currentTarget: form });
+  assert.equal(requests.find(record => record.url.pathname === "/api/parties/delete").body.confirmName, "My private party");
+  assert.equal(app.state.active, "global"); assert.equal(app.drafts["party-owned"], undefined); assert.equal(app.drafts.global, "World draft");
+  assert.equal(app.state.messages["party-retained"][0].text, "Keep this history"); assert.equal(app.state.parties.length, 1);
+});
+
+test("unused-account removal requires confirmation and retains the account when reauthentication fails", async () => {
+  const { app, element, requests } = fixture({ request(record) {
+    if (record.url.pathname === "/api/account/delete") return mockHttp({ error: "Current password did not match." }, { status: 401 });
+  } });
+  app.state.profile = { id: "owner", name: "Owner" }; app.state.cleanupSupport = true; app.chooseDrafts(app.state.profile);
+  element("#messageInput").value = "Keep my local draft"; app.saveDraft(); app.accountDeletionModal();
+  const form = element("#accountDeleteForm"); element("#accountDeleteConfirm").value = "delete";
+  await form.onsubmit({ preventDefault() {}, currentTarget: form }); assert.equal(requests.length, 0);
+  element("#accountDeleteConfirm").value = "DELETE"; element("#accountDeletePassword").value = "wrong-test-password";
+  await form.onsubmit({ preventDefault() {}, currentTarget: form });
+  assert.match(element("#accountDeleteError").textContent, /password did not match/);
+  assert.equal(app.state.profile.id, "owner"); assert.equal(app.drafts.global, "Keep my local draft");
 });

@@ -467,3 +467,10 @@ h1,h2,h3,p { margin-top:0; }
 .message-quote>span:first-child{color:var(--purple)}.message-quote b{flex:none;max-width:32%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#d6caef;font-weight:600}.message-quote .quote-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .message-quote:hover{background:#b5a0ff16}.message-quote:focus-visible,#cancelReply:focus-visible{outline:2px solid var(--purple);outline-offset:3px}
 @media(max-width:760px){.reply-preview{padding:7px 7px 7px 10px}.message-quote{min-height:36px;font-size:12px}#cancelReply{width:40px;height:40px}.reply-context p{font-size:13px}}
+
+/* Explicit, owner-only privacy controls. */
+.account-danger-zone{margin-top:22px;padding-top:18px;border-top:1px solid #ffffff14}.account-danger-zone>b{font-size:14px}.account-danger-zone>p{font-size:12px;line-height:1.6;color:var(--muted);margin:7px 0 12px}
+.danger-outline{min-height:44px;padding:9px 13px;border:1px solid #f394944d;border-radius:9px;color:#ffc2c2;background:#f3949408;font-size:13px}.danger-outline:hover{background:#f394941a}
+.modal .danger-button{background:#a63e50;color:#fff;border:1px solid #d77e8d}.modal .danger-button:hover{background:#b84b5d}.danger-outline:focus-visible,.danger-button:focus-visible{outline:2px solid #ffb4b4;outline-offset:3px}
+#manageParty{white-space:nowrap;color:#cbb9ff;font-size:12px}
+@media(max-width:760px){#manageParty{font-size:11px;padding:8px}.topic-strip:has(#manageParty:not(.hidden))>p{display:none}}

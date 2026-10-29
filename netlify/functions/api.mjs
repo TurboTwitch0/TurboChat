@@ -28,7 +28,7 @@ async function readMessages(store, db, channel) {
   const merged = new Map((db.messages[channel] || []).map(item => [item.id, item]));
   const { blobs } = await store.list({ prefix: `messages/${channel}/` });
   const recent = blobs.sort((a, b) => a.key.localeCompare(b.key)).slice(-250);
-  const records = await Promise.all(recent.map(blob => store.get(blob.key, { type: "json" })));
+  const records = await Promise.all(recent.map(blob => store.get(blob.key, { type: "json", consistency: "strong" })));
   for (const item of records) if (item?.id) {
     const previous = merged.get(item.id);
     merged.set(item.id, previous ? { ...item, ...previous, reactions: previous.reactions ?? item.reactions } : item);
@@ -60,9 +60,25 @@ return async function handler(request) {
     if (!data || typeof data !== "object" || Array.isArray(data)) return reply(400, { error: "Invalid request body. Expected a JSON object." });
   }
   try {
-    const store = storeFactory("orbit-chat");
-    const db = await store.get("state", { type: "json" }) || { users: [], messages: {}, rooms: [], parties: [], servers: [], music: null, events: [], presence: {} };
+    // Membership checks and the next message must see a newly created space
+    // immediately; eventual snapshots can falsely reject its own creator.
+    const store = storeFactory({ name: "orbit-chat", consistency: "strong" });
+    const db = await store.get("state", { type: "json", consistency: "strong" }) || { users: [], messages: {}, rooms: [], parties: [], servers: [], music: null, events: [], presence: {} };
     db.users ||= []; db.messages ||= {}; db.rooms ||= []; db.parties ||= []; db.servers ||= []; db.events ||= []; db.presence ||= {}; db.voicePeers ||= {};
+    const deletedUsers = new Map();
+    const isUserDeleted = id => {
+      if (!deletedUsers.has(id)) deletedUsers.set(id, store.get(`auth/deleted-users/${id}`, { type: "text", consistency: "strong" }).then(Boolean));
+      return deletedUsers.get(id);
+    };
+    const activeUsers = await Promise.all(db.users.map(async entry => !(await isUserDeleted(entry.id))));
+    db.users = db.users.filter((_, index) => activeUsers[index]);
+    const partyReference = event => event.channel || (typeof event.room === "string" ? event.room : event.room?.type === "party" ? event.room.id : "");
+    const knownPartyIds = new Set(db.parties.map(party => party.id));
+    const partyIds = new Set([...knownPartyIds, ...Object.keys(db.messages), ...db.events.map(partyReference), ...Object.values(db.voicePeers).map(peer => peer.room), data.id, data.channel, data.room, url.searchParams.get("channel")].filter(id => typeof id === "string" && (id.startsWith("party-") || knownPartyIds.has(id))));
+    const deletedPartyIds = new Set((await Promise.all([...partyIds].map(async id => await store.get(`deleted-parties/${id}`, { type: "text", consistency: "strong" }) ? id : null))).filter(Boolean));
+    db.parties = db.parties.filter(party => !deletedPartyIds.has(party.id));
+    for (const id of deletedPartyIds) delete db.messages[id];
+    db.events = db.events.filter(event => !deletedPartyIds.has(partyReference(event)));
     if (!db.eventSequenceVersion) { db.nextEventSeq = 0; for (const event of db.events) event.seq = ++db.nextEventSeq; db.eventSequenceVersion = 1; await store.setJSON("state", db); }
     const session = parseCookie(request.headers.get("cookie"), "orbit_session");
     const validSession = /^[\w-]{43}$/.test(session);
@@ -78,7 +94,7 @@ return async function handler(request) {
       sessionRecord = { userId: db.sessions[session], expiresAt: Date.now() + sessionLifetime };
     }
     const userId = !sessionRevoked && sessionRecord && !sessionRecord.revoked && sessionRecord.expiresAt > Date.now() ? sessionRecord.userId : null;
-    const user = userId ? (await store.get(`auth/users/${userId}`, { type: "json", consistency: "strong" }) || db.users.find(item => item.id === userId)) : null;
+    const user = userId && !(await isUserDeleted(userId)) ? (await store.get(`auth/users/${userId}`, { type: "json", consistency: "strong" }) || db.users.find(item => item.id === userId)) : null;
     // Older releases used a bare user id. Migrate without invalidating existing accounts.
     if (user && (!sessionValue || sessionValue[0] !== "{")) await store.setJSON(`auth/sessions/${session}`, sessionRecord);
     const who = identity(method === "GET" || method === "HEAD" ? { guestId: url.searchParams.get("guestId") } : data, user);
@@ -88,7 +104,17 @@ return async function handler(request) {
     const getServer = id => db.servers.find(item => item.id === id);
     const getChannelServer = channel => db.servers.find(server => server.channels.some(item => item.id === channel));
     const safeServer = server => server && ({ id: server.id, name: server.name, emoji: server.emoji, description: server.description, ownerId: server.ownerId, channels: server.channels });
-    const canSee = channel => { const party = getParty(channel), server = getChannelServer(channel); return party ? isMember(party, who) : !server || isMember(server, who); };
+    const canSee = channel => { const party = getParty(channel), server = getChannelServer(channel); return !deletedPartyIds.has(channel) && (party ? isMember(party, who) : server ? isMember(server, who) : !/^(?:party|channel|voice)-/.test(channel)); };
+    const findUserByEmail = async email => {
+      const key = emailKey(email);
+      const [owner, index, tombstone] = await Promise.all([
+        store.get(`auth/email-owners/${key}`, { type: "text", consistency: "strong" }),
+        store.get(`auth/emails/${key}`, { type: "json", consistency: "strong" }),
+        store.get(`auth/deleted-emails/${key}`, { type: "json", consistency: "strong" })
+      ]);
+      const candidate = owner ? await store.get(`auth/users/${owner}`, { type: "json", consistency: "strong" }) || db.users.find(entry => entry.id === owner) : index || db.users.find(entry => entry.email === email);
+      return candidate && candidate.email === email && tombstone?.userId !== candidate.id && !(await isUserDeleted(candidate.id)) ? candidate : null;
+    };
     const migrateGuestMemberships = (guestId, userId) => {
       const guestKey = `guest-${validId(guestId)}`;
       if (guestKey === "guest-") return;
@@ -98,11 +124,21 @@ return async function handler(request) {
         if (group.ownerId === guestKey) group.ownerId = userId;
       }
     };
+    for (const [key, member] of Object.entries(db.presence)) if (key.startsWith("user-") && await isUserDeleted(key.slice(5))) delete db.presence[key];
+    db.events = (await Promise.all(db.events.map(async event => {
+      if (event.id?.startsWith("user-") && await isUserDeleted(event.id.slice(5))) return null;
+      if (Array.isArray(event.members)) {
+        const remaining = await Promise.all(event.members.map(async member => !(member.id?.startsWith("user-") && await isUserDeleted(member.id.slice(5)))));
+        event.members = event.members.filter((_, index) => remaining[index]);
+      }
+      return event;
+    }))).filter(Boolean);
+    for (const [key, peer] of Object.entries(db.voicePeers)) if (deletedPartyIds.has(peer.room) || peer.room?.startsWith("party-") && !getParty(peer.room) || peer.who?.startsWith("user-") && await isUserDeleted(peer.who.slice(5))) delete db.voicePeers[key];
     const online = Object.values(db.presence).filter(member => Date.now() - member.seenAt < 30000);
     db.presence = Object.fromEntries(Object.entries(db.presence).filter(([, member]) => Date.now() - member.seenAt < 30000));
     db.voicePeers = Object.fromEntries(Object.entries(db.voicePeers).filter(([, peer]) => Date.now() - peer.seenAt < 30000));
 
-    if (method === "GET" && ["/health", "/api/health"].includes(path)) return reply(200, { ok: true, service: "orbit-netlify", release: "turbochat-19", features: { messageReplies: true } });
+    if (method === "GET" && ["/health", "/api/health"].includes(path)) return reply(200, { ok: true, service: "orbit-netlify", release: "turbochat-21", features: { messageReplies: true, safeSelfCleanup: true } });
     if (method === "GET" && path === "/api/me") return reply(200, { user: publicUser(user) });
     if (method === "POST" && path === "/api/presence") {
       if (!who) return reply(400, { error: "Refresh the page and try again." });
@@ -114,7 +150,7 @@ return async function handler(request) {
     if (method === "GET" && path === "/api/bootstrap") {
       const channel = validId(url.searchParams.get("channel")) || "global";
       if (!canSee(channel)) return reply(403, { error: "Join this party from its invite link first." });
-      return reply(200, { messages: await readMessages(store, db, channel), rooms: db.rooms, parties: db.parties.filter(room => isMember(room, who)).map(safeRoom), servers: db.servers.filter(server => isMember(server, who)).map(safeServer), music: db.music, members: online.map(publicMember), registeredCount: baseline + db.users.length, memberGoal: goal, features: { messageReplies: true } });
+      return reply(200, { messages: await readMessages(store, db, channel), rooms: db.rooms, parties: db.parties.filter(room => isMember(room, who)).map(safeRoom), servers: db.servers.filter(server => isMember(server, who)).map(safeServer), music: db.music, members: online.map(publicMember), registeredCount: baseline + db.users.length, memberGoal: goal, features: { messageReplies: true, safeSelfCleanup: true } });
     }
     if (method === "GET" && path === "/api/messages") {
       const channel = validId(url.searchParams.get("channel")) || "global";
@@ -124,7 +160,7 @@ return async function handler(request) {
     if (method === "GET" && path === "/api/updates") {
       const after = Number(url.searchParams.get("after")) || 0;
       const peerId = validId(url.searchParams.get("peerId"));
-      return reply(200, { events: db.events.filter(event => event.seq > after && (!event.channel || canSee(event.channel)) && (!event.serverId || isMember(getServer(event.serverId), who)) && (event.type !== "signal" || event.to === peerId)), nextSeq: db.nextEventSeq || 0, members: online.map(publicMember), registeredCount: baseline + db.users.length });
+      return reply(200, { events: db.events.filter(event => event.seq > after && (!partyReference(event) || canSee(partyReference(event))) && (!event.serverId || isMember(getServer(event.serverId), who)) && (event.type !== "signal" || event.to === peerId)), nextSeq: db.nextEventSeq || 0, members: online.map(publicMember), registeredCount: baseline + db.users.length });
     }
     if (method === "POST" && path === "/api/messages") {
       const channel = validId(data.channel) || "global", content = clean(data.text, 700);
@@ -174,6 +210,7 @@ return async function handler(request) {
       if (name.length < 2) return reply(400, { error: "Give the room a name with at least two characters." });
       const inviteCode = party ? randomBytes(18).toString("base64url") : "";
       const room = { id: `${party ? "party" : "room"}-${randomUUID()}`, name, title: name, topic: clean(data.topic, 100), emoji: party ? "✦" : "✳", color: party ? "#8069bd" : "#3c998b", type: party ? "party" : "channel", owner: user?.name || clean(data.owner, 32) || "Guest", memberKeys: [who], inviteCode, createdAt: new Date().toISOString() };
+      if (party) room.ownerId = user?.id || who;
       (party ? db.parties : db.rooms).unshift(room); pushEvent(db, { type: "room", room: safeRoom(room) }); await save(); return reply(201, { room: safeRoom(room), inviteCode });
     }
     if (method === "POST" && path === "/api/servers") {
@@ -211,6 +248,23 @@ return async function handler(request) {
       if (!room.memberKeys.includes(who)) room.memberKeys.push(who);
       pushEvent(db, { type: "room", room: safeRoom(room) }); await save(); return reply(200, { room: safeRoom(room) });
     }
+    if (method === "POST" && path === "/api/parties/delete") {
+      if (!user) return reply(401, { error: "Sign in to manage your own private party." });
+      const room = getParty(validId(data.id));
+      if (!room) return reply(404, { error: "That party is no longer available." });
+      if (!room.ownerId) return reply(409, { error: "Legacy parties cannot be deleted automatically." });
+      if (room.ownerId !== user.id) return reply(403, { error: "Only the account that created this party can delete it." });
+      if (data.confirmName !== room.name) return reply(400, { error: "Type the party name exactly to confirm." });
+      const { blobs } = await store.list({ prefix: `messages/${room.id}/` });
+      const messages = [...(db.messages[room.id] || []), ...await Promise.all(blobs.map(blob => store.get(blob.key, { type: "json", consistency: "strong" })))];
+      if ((room.memberKeys || []).some(key => key !== who) || messages.some(message => !message || message.userId !== user.id)) return reply(409, { error: "This party has other people or their messages. It cannot be deleted here." });
+      await store.set(`deleted-parties/${room.id}`, "1");
+      db.parties = db.parties.filter(item => item.id !== room.id); delete db.messages[room.id];
+      db.events = db.events.filter(event => partyReference(event) !== room.id);
+      db.voicePeers = Object.fromEntries(Object.entries(db.voicePeers).filter(([, peer]) => peer.room !== room.id));
+      for (const blob of blobs) await store.delete(blob.key);
+      await save(); return reply(200, { ok: true });
+    }
     if (method === "POST" && path === "/api/music") {
       const rawUrl = clean(data.url, 1000), title = clean(data.title, 100); let parsed;
       try { parsed = new URL(rawUrl); } catch { return reply(400, { error: "Paste a valid audio, YouTube, or SoundCloud link." }); }
@@ -225,19 +279,19 @@ return async function handler(request) {
       if (name.length < 2) return reply(400, { error: "Choose a name with at least two characters." });
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return reply(400, { error: "Enter a valid email address." });
       if (password.length < 8 || password.length > 128) return reply(400, { error: "Use a password between 8 and 128 characters." });
-      const indexedUser = email ? await store.get(`auth/emails/${emailKey(email)}`, { type: "json", consistency: "strong" }) : null;
-      if (indexedUser || db.users.some(item => item.email === email)) return reply(409, { error: "That email already has an account. Sign in instead." });
+      if (await findUserByEmail(email)) return reply(409, { error: "That email already has an account. Sign in instead." });
       const salt = randomBytes(16).toString("hex"), hash = (await scrypt(password, salt, 64)).toString("hex");
+      if (await findUserByEmail(email)) return reply(409, { error: "That email already has an account. Sign in instead." });
       const created = { id: randomUUID(), name, email, salt, passwordHash: hash, emoji: [...name][0].toUpperCase(), about: "", status: "online" };
       migrateGuestMemberships(data.guestId, created.id);
       db.users.push(created); const token = randomBytes(32).toString("base64url");
-      await Promise.all([store.setJSON(`auth/users/${created.id}`, created), store.setJSON(`auth/emails/${emailKey(email)}`, created), store.setJSON(`auth/sessions/${token}`, { userId: created.id, expiresAt: Date.now() + sessionLifetime })]);
+      await Promise.all([store.setJSON(`auth/users/${created.id}`, created), store.setJSON(`auth/emails/${emailKey(email)}`, created), store.set(`auth/email-owners/${emailKey(email)}`, created.id), store.setJSON(`auth/sessions/${token}`, { userId: created.id, expiresAt: Date.now() + sessionLifetime })]);
       pushEvent(db, { type: "presence", members: online.map(publicMember), registeredCount: baseline + db.users.length }); await save().catch(() => {});
       return reply(201, { user: publicUser(created) }, setCookie(token));
     }
     if (method === "POST" && path === "/api/login") {
       const email = clean(data.email, 120).toLowerCase(), password = typeof data.password === "string" ? data.password : "";
-      const found = await store.get(`auth/emails/${emailKey(email)}`, { type: "json", consistency: "strong" }) || db.users.find(item => item.email === email);
+      const found = await findUserByEmail(email);
       if (!found || password.length > 128 || !(await scrypt(password, found.salt, 64)).equals(Buffer.from(found.passwordHash, "hex"))) return reply(401, { error: "Email or password didn’t match." });
       migrateGuestMemberships(data.guestId, found.id);
       const token = randomBytes(32).toString("base64url"); await store.setJSON(`auth/sessions/${token}`, { userId: found.id, expiresAt: Date.now() + sessionLifetime }); await save().catch(() => {}); return reply(200, { user: publicUser(found) }, setCookie(token));
@@ -253,6 +307,31 @@ return async function handler(request) {
       if (who) delete db.presence[who];
       await save().catch(() => {}); return reply(200, { ok: true }, { "set-cookie": "orbit_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0; Secure" });
     }
+    if (method === "POST" && path === "/api/account/delete") {
+      if (!user) return reply(401, { error: "Sign in before deleting an unused account." });
+      if (data.confirmation !== "DELETE") return reply(400, { error: "Type DELETE exactly to confirm." });
+      const password = typeof data.password === "string" ? data.password : "";
+      if (!password || password.length > 128 || !(await scrypt(password, user.salt, 64)).equals(Buffer.from(user.passwordHash, "hex"))) return reply(401, { error: "Your current password did not match." });
+      if ([...db.parties, ...db.servers].some(group => isMember(group, who) || [user.id, who].includes(group.ownerId)) || Object.values(db.messages).some(messages => messages.some(message => message.userId === user.id))) return reply(409, { error: "Only unused accounts can be deleted here. Your account still has messages or belongs to a server or party." });
+      const { blobs } = await store.list({ prefix: "messages/" });
+      // Bound concurrency so checking old message history does not become a
+      // long serial chain, while still refusing deletion if a record is unreadable.
+      for (let offset = 0; offset < blobs.length; offset += 16) {
+        const messages = await Promise.all(blobs.slice(offset, offset + 16).map(blob => store.get(blob.key, { type: "json", consistency: "strong" })));
+        if (messages.some(message => !message || message.userId === user.id)) return reply(409, { error: "Only accounts without remaining authored messages can be deleted here." });
+      }
+      await Promise.all([store.set(`auth/deleted-users/${user.id}`, "1"), store.setJSON(`auth/deleted-emails/${emailKey(user.email)}`, { userId: user.id, deletedAt: new Date().toISOString() })]);
+      await store.delete(`auth/users/${user.id}`);
+      const indexed = await store.get(`auth/emails/${emailKey(user.email)}`, { type: "json", consistency: "strong" });
+      if (indexed?.id === user.id) await store.delete(`auth/emails/${emailKey(user.email)}`);
+      db.users = db.users.filter(entry => entry.id !== user.id);
+      if (db.sessions) for (const [key, value] of Object.entries(db.sessions)) if (value === user.id || value?.userId === user.id) delete db.sessions[key];
+      delete db.presence[who];
+      const peerIds = new Set(Object.values(db.voicePeers).filter(peer => peer.who === who).map(peer => peer.peerId));
+      db.events = db.events.filter(event => event.id !== who).map(event => ({ ...event, ...(Array.isArray(event.members) ? { members: event.members.filter(member => member.id !== who) } : {}), ...(Array.isArray(event.participants) ? { participants: event.participants.filter(peer => !peerIds.has(peer.peerId)) } : {}) }));
+      db.voicePeers = Object.fromEntries(Object.entries(db.voicePeers).filter(([, peer]) => peer.who !== who));
+      await save(); return reply(200, { ok: true }, { "set-cookie": "orbit_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0; Secure" });
+    }
     if (method === "POST" && path === "/api/profile") {
       if (!user) return reply(401, { error: "Sign in to edit your profile." });
       const name = clean(data.name, 32), emoji = clean(data.emoji, 8), allowed = new Set(["✦","🌙","🌻","🦊","🐸","🐈","🎧","🚀","🌊","⭐","🍄","🪐"]);
@@ -267,6 +346,7 @@ return async function handler(request) {
       pushEvent(db, { type: "presence", members: online.map(publicMember), registeredCount: baseline + db.users.length }); await save().catch(() => {});
       return reply(200, { user: publicUser(user) });
     }
+    if (path.startsWith("/api/voice/") && method === "POST" && validId(data.room) && !canSee(validId(data.room))) return reply(403, { error: "Join this space before entering voice." });
     if (path === "/api/voice/join" && method === "POST") {
       const room = validId(data.room), peerId = validId(data.peerId);
       if (!who || !room || !peerId) return reply(400, { error: "Reconnect to chat before joining voice." });

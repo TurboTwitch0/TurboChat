@@ -4,6 +4,8 @@ TurboChat's Orbit community keeps its existing Vercel frontend and Netlify API. 
 
 The readable interface uses one layout stylesheet, `styles.css`, with a 16px default body/message size, natural wrapping, and normal-flow public room previews. Tablets give the conversation the full available column; compact screens keep room navigation, search and the composer accessible. Dialog headers stay visible while their content scrolls. The optional voice panel opens only when requested. Drafts, message recovery, account/session handling, search and voice keep their existing data and behavior.
 
+The create-space menu works on phones and offers community servers, public rooms and private parties. Profile privacy controls can remove an unused account only after password confirmation. A new private party can be removed only by its registered owner when it has no other members or their messages; legacy and shared spaces are protected. Account deletion is refused while messages or server/private-party memberships remain. Local deletion markers are kept in `data/deletions.json`, so retain the whole data directory when backing up the app.
+
 The static build writes content-hashed CSS/JavaScript filenames into its HTML and records their SHA-256 values in `asset-manifest.json`. This keeps the page and assets matched on ordinary loads without clearing browser data. Unhashed script/style URLs and empty legacy `brand.css`/`showcase.css` compatibility files remain available for older pages. No service worker is installed by the app.
 
 ## Run
@@ -22,7 +24,7 @@ The standalone Node server uses built-in modules; the hosted Netlify API uses `@
 
 The Now Playing room has four computer-generated originals: retro pop, synthwave, dream pop, and ambient pop. Run `npm run music:generate` to recreate the bundled tracks. Shared audio supports YouTube, SoundCloud, and direct audio links.
 
-Voice needs microphone permission and a secure context (HTTPS or localhost). It uses a room-scoped WebSocket audio relay on the same server as chat, so it does not depend on public STUN or TURN servers. For public use, run it behind HTTPS as a long-lived Node service with persistent storage. Static hosting alone cannot run the chat API or voice relay.
+Voice needs microphone permission and a secure context (HTTPS or localhost). The local Node server uses a room-scoped WebSocket audio relay. The hosted Netlify/Vercel app uses browser WebRTC with STUN and serverless signaling; restrictive networks may require a TURN relay. For public use, run it behind HTTPS as a long-lived Node service with persistent storage. Static hosting alone cannot run the chat API or voice relay.
 
 ## Deploy the website on Vercel
 
