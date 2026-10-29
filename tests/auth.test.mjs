@@ -28,6 +28,79 @@ function hostedFixture() {
   return { records, reads, store, request, handler };
 }
 
+async function checkReplyContract(request) {
+  const guestId = "reply-owner", sender = { guestId, guestName: "Original-author-".repeat(4) };
+  const originalResponse = await request("/api/messages", { ...sender, channel: "global", text: "Original message content. ".repeat(16) });
+  assert.equal(originalResponse.status, 201);
+  const original = (await originalResponse.json()).message;
+  assert.equal(original.replyTo, undefined, "ordinary messages retain their existing format");
+  const expected = { id: original.id, user: original.user.slice(0, 32), text: original.text.slice(0, 180) };
+  const response = await request("/api/messages", {
+    guestId, guestName: "Reply author", channel: "global", text: "A reply with context", replyTo: original.id,
+    replySnapshot: { id: "forged-id", user: "Forged author", text: "Forged original" }
+  });
+  assert.equal(response.status, 201);
+  const reply = (await response.json()).message;
+  assert.deepEqual(reply.replyTo, expected, "the server constructs the preview from the stored target");
+  assert.equal(reply.replyTo.user.length, 32);
+  assert.equal(reply.replyTo.text.length, 180);
+  const history = await (await request(`/api/messages?channel=global&guestId=${guestId}`)).json();
+  assert.deepEqual(history.messages.find(message => message.id === reply.id).replyTo, expected);
+
+  const plain = await request("/api/messages", { guestId, channel: "global", text: "No reply selected", replyTo: "" });
+  assert.equal(plain.status, 201);
+  assert.equal((await plain.json()).message.replyTo, undefined);
+  for (const replyTo of [null, {}, [], 42, true, "../other-channel", " target ", "x".repeat(101)]) {
+    const invalid = await request("/api/messages", { guestId, channel: "global", text: "Invalid reply", replyTo });
+    assert.equal(invalid.status, 400, `malformed reply target ${JSON.stringify(replyTo)} must be rejected`);
+    assert.match((await invalid.json()).error, /valid message to reply/);
+  }
+  for (const [channel, replyTo] of [["global", "missing-message"], ["music", original.id]]) {
+    const unavailable = await request("/api/messages", { guestId, channel, text: "Unavailable reply", replyTo });
+    assert.equal(unavailable.status, 400);
+    assert.match((await unavailable.json()).error, /no longer available in this conversation/);
+  }
+
+  const created = await request("/api/servers", { name: "Private replies", guestId });
+  assert.equal(created.status, 201);
+  const privateChannel = (await created.json()).server.channels[0].id;
+  const privateOriginalResponse = await request("/api/messages", { guestId, channel: privateChannel, text: "Private original content" });
+  assert.equal(privateOriginalResponse.status, 201);
+  const privateOriginal = (await privateOriginalResponse.json()).message;
+  const privateReplyResponse = await request("/api/messages", { guestId, channel: privateChannel, text: "Private reply", replyTo: privateOriginal.id });
+  assert.equal(privateReplyResponse.status, 201);
+  const privateReply = (await privateReplyResponse.json()).message;
+  assert.equal(privateReply.replyTo.id, privateOriginal.id);
+  assert.equal((await request(`/api/messages?channel=${privateChannel}&guestId=reply-outsider`)).status, 403);
+  assert.equal((await request("/api/messages", { guestId: "reply-outsider", channel: privateChannel, text: "Unauthorized reply", replyTo: privateOriginal.id })).status, 403);
+  const leakedReference = await request("/api/messages", { guestId: "reply-outsider", channel: "global", text: "Cross-channel reply", replyTo: privateOriginal.id });
+  assert.equal(leakedReference.status, 400);
+  assert.ok(!(await leakedReference.text()).includes(privateOriginal.text), "an unavailable reply error must not reveal private content");
+  return { guestId, original, reply, expected, privateChannel, privateReply };
+}
+
+test("hosted replies persist trusted previews and reject invalid or inaccessible targets", async () => {
+  const { request, records, store, reads } = hostedFixture();
+  const { guestId, original, reply, expected, privateChannel, privateReply } = await checkReplyContract(request);
+  const persisted = [...records.entries()].find(([key, value]) => key.startsWith("messages/global/") && JSON.parse(value).id === reply.id);
+  assert.deepEqual(JSON.parse(persisted[1]).replyTo, expected);
+  const ownUpdates = await (await request(`/api/updates?after=0&guestId=${guestId}`)).json();
+  assert.deepEqual(ownUpdates.events.find(event => event.message?.id === reply.id).message.replyTo, expected);
+  assert.equal(ownUpdates.events.find(event => event.message?.id === privateReply.id).message.replyTo.text, "Private original content");
+  const outsiderUpdates = await (await request("/api/updates?after=0&guestId=reply-outsider")).json();
+  assert.ok(!outsiderUpdates.events.some(event => event.channel === privateChannel));
+
+  // The immutable message is authoritative even when a concurrent shared-state
+  // save omitted it from the cached channel history.
+  const state = JSON.parse(records.get("state"));
+  state.messages.global = [];
+  await store.setJSON("state", state);
+  const fromBlob = await request("/api/messages", { guestId, channel: "global", text: "Reply to durable target", replyTo: original.id });
+  assert.equal(fromBlob.status, 201);
+  assert.deepEqual((await fromBlob.json()).message.replyTo, expected);
+  assert.ok(reads.some(read => read.key.startsWith("messages/global/") && read.consistency === "strong"));
+});
+
 test('hosted API rejects JSON values that are not request objects before accessing storage', async () => {
   const { handler, records, reads } = hostedFixture();
   for (const data of [null, [], 'text', 42, true]) {
@@ -131,6 +204,61 @@ test("local sessions survive a server restart and stay revoked after a second re
     assert.equal((await (await request("/api/me", null, cookie)).json()).user, null);
     assert.equal((await request("/api/profile", { name: "Unauthorized", emoji: "✦" }, cookie)).status, 401);
   } finally {
+    if (child) await stop();
+    assert.ok(dataDir.startsWith(`${work}${path.sep}`));
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("local replies retain context after restart and broadcast only server-built previews", async () => {
+  const work = path.resolve(repo, "..", "auth-test-work");
+  await mkdir(work, { recursive: true });
+  const dataDir = await mkdtemp(path.join(work, "replies-"));
+  const listener = createServer(); listener.listen(0, "127.0.0.1"); await once(listener, "listening");
+  const port = listener.address().port; await new Promise(resolve => listener.close(resolve));
+  let child, streamController;
+  const start = async () => {
+    child = spawn(process.execPath, ["server.js"], { cwd: repo, env: { ...process.env, PORT: String(port), ORBIT_DATA_DIR: dataDir }, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    await Promise.race([once(child.stdout, "data"), once(child, "exit").then(([code]) => { throw new Error(`Server exited ${code}`); })]);
+  };
+  const stop = async () => { const exited = once(child, "exit"); child.kill(); await exited; child = null; };
+  const request = (url, body) => fetch(`http://127.0.0.1:${port}${url}`, { method: body ? "POST" : "GET", headers: { "Content-Type": "application/json" }, ...(body ? { body: JSON.stringify(body) } : {}) });
+  try {
+    await start();
+    const { guestId, original, reply, expected, privateChannel } = await checkReplyContract(request);
+    streamController = new AbortController();
+    const stream = await fetch(`http://127.0.0.1:${port}/api/events?guestId=${guestId}&peerId=reply-stream-test`, { signal: streamController.signal });
+    assert.equal(stream.status, 200);
+    const reader = stream.body.getReader(), decoder = new TextDecoder();
+    const streamedReplyResponse = await request("/api/messages", { guestId, channel: "global", text: "A live reply", replyTo: original.id });
+    assert.equal(streamedReplyResponse.status, 201);
+    const streamedReply = (await streamedReplyResponse.json()).message;
+    const timeout = setTimeout(() => streamController.abort(), 5000);
+    try {
+      let buffer = "", received;
+      while (!received) {
+        const { done, value } = await reader.read();
+        assert.ok(!done, "the live stream must include the new reply");
+        buffer += decoder.decode(value, { stream: true });
+        let boundary;
+        while ((boundary = buffer.indexOf("\n\n")) >= 0) {
+          const event = buffer.slice(0, boundary); buffer = buffer.slice(boundary + 2);
+          const json = event.split("\n").find(line => line.startsWith("data: "))?.slice(6);
+          if (json) { const data = JSON.parse(json); if (data.message?.id === streamedReply.id) received = data; }
+        }
+      }
+      assert.equal(received.type, "message");
+      assert.equal(received.channel, "global");
+      assert.deepEqual(received.message.replyTo, expected);
+    } finally { clearTimeout(timeout); streamController.abort(); await reader.cancel().catch(() => {}); }
+    await stop(); await start();
+    const history = await (await request(`/api/messages?channel=global&guestId=${guestId}`)).json();
+    assert.deepEqual(history.messages.find(message => message.id === reply.id).replyTo, expected);
+    assert.equal((await request(`/api/messages?channel=${privateChannel}&guestId=reply-outsider`)).status, 403);
+    const persisted = JSON.parse(await readFile(path.join(dataDir, "orbit.json"), "utf8"));
+    assert.deepEqual(persisted.messages.global.find(message => message.id === streamedReply.id).replyTo, expected);
+  } finally {
+    streamController?.abort();
     if (child) await stop();
     assert.ok(dataDir.startsWith(`${work}${path.sep}`));
     await rm(dataDir, { recursive: true, force: true });

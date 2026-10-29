@@ -64,21 +64,33 @@
   const name = () => state.profile?.name || state.guest.name;
   const drafts = saved.drafts && typeof saved.drafts === "object" && !Array.isArray(saved.drafts) ? saved.drafts : {};
   const draftBooks = saved.draftsByIdentity && typeof saved.draftsByIdentity === "object" && !Array.isArray(saved.draftsByIdentity) ? saved.draftsByIdentity : {};
-  let draftIdentity = typeof saved.draftIdentity === "string" ? saved.draftIdentity : "", accountBusy = false;
+  const replyDrafts = saved.replyDrafts && typeof saved.replyDrafts === "object" && !Array.isArray(saved.replyDrafts) ? saved.replyDrafts : {};
+  const replyBooks = saved.replyDraftsByIdentity && typeof saved.replyDraftsByIdentity === "object" && !Array.isArray(saved.replyDraftsByIdentity) ? saved.replyDraftsByIdentity : {};
+  let draftIdentity = typeof saved.draftIdentity === "string" ? saved.draftIdentity : "", accountBusy = false, draftsResolved = false;
   state.unread = {};
+  state.replySupport = false;
   let worldHistoryReset = saved.worldHistoryReset && Number.isFinite(saved.worldHistoryReset.through) && Array.isArray(saved.worldHistoryReset.ids) ? saved.worldHistoryReset : null;
   let worldHistoryInitialized = saved.worldHistoryInitialized === true || !!worldHistoryReset;
   const messageFollow = { room: null, pinned: true, generation: 0, adjusting: false, frame: null, anchor: null };
   let identityVersion = 0, modalOpener = null, pollingHasSnapshot = false;
-  const save = () => { if (draftIdentity) draftBooks[draftIdentity] = { ...drafts }; try { localStorage.setItem(storageKey, JSON.stringify({ guest: state.guest, active: state.active, view: state.view, followingRooms: state.followingRooms, drafts, draftIdentity, draftsByIdentity: draftBooks, worldHistoryReset, worldHistoryInitialized })); state.storageAvailable = true; return true; } catch { state.storageAvailable = false; return false; } };
+  const save = () => {
+    if (draftIdentity) { draftBooks[draftIdentity] = { ...drafts }; replyBooks[draftIdentity] = { ...replyDrafts }; }
+    try {
+      localStorage.setItem(storageKey, JSON.stringify({ guest: state.guest, active: state.active, view: state.view, followingRooms: state.followingRooms, drafts, draftIdentity, draftsByIdentity: draftBooks, replyDrafts, replyDraftsByIdentity: replyBooks, worldHistoryReset, worldHistoryInitialized }));
+      state.storageAvailable = true; return true;
+    } catch { state.storageAvailable = false; return false; }
+  };
   function chooseDrafts(profile) {
     const next = profile ? `user-${profile.id}` : `guest-${state.guest.id}`;
     if (draftIdentity && draftIdentity !== next) {
       draftBooks[draftIdentity] = { ...drafts };
+      replyBooks[draftIdentity] = { ...replyDrafts };
       for (const key of Object.keys(drafts)) delete drafts[key];
+      for (const key of Object.keys(replyDrafts)) delete replyDrafts[key];
       Object.assign(drafts, draftBooks[next] || {});
+      Object.assign(replyDrafts, replyBooks[next] || {});
     }
-    draftIdentity = next; save(); restoreDraft();
+    draftIdentity = next; draftsResolved = true; save(); restoreDraft();
   }
   function unreadBadge(channel) {
     const count = state.unread[channel] || 0;
@@ -181,8 +193,39 @@
     const input = $("#messageInput");
     $("#charCount").textContent = input.value.length;
     input.style.height = "auto"; input.style.height = `${Math.min(input.scrollHeight, 130)}px`;
-    $("#draftHint").textContent = input.value ? state.storageAvailable === false ? "Draft kept in this tab" : "Draft saved on this device" : "";
-    $("#sendButton").disabled = !state.connected || !input.value.trim();
+    const tooLong = input.value.trim().length > 700;
+    const replyWaiting = draftsResolved && !!replySnapshot(replyDrafts[state.active]) && !state.replySupport;
+    $("#draftHint").textContent = tooLong ? "Use 700 characters or fewer to send." : replyWaiting ? "Replies are updating. Cancel the reply to send a regular message." : input.value ? state.storageAvailable === false ? "Draft kept in this tab" : "Draft saved on this device" : "";
+    $("#sendButton").disabled = !state.connected || !input.value.trim() || tooLong || replyWaiting;
+    renderReplyPreview();
+  }
+  function replySnapshot(value) {
+    if (!value || typeof value.id !== "string" || !/^[\w-]{1,100}$/.test(value.id) || typeof value.text !== "string") return null;
+    return { id: value.id, user: String(value.user || "Guest").slice(0, 32), text: value.text.slice(0, 180) };
+  }
+  function renderReplyPreview() {
+    const reply = draftsResolved ? replySnapshot(replyDrafts[state.active]) : null;
+    $("#replyPreview").classList.toggle("hidden", !reply);
+    $("#replyUser").textContent = reply?.user || ""; $("#replyText").textContent = reply?.text || "";
+    $("#messageInput").setAttribute("aria-describedby", reply ? "replyUser replyText" : "draftHint");
+  }
+  function startReply(id) {
+    if (!state.replySupport) return toast("Quoted replies are not available on this server yet. You can still send regular messages.");
+    const item = visibleMessages(state.active).find(message => message.id === id && !message.pending && !message.failed);
+    const reply = replySnapshot(item); if (!reply) return;
+    replyDrafts[state.active] = reply; save(); renderReplyPreview(); $("#messageInput").focus();
+  }
+  function cancelReply() { delete replyDrafts[state.active]; save(); updateComposer(); $("#messageInput").focus(); }
+  function jumpToMessage(id) {
+    const target = [...$("#messages").querySelectorAll("[data-message-id]")].find(item => item.dataset.messageId === id);
+    if (!target) {
+      if (state.active === "global" && (state.messages.global || []).some(item => item.id === id)) {
+        toast("That message is in hidden history. Restore history to see it."); $("#worldHistoryToggle").focus();
+      } else toast("The original is outside the loaded history. Its quote is saved here.");
+      return;
+    }
+    pauseMessageFollow(); target.scrollIntoView({ block: "center", behavior: scrollBehavior() });
+    target.classList.add("search-highlight"); setTimeout(() => target.classList.remove("search-highlight"), 1800);
   }
   function saveDraft() { const value = $("#messageInput").value; if (value) drafts[state.active] = value; else delete drafts[state.active]; save(); updateComposer(); }
   function restoreDraft() { $("#messageInput").value = typeof drafts[state.active] === "string" ? drafts[state.active].slice(0, 700) : ""; updateComposer(); }
@@ -240,9 +283,10 @@
   }
   function renderMessage(item) {
     const reactions = Object.entries(item.reactions || {}).map(([emoji, list]) => `<button class="reaction" data-react="${esc(item.id)}" data-emoji="${esc(emoji)}">${esc(emoji)} ${list.length}</button>`).join("");
-    const stamp = new Date(item.createdAt || Date.now());
-    const actions = item.pending ? `<span class="message-delivery">Sending…</span>` : item.failed ? `<span class="message-delivery failed">${item.uncertain ? "Delivery unconfirmed" : "Not sent"}</span><button class="retry-message" data-retry-message="${esc(item.id)}">Try again</button>` : `${reactions}<button class="reaction" data-react="${esc(item.id)}" data-emoji="💜" aria-label="React with a purple heart">💜 +</button><button class="reply-link" data-reply="${esc(item.id)}">↩ Reply</button>`;
-    return `<article class="message ${item.failed ? "message-failed" : ""}" data-message-id="${esc(item.id)}"><span class="avatar">${esc(item.emoji || "✦")}</span><div class="message-body"><div class="message-meta"><b>${esc(item.user || "Guest")}</b>${item.registered ? `<i>member</i>` : ""}<time datetime="${esc(stamp.toISOString())}" title="${esc(stamp.toLocaleString())}">${new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" }).format(stamp)}</time></div><p>${esc(item.text)}</p><div class="message-actions">${actions}</div></div></article>`;
+    const stamp = new Date(item.createdAt || Date.now()), reply = replySnapshot(item.replyTo);
+    const quote = reply ? `<button type="button" class="message-quote" data-jump-reply="${esc(reply.id)}" aria-label="Go to original message from ${esc(reply.user)}"><span aria-hidden="true">↩</span><b>${esc(reply.user)}</b><span class="quote-text">${esc(reply.text)}</span></button>` : "";
+    const actions = item.pending ? `<span class="message-delivery">Sending…</span>` : item.failed ? `<span class="message-delivery failed">${item.uncertain ? "Delivery unconfirmed" : "Not sent"}</span><button class="retry-message" data-retry-message="${esc(item.id)}">Try again</button>${reply ? `<button class="retry-message" data-retry-plain="${esc(item.id)}">Send without reply</button>` : ""}` : `${reactions}<button class="reaction" data-react="${esc(item.id)}" data-emoji="💜" aria-label="React with a purple heart">💜 +</button>${state.replySupport ? `<button class="reply-link" data-reply="${esc(item.id)}">↩ Reply</button>` : ""}`;
+    return `<article class="message ${item.failed ? "message-failed" : ""}" data-message-id="${esc(item.id)}"><span class="avatar">${esc(item.emoji || "✦")}</span><div class="message-body"><div class="message-meta"><b>${esc(item.user || "Guest")}</b>${item.registered ? `<i>member</i>` : ""}<time datetime="${esc(stamp.toISOString())}" title="${esc(stamp.toLocaleString())}">${new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" }).format(stamp)}</time></div>${quote}<p>${esc(item.text)}</p><div class="message-actions">${actions}</div></div></article>`;
   }
   function renderMessages({ scrollToBottom = false } = {}) {
     const current = room(state.active), rawItems = state.messages[state.active] || [], items = visibleMessages(state.active, rawItems);
@@ -318,7 +362,7 @@
     }
     if (version !== identityVersion) return;
     state.loading = false; delete state.channelErrors[channel]; initializeWorldHistory(channel, data.messages || []);
-    state.rooms = data.rooms || []; state.parties = data.parties || []; state.servers = [...new Map((data.servers || []).map(server => [server.id, server])).values()]; mergeMessages(channel, data.messages || []); state.members = data.members || []; state.registered = Number(data.registeredCount) || 1428; state.goal = Number(data.memberGoal) || 1500; state.music = data.music || null; renderRoomList(); renderMessages(); renderMembers(); renderMusic(); restoreDraft();
+    state.rooms = data.rooms || []; state.parties = data.parties || []; state.servers = [...new Map((data.servers || []).map(server => [server.id, server])).values()]; mergeMessages(channel, data.messages || []); state.members = data.members || []; state.registered = Number(data.registeredCount) || 1428; state.goal = Number(data.memberGoal) || 1500; state.music = data.music || null; state.replySupport = data.features?.messageReplies === true; renderRoomList(); renderMessages(); renderMembers(); renderMusic(); restoreDraft();
   }
   function connectLive() {
     state.stream?.close();
@@ -378,15 +422,19 @@
   }
   function renderTyping() { const names = [...typingPeers.entries()].filter(([key]) => !key.endsWith(":timer")).map(([, value]) => value); $("#typingIndicator").textContent = names.length ? `${names.slice(0, 2).join(", ")}${names.length > 2 ? ` and ${names.length - 2} others` : names.length === 1 ? " is" : " are"} typing…` : ""; }
   function sendTyping(typing) { if (localTyping === typing) return; localTyping = typing; api("/api/typing", { method: "POST", body: JSON.stringify({ channel: state.active, typing, guestId: state.guest.id, guestName: name() }) }).catch(() => {}); }
-  async function sendMessage(value, retryId = "") {
+  async function sendMessage(value, retryId = "", withoutReply = false) {
     const content = value.trim(); if (!content || !state.connected) return;
+    if (content.length > 700) return toast("Use 700 characters or fewer to send.");
     const channel = state.active, version = identityVersion;
+    const retry = retryId && (state.messages[channel] || []).find(item => item.id === retryId);
+    const reply = withoutReply ? null : replySnapshot(retryId ? retry?.replyTo : replyDrafts[channel]);
+    if (reply && !state.replySupport) return toast("Replies are updating. Cancel the reply or use Send without reply.");
     if (retryId) state.messages[channel] = (state.messages[channel] || []).filter(item => item.id !== retryId);
-    else { $("#messageInput").value = ""; saveDraft(); }
+    else { $("#messageInput").value = ""; delete replyDrafts[channel]; saveDraft(); }
     clearTyping();
-    const tempId = `pending-${crypto.randomUUID()}`, pending = { id: tempId, user: name(), emoji: state.profile?.emoji || "✦", text: content, createdAt: new Date().toISOString(), reactions: {}, pending: true };
+    const tempId = `pending-${crypto.randomUUID()}`, pending = { id: tempId, user: name(), emoji: state.profile?.emoji || "✦", text: content, createdAt: new Date().toISOString(), reactions: {}, pending: true, ...(reply ? { replyTo: reply } : {}) };
     mergeMessages(channel, [pending]); if (state.active === channel) renderMessages({ scrollToBottom: true });
-    try { const result = await api("/api/messages", { method: "POST", body: JSON.stringify({ channel, text: content, guestId: state.guest.id, guestName: name() }) }); if (version !== identityVersion) return; state.messages[channel] = (state.messages[channel] || []).filter(item => item.id !== tempId); mergeMessages(channel, [result.message]); if (state.active === channel) renderMessages({ scrollToBottom: true }); }
+    try { const result = await api("/api/messages", { method: "POST", body: JSON.stringify({ channel, text: content, guestId: state.guest.id, guestName: name(), ...(reply ? { replyTo: reply.id } : {}) }) }); if (version !== identityVersion) return; state.messages[channel] = (state.messages[channel] || []).filter(item => item.id !== tempId); mergeMessages(channel, [result.message]); if (state.active === channel) renderMessages({ scrollToBottom: true }); }
     catch (error) { if (version !== identityVersion) return; const item = (state.messages[channel] || []).find(item => item.id === tempId); if (item) { item.pending = false; item.failed = true; item.uncertain = error.uncertain === true; } if (state.active === channel) renderMessages(); toast(error.uncertain ? `${error.message} Your text is kept above. Check the conversation before using Try again.` : `${error.message} Your message is kept above. Use Try again to resend.`); }
   }
   async function selectChannel(id) {
@@ -862,7 +910,9 @@
       const track = event.target.closest("[data-track]"); if (track) playBuiltin(track.dataset.track);
       const react = event.target.closest("[data-react]"); if (react) api("/api/reactions", { method: "POST", body: JSON.stringify({ channel: state.active, messageId: react.dataset.react, emoji: react.dataset.emoji, guestId: state.guest.id, guestName: name() }) }).catch(error => toast(error.message));
       const retry = event.target.closest("[data-retry-message]"); if (retry) { const item = (state.messages[state.active] || []).find(item => item.id === retry.dataset.retryMessage); if (item?.failed) sendMessage(item.text, item.id); }
-      const reply = event.target.closest("[data-reply]"); if (reply) { const item = visibleMessages(state.active).find(item => item.id === reply.dataset.reply); if (!item) return; const input = $("#messageInput"); input.value = (`@${item?.user || "Guest"} ` + input.value).slice(0, 700); saveDraft(); input.focus(); }
+      const retryPlain = event.target.closest("[data-retry-plain]"); if (retryPlain) { const item = (state.messages[state.active] || []).find(item => item.id === retryPlain.dataset.retryPlain); if (item?.failed) sendMessage(item.text, item.id, true); }
+      const reply = event.target.closest("[data-reply]"); if (reply) startReply(reply.dataset.reply);
+      const original = event.target.closest("[data-jump-reply]"); if (original) jumpToMessage(original.dataset.jumpReply);
     });
     $("#createSpace").onclick = createRoomMenu; $("#createServer").onclick = $("#railCreate").onclick = createServerModal; $("#searchOpen").onclick = $("#mobileSearch").onclick = search; $("#inviteButton").onclick = $("#peopleInvite").onclick = inviteGeneral;
     $("#followButton").onclick = toggleFollow;
@@ -874,6 +924,7 @@
     $("#discoverAccount").onclick = () => state.profile ? profileModal() : authModal();
     $("#helpButton").onclick = showRules; $("#profileButton").onclick = $("#topProfile").onclick = () => state.profile ? profileModal() : authModal();
     $("#messageForm").onsubmit = e => { e.preventDefault(); sendMessage($("#messageInput").value); };
+    $("#cancelReply").onclick = cancelReply;
     $("#messageInput").oninput = e => { saveDraft(); clearTimeout(typingStopTimer); if (e.currentTarget.value.trim()) { if (!localTyping) { clearTimeout(typingTimer); typingTimer = setTimeout(() => sendTyping(true), 180); } typingStopTimer = setTimeout(() => sendTyping(false), 1600); } else { clearTimeout(typingTimer); sendTyping(false); } };
     $("#messageInput").onkeydown = e => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); clearTimeout(typingTimer); clearTimeout(typingStopTimer); sendTyping(false); sendMessage(e.currentTarget.value); } };
     window.addEventListener("resize", updateComposer);
@@ -883,6 +934,8 @@
     $$("[data-view]").forEach(button => button.onclick = () => setView(button.dataset.view));
     document.addEventListener("keydown", e => {
       if (accountBusy) { if (e.key === "Tab") { e.preventDefault(); $(".modal")?.focus(); } return; }
+      if (e.isComposing) return;
+      if (e.key === "Escape" && !$(".modal") && replyDrafts[state.active]) { e.preventDefault(); cancelReply(); return; }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); search(); }
       if (e.key === "Escape") { closeModal(); state.voiceMobileOpen = false; renderVoice(); }
       if (e.key === "Tab" && $(".modal")) { const controls = $$(".modal button:not([disabled]), .modal input:not([disabled]), .modal select:not([disabled]), .modal textarea:not([disabled]), .modal a[href]").filter(item => item.getClientRects().length); const first = controls[0], last = controls.at(-1); if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last?.focus(); } else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first?.focus(); } }

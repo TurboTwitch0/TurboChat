@@ -35,6 +35,17 @@ async function readMessages(store, db, channel) {
   }
   return [...merged.values()].sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt)).slice(-250);
 }
+async function findReplyTarget(store, db, channel, id) {
+  const cached = (db.messages[channel] || []).find(item => item.id === id);
+  if (cached) return cached;
+  // A concurrent state save can omit a message while its immutable blob remains.
+  // Only look inside the already authorized channel, then verify the record id.
+  const { blobs } = await store.list({ prefix: `messages/${channel}/` });
+  const record = blobs.find(blob => blob.key.endsWith(`-${id}`));
+  if (!record) return null;
+  const message = await store.get(record.key, { type: "json", consistency: "strong" });
+  return message?.id === id ? message : null;
+}
 
 export function createApiHandler(storeFactory = getStore) {
 return async function handler(request) {
@@ -91,7 +102,7 @@ return async function handler(request) {
     db.presence = Object.fromEntries(Object.entries(db.presence).filter(([, member]) => Date.now() - member.seenAt < 30000));
     db.voicePeers = Object.fromEntries(Object.entries(db.voicePeers).filter(([, peer]) => Date.now() - peer.seenAt < 30000));
 
-    if (method === "GET" && ["/health", "/api/health"].includes(path)) return reply(200, { ok: true, service: "orbit-netlify", release: "turbochat-13" });
+    if (method === "GET" && ["/health", "/api/health"].includes(path)) return reply(200, { ok: true, service: "orbit-netlify", release: "turbochat-19", features: { messageReplies: true } });
     if (method === "GET" && path === "/api/me") return reply(200, { user: publicUser(user) });
     if (method === "POST" && path === "/api/presence") {
       if (!who) return reply(400, { error: "Refresh the page and try again." });
@@ -103,7 +114,7 @@ return async function handler(request) {
     if (method === "GET" && path === "/api/bootstrap") {
       const channel = validId(url.searchParams.get("channel")) || "global";
       if (!canSee(channel)) return reply(403, { error: "Join this party from its invite link first." });
-      return reply(200, { messages: await readMessages(store, db, channel), rooms: db.rooms, parties: db.parties.filter(room => isMember(room, who)).map(safeRoom), servers: db.servers.filter(server => isMember(server, who)).map(safeServer), music: db.music, members: online.map(publicMember), registeredCount: baseline + db.users.length, memberGoal: goal });
+      return reply(200, { messages: await readMessages(store, db, channel), rooms: db.rooms, parties: db.parties.filter(room => isMember(room, who)).map(safeRoom), servers: db.servers.filter(server => isMember(server, who)).map(safeServer), music: db.music, members: online.map(publicMember), registeredCount: baseline + db.users.length, memberGoal: goal, features: { messageReplies: true } });
     }
     if (method === "GET" && path === "/api/messages") {
       const channel = validId(url.searchParams.get("channel")) || "global";
@@ -120,7 +131,16 @@ return async function handler(request) {
       if (!content) return reply(400, { error: "Write a message first." });
       if (!who) return reply(400, { error: "Refresh the page and try again." });
       if (!canSee(channel)) return reply(403, { error: "Join this party from its invite link first." });
+      let replyTo;
+      if (data.replyTo !== undefined && data.replyTo !== "") {
+        const targetId = validId(data.replyTo);
+        if (!targetId) return reply(400, { error: "Choose a valid message to reply to." });
+        const target = await findReplyTarget(store, db, channel, targetId);
+        if (!target) return reply(400, { error: "That message is no longer available in this conversation. Choose another message to reply to." });
+        replyTo = { id: target.id, user: clean(target.user, 32) || "Guest", text: clean(target.text, 180) };
+      }
       const message = { id: randomUUID(), user: user?.name || clean(data.guestName, 32) || "Guest", userId: user?.id || "", registered: !!user, emoji: user?.emoji || "✦", text: content, reactions: {}, createdAt: new Date().toISOString() };
+      if (replyTo) message.replyTo = replyTo;
       // Store messages under unique immutable keys so concurrent serverless
       // writes cannot replace another message from the shared state snapshot.
       const messageKey = `messages/${channel}/${message.createdAt.replace(/\D/g, "")}-${message.id}`;

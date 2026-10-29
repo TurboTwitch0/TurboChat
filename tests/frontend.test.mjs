@@ -8,7 +8,7 @@ const source = await readFile(new URL("../app.js", import.meta.url), "utf8");
 const entry = "bind(); renderMessages(); updateIdentity(); start();";
 assert.ok(source.includes(entry), "The test harness must replace only the application startup.");
 // Expose functions in the test-only copy; production does not export internals.
-const testSource = source.replace(entry, "globalThis.app = { state, drafts, chooseDrafts, addMessage, setView, renderRoomList, saveDraft, restoreDraft, selectChannel, pollUpdates, sendMessage, receiveLiveEvent, typingPeers, bind, renderMessages, renderVoice, setConnected, loadChannel, bootstrap, scrollBehavior, renderShowcase, selectShowcase, showcaseKeydown, messageFollow, scrollToLatest, scheduleBottomScroll, handleFeedScroll, pauseMessageFollow, initMessageScrolling, enterMessageRoom, visibleMessages, hideWorldHistory, restoreWorldHistory, api, authModal, refreshIdentity, start, signOut, roomForm };");
+const testSource = source.replace(entry, "globalThis.app = { state, drafts, replyDrafts, startReply, cancelReply, jumpToMessage, renderMessage, chooseDrafts, addMessage, setView, renderRoomList, saveDraft, restoreDraft, selectChannel, pollUpdates, sendMessage, receiveLiveEvent, typingPeers, bind, renderMessages, renderVoice, setConnected, loadChannel, bootstrap, scrollBehavior, renderShowcase, selectShowcase, showcaseKeydown, messageFollow, scrollToLatest, scheduleBottomScroll, handleFeedScroll, pauseMessageFollow, initMessageScrolling, enterMessageRoom, visibleMessages, hideWorldHistory, restoreWorldHistory, api, authModal, refreshIdentity, start, signOut, roomForm };");
 
 // Response metadata is a fixture-only wrapper; application payloads stay unchanged.
 const mockHttp = (data, options = {}) => ({ fixtureResponse: { data, status: 200, ...options } });
@@ -19,7 +19,7 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-function fixture({ storage = new Map(), request = () => undefined, reducedMotion = false, storageBlocked = false, locationSearch = "" } = {}) {
+function fixture({ storage = new Map(), request = () => undefined, reducedMotion = false, storageBlocked = false, locationSearch = "", replySupport = true } = {}) {
   const elements = new Map(), requests = [], timers = new Map(), timerDelays = new Map(), intervals = new Map(), listeners = new Map(), historyChanges = [];
   const frames = new Map(), windowListeners = new Map(), fontListeners = new Map(), resizeObservers = [], fontReady = deferred();
   let timerId = 0, frameId = 0;
@@ -123,6 +123,7 @@ function fixture({ storage = new Map(), request = () => undefined, reducedMotion
     }
   });
   vm.runInContext(testSource, context, { filename: "app.js" });
+  context.app.state.replySupport = replySupport;
   const flushFrames = () => {
     for (let pass = 0; frames.size; pass++) {
       assert.ok(pass < 30, "Bottom-follow work must settle instead of scheduling frames forever.");
@@ -693,8 +694,10 @@ test("reply actions use visible message identities after earlier World history i
   assert.doesNotMatch(element("#messageList").innerHTML, /data-reply="hidden-reply"/);
   element("#messageInput").value = "My thought";
   const reply = id => listeners.get("click")({ target: { closest: selector => selector === "[data-reply]" ? { dataset: { reply: id } } : null } });
-  reply("visible-reply"); assert.equal(element("#messageInput").value, "@New person My thought");
-  reply("hidden-reply"); assert.equal(element("#messageInput").value, "@New person My thought");
+  reply("visible-reply"); assert.equal(element("#messageInput").value, "My thought");
+  assert.equal(app.replyDrafts.global.id, "visible-reply");
+  reply("hidden-reply"); assert.equal(element("#messageInput").value, "My thought");
+  assert.equal(app.replyDrafts.global.id, "visible-reply");
   assert.equal(requests.length, 0);
 });
 
@@ -1023,4 +1026,107 @@ test("a sender's accepted message is not marked unread after switching away", ()
   app.state.messages.music = [{ id: "pending-local", pending: true, user: "Guest", text: "My guest message" }];
   app.addMessage("music", { id: "guest-accepted", user: "Guest", text: "My guest message" });
   assert.equal(app.state.unread.music, undefined);
+});
+
+test("reply context preserves a full draft and follows its room and account through reload", async () => {
+  const { app, element, storage } = fixture();
+  app.chooseDrafts(null); app.state.loading = false;
+  const original = { id: "reply-original", user: "First person", text: "Original conversation" };
+  app.state.messages.global = [original];
+  element("#messageInput").value = "x".repeat(700); app.saveDraft(); app.startReply(original.id);
+  assert.equal(element("#messageInput").value.length, 700);
+  assert.equal(app.replyDrafts.global.id, original.id);
+  assert.equal(element("#replyUser").textContent, original.user);
+  await app.selectChannel("music");
+  assert.equal(element("#replyPreview").classList.contains("hidden"), true);
+  await app.selectChannel("global");
+  assert.equal(element("#replyPreview").classList.contains("hidden"), false);
+  const reload = fixture({ storage }); reload.app.chooseDrafts(null);
+  assert.equal(reload.app.replyDrafts.global.id, original.id);
+  assert.equal(reload.element("#messageInput").value.length, 700);
+  reload.app.chooseDrafts({ id: "other-account" });
+  assert.equal(reload.app.replyDrafts.global, undefined);
+  assert.equal(reload.element("#replyPreview").classList.contains("hidden"), true);
+  reload.app.chooseDrafts(null); reload.app.cancelReply();
+  assert.equal(reload.app.replyDrafts.global, undefined);
+  assert.equal(reload.element("#messageInput").value.length, 700);
+});
+
+test("sending a reply keeps optimistic context and sends only the target identifier", async () => {
+  const response = deferred();
+  const { app, element, requests } = fixture({ request: record => record.method === "POST" && record.url.pathname === "/api/messages" ? response.promise : undefined });
+  app.chooseDrafts(null); app.state.connected = true; app.state.loading = false;
+  app.state.messages.global = [{ id: "original", user: "Friend", text: "What are you making?" }];
+  app.startReply("original"); element("#messageInput").value = "A new project"; app.saveDraft();
+  const sending = app.sendMessage(element("#messageInput").value);
+  const request = requests.find(record => record.url.pathname === "/api/messages" && record.method === "POST");
+  assert.equal(request.body.replyTo, "original");
+  assert.equal(app.state.messages.global.find(item => item.pending).replyTo.user, "Friend");
+  assert.equal(app.replyDrafts.global, undefined);
+  response.resolve({ message: { id: "accepted-reply", user: "Me", text: "A new project", replyTo: { id: "original", user: "Friend", text: "What are you making?" } } });
+  await sending;
+  assert.equal(app.state.messages.global.find(item => item.id === "accepted-reply").replyTo.id, "original");
+  assert.match(element("#messageList").innerHTML, /data-jump-reply="original"/);
+});
+
+test("a failed reply retains context and can be retried without it without changing a newer draft", async () => {
+  let attempts = 0;
+  const { app, element, requests } = fixture({ request(record) {
+    if (record.method !== "POST" || record.url.pathname !== "/api/messages") return;
+    if (++attempts === 1) throw new Error("Original no longer available");
+    return { message: { id: "retry-accepted", user: "Me", text: record.body.text } };
+  } });
+  app.chooseDrafts(null); app.state.connected = true; app.state.loading = false;
+  app.state.messages.global = [{ id: "old-original", user: "Friend", text: "Earlier" }, { id: "new-original", user: "Friend", text: "New topic" }];
+  app.startReply("old-original"); element("#messageInput").value = "My reply"; app.saveDraft(); await app.sendMessage("My reply");
+  const failed = app.state.messages.global.find(item => item.failed);
+  assert.equal(failed.replyTo.id, "old-original");
+  assert.match(element("#messageList").innerHTML, /data-retry-plain=/);
+  element("#messageInput").value = "A newer draft"; app.saveDraft(); app.startReply("new-original");
+  await app.sendMessage(failed.text, failed.id, true);
+  const outgoing = requests.filter(record => record.method === "POST" && record.url.pathname === "/api/messages");
+  assert.equal(outgoing[1].body.replyTo, undefined);
+  assert.equal(element("#messageInput").value, "A newer draft");
+  assert.equal(app.replyDrafts.global.id, "new-original");
+});
+
+test("reply quotes escape user content and respect intentionally hidden World history", () => {
+  const { app, element } = fixture();
+  const html = app.renderMessage({ id: "safe-reply", text: "Answer", replyTo: { id: "unsafe-original", user: "<img onerror=bad>", text: "<script>bad()</script>" } });
+  assert.match(html, /&lt;script&gt;/); assert.doesNotMatch(html, /<script>/);
+  assert.match(html, /data-jump-reply="unsafe-original"/);
+  app.state.loading = false; app.state.messages.global = [{ id: "hidden-original", text: "Earlier", createdAt: "2026-10-27T12:00:00Z" }];
+  app.hideWorldHistory(); app.jumpToMessage("hidden-original");
+  assert.match(element("#toast").textContent, /hidden history/);
+  assert.equal(element("#worldHistoryToggle").focused, true);
+  assert.equal(app.visibleMessages("global").length, 0);
+});
+
+test("an older API keeps regular messaging working and cannot silently drop saved reply context", async () => {
+  const { app, element, requests } = fixture({ replySupport: false, request(record) {
+    if (record.method === "POST" && record.url.pathname === "/api/messages") return { message: { id: "plain-accepted", text: record.body.text } };
+  } });
+  app.chooseDrafts(null); app.state.connected = true; app.state.loading = false;
+  app.state.messages.global = [{ id: "original", user: "Friend", text: "Earlier topic" }];
+  app.startReply("original"); assert.equal(app.replyDrafts.global, undefined);
+  assert.doesNotMatch(app.renderMessage(app.state.messages.global[0]), /data-reply=/);
+  element("#messageInput").value = "Ordinary message"; await app.sendMessage("Ordinary message");
+  assert.equal(requests.filter(item => item.method === "POST" && item.url.pathname === "/api/messages").length, 1);
+  app.replyDrafts.global = { id: "original", user: "Friend", text: "Earlier topic" };
+  element("#messageInput").value = "Keep this saved reply"; app.saveDraft();
+  assert.equal(element("#sendButton").disabled, true);
+  assert.match(element("#draftHint").textContent, /Replies are updating/);
+  await app.sendMessage(element("#messageInput").value);
+  assert.equal(requests.filter(item => item.method === "POST" && item.url.pathname === "/api/messages").length, 1);
+  assert.equal(element("#messageInput").value, "Keep this saved reply");
+  app.cancelReply(); assert.equal(element("#sendButton").disabled, false);
+});
+
+test("reply controls follow the API capability declared by bootstrap", async () => {
+  let supported = false;
+  const { app } = fixture({ request(record) {
+    if (record.url.pathname === "/api/bootstrap") return { messages: [], rooms: [], parties: [], servers: [], features: supported ? { messageReplies: true } : undefined };
+  } });
+  await app.bootstrap(); assert.equal(app.state.replySupport, false);
+  supported = true; await app.bootstrap(); assert.equal(app.state.replySupport, true);
 });

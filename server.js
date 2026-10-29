@@ -152,14 +152,14 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "OPTIONS") { res.writeHead(204); return res.end(); }
   try {
-    if (req.method === "GET" && url.pathname === "/health") return sendJson(res, 200, { ok: true, service: "orbit-chat" });
+    if (req.method === "GET" && url.pathname === "/health") return sendJson(res, 200, { ok: true, service: "orbit-chat", features: { messageReplies: true } });
     if (req.method === "GET" && url.pathname === "/api/events") return live(req, res, url);
     if (req.method === "GET" && url.pathname === "/api/me") return sendJson(res, 200, { user: safeUser(userFor(req)) });
     if (req.method === "GET" && url.pathname === "/api/bootstrap") {
       const who = identity(req, { guestId: url.searchParams.get("guestId") });
       const channel = safeId(url.searchParams.get("channel")) || "global";
       if (!canReadChannel(channel, who)) return sendJson(res, 403, { error: "Join this server from its invite link first." });
-      return sendJson(res, 200, { messages: (store.messages[channel] || []).slice(-250), rooms: store.rooms, parties: store.parties.filter(item => roomMember(item, who)), servers: (store.servers || []).filter(item => roomMember(item, who)).map(publicServer), music: store.music, members: publicMembers(), registeredCount: registeredCount(), memberGoal });
+      return sendJson(res, 200, { messages: (store.messages[channel] || []).slice(-250), rooms: store.rooms, parties: store.parties.filter(item => roomMember(item, who)), servers: (store.servers || []).filter(item => roomMember(item, who)).map(publicServer), music: store.music, members: publicMembers(), registeredCount: registeredCount(), memberGoal, features: { messageReplies: true } });
     }
     if (req.method === "GET" && url.pathname === "/api/messages") {
       const channel = safeId(url.searchParams.get("channel")) || "global", who = identity(req, { guestId: url.searchParams.get("guestId") });
@@ -171,7 +171,16 @@ const server = http.createServer(async (req, res) => {
       if (!content) return sendJson(res, 400, { error: "Write a message first." });
       if (!who) return sendJson(res, 400, { error: "Refresh the page and try again." });
       if (!canReadChannel(channel, who)) return sendJson(res, 403, { error: "Join this server from its invite link first." });
+      let replyTo;
+      if (data.replyTo !== undefined && data.replyTo !== "") {
+        const targetId = safeId(data.replyTo);
+        if (!targetId) return sendJson(res, 400, { error: "Choose a valid message to reply to." });
+        const target = (store.messages[channel] || []).find(item => item.id === targetId);
+        if (!target) return sendJson(res, 400, { error: "That message is no longer available in this conversation. Choose another message to reply to." });
+        replyTo = { id: target.id, user: text(target.user, 32) || "Guest", text: text(target.text, 180) };
+      }
       const message = { id: crypto.randomUUID(), user: user?.name || text(data.guestName, 32) || "Guest", userId: user?.id || "", registered: !!user, emoji: user?.emoji || "✦", text: content, reactions: {}, createdAt: new Date().toISOString() };
+      if (replyTo) message.replyTo = replyTo;
       store.messages[channel] ||= []; store.messages[channel].push(message); store.messages[channel] = store.messages[channel].slice(-250); persist();
       broadcast({ type: "message", channel, message }, item => eventVisible(item, { type: "message", channel }));
       return sendJson(res, 201, { message });
