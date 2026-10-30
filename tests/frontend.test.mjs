@@ -1211,4 +1211,3 @@ test("unused-account removal requires confirmation and retains the account when 
   assert.match(element("#accountDeleteError").textContent, /password did not match/);
   assert.equal(app.state.profile.id, "owner"); assert.equal(app.drafts.global, "Keep my local draft");
 });
-
