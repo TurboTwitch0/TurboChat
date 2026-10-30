@@ -140,6 +140,43 @@ function fixture({ storage = new Map(), request = () => undefined, reducedMotion
   return { app: context.app, element, requests, timers, timerDelays, intervals, storage, listeners, frames, flushFrames, resize, historyChanges, windowEvent: (type, event) => dispatch(windowListeners, type, event), fontEvent: type => dispatch(fontListeners, type), finishFonts: async () => { fontReady.resolve(); await fontReady.promise; } };
 }
 
+test("damaged saved settings open safely and preserve the original before saving a new guest", () => {
+  for (const raw of ["null", "[]", "42", '"old settings"', "{unfinished"]) {
+    const storage = new Map([["orbit.chat.v3", raw]]);
+    const { app, element } = fixture({ storage });
+    app.bind(); app.chooseDrafts(null); app.renderMessages();
+    assert.equal(typeof app.state.guest.id, "string");
+    assert.match(app.state.guest.name, /^Guest /);
+    assert.equal(app.state.storageAvailable, true);
+    assert.equal([...storage].find(([key]) => key.startsWith("orbit.chat.v3.recovery."))?.[1], raw);
+    element("#messageInput").value = "Recovered and ready to chat";
+    app.saveDraft();
+    assert.equal(JSON.parse(storage.get("orbit.chat.v3")).drafts.global, "Recovered and ready to chat");
+  }
+});
+
+test("recovery storage failure keeps the damaged original and new drafts usable in memory", () => {
+  const storage = new Map([["orbit.chat.v3", "null"]]);
+  const { app, element } = fixture({ storage, storageBlocked: true });
+  app.chooseDrafts(null);
+  element("#messageInput").value = "Keep this draft in the tab"; app.saveDraft();
+  assert.equal(storage.get("orbit.chat.v3"), "null");
+  assert.equal(app.state.storageAvailable, false);
+  app.restoreDraft();
+  assert.equal(element("#messageInput").value, "Keep this draft in the tab");
+  assert.equal(element("#draftHint").textContent, "Draft kept in this tab");
+});
+
+test("invalid saved guest details cannot break identity display or replace valid drafts", () => {
+  for (const guest of [42, "old guest", {}, { id: "", name: "" }, { id: "old", name: 17 }]) {
+    const storage = new Map([["orbit.chat.v3", JSON.stringify({ guest, drafts: { global: "Still here" } })]]);
+    const { app, element } = fixture({ storage });
+    app.chooseDrafts(null); app.bind();
+    assert.match(app.state.guest.name, /^Guest /);
+    assert.equal(element("#messageInput").value, "Still here");
+  }
+});
+
 test("a stalled poll times out, releases its lock, and reconnects on the next attempt", async () => {
   const started = deferred(), stalled = deferred(); let attempts = 0;
   const testCase = fixture({ request(record) {
