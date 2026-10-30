@@ -7,8 +7,19 @@
   const appOrigin = API_BASE || location.origin;
   const storageKey = "orbit.chat.v3";
   const VOICE_SAMPLE_RATE = 24000;
-  const saved = (() => { try { return JSON.parse(localStorage.getItem(storageKey) || "{}"); } catch { return {}; } })();
-  const guest = saved.guest || { id: crypto.randomUUID(), name: `Guest ${100 + Math.floor(Math.random() * 900)}` };
+  let damagedSaved = null;
+  const saved = (() => {
+    let raw = null;
+    try {
+      raw = localStorage.getItem(storageKey);
+      if (raw === null) return {};
+      const value = JSON.parse(raw);
+      if (value && typeof value === "object" && !Array.isArray(value)) return value;
+    } catch { /* A damaged record must not prevent opening the app. */ }
+    damagedSaved = raw; return {};
+  })();
+  const validGuest = saved.guest && typeof saved.guest.id === "string" && saved.guest.id.trim() && typeof saved.guest.name === "string" && saved.guest.name.trim();
+  const guest = validGuest ? saved.guest : { id: crypto.randomUUID(), name: `Guest ${100 + Math.floor(Math.random() * 900)}` };
   const defaultRooms = [
     { id: "global", name: "The World", emoji: "◎", color: "#7763d8", type: "channel" },
     { id: "music", name: "Now Playing", emoji: "♫", color: "#a07ae1", type: "channel" },
@@ -77,6 +88,10 @@
   const save = () => {
     if (draftIdentity) { draftBooks[draftIdentity] = { ...drafts }; replyBooks[draftIdentity] = { ...replyDrafts }; }
     try {
+      if (damagedSaved !== null) {
+        localStorage.setItem(`${storageKey}.recovery.${Date.now()}`, damagedSaved);
+        damagedSaved = null;
+      }
       localStorage.setItem(storageKey, JSON.stringify({ guest: state.guest, active: state.active, view: state.view, followingRooms: state.followingRooms, drafts, draftIdentity, draftsByIdentity: draftBooks, replyDrafts, replyDraftsByIdentity: replyBooks, worldHistoryReset, worldHistoryInitialized }));
       state.storageAvailable = true; return true;
     } catch { state.storageAvailable = false; return false; }
@@ -1001,3 +1016,4 @@
   }
   bind(); renderMessages(); updateIdentity(); start();
 })();
+
