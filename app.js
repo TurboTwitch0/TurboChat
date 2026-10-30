@@ -1016,4 +1016,3 @@
   }
   bind(); renderMessages(); updateIdentity(); start();
 })();
-
