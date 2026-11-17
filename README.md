@@ -6,6 +6,8 @@ The readable interface uses one layout stylesheet, `styles.css`, with a 16px def
 
 The create-space menu works on phones and offers community servers, public rooms and private parties. Profile privacy controls can remove an unused account only after password confirmation. A new private party can be removed only by its registered owner when it has no other members or their messages; legacy and shared spaces are protected. Account deletion is refused while messages or server/private-party memberships remain. Local deletion markers are kept in `data/deletions.json`, so retain the whole data directory when backing up the app.
 
+Message tools include a searchable emoji picker on desktop and phones, reactions with a visible selected state, and copy-text controls with a manual fallback when clipboard access is blocked. Emoji insert at the cursor without sending or replacing the rest of your draft. Reaction counts update from the server response; failed or unconfirmed requests keep the last known count and show an error. Explicit HTTP/HTTPS links open in a separate tab; message HTML stays escaped and other URL schemes remain plain text.
+
 The static build writes content-hashed CSS/JavaScript filenames into its HTML and records their SHA-256 values in `asset-manifest.json`. This keeps the page and assets matched on ordinary loads without clearing browser data. Unhashed script/style URLs and empty legacy `brand.css`/`showcase.css` compatibility files remain available for older pages. No service worker is installed by the app.
 
 ## Run

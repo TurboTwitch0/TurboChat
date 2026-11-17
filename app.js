@@ -73,6 +73,35 @@
   const blockedVoicePeers = new Map();
   const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const name = () => state.profile?.name || state.guest.name;
+  const emojiChoices = [
+    ["👋", "Wave hello"], ["💜", "Purple heart love"], ["❤️", "Red heart love"], ["👍", "Thumbs up yes"],
+    ["🙌", "Raised hands celebrate"], ["👏", "Clap applause"], ["🎉", "Party celebration"], ["🔥", "Fire amazing"],
+    ["😂", "Laugh tears of joy"], ["😊", "Smile happy"], ["🥰", "Smiling with hearts"], ["😎", "Cool sunglasses"],
+    ["🤔", "Thinking curious"], ["👀", "Eyes looking"], ["😮", "Surprised wow"], ["😢", "Sad crying"],
+    ["🫶", "Heart hands care"], ["🙏", "Thank you please"], ["💯", "Hundred perfect"], ["✅", "Check done"],
+    ["✨", "Sparkles magic"], ["⭐", "Star favorite"], ["🌈", "Rainbow"], ["🌻", "Sunflower"],
+    ["☕", "Coffee break"], ["🍕", "Pizza food"], ["🎧", "Headphones music"], ["🎵", "Music note song"],
+    ["🎮", "Game controller"], ["🚀", "Rocket launch"], ["🌍", "Earth world"], ["🌙", "Moon night"]
+  ];
+  const reactionRequests = new Set();
+  // Only explicit web URLs become links. All user text and attributes stay escaped.
+  function formatMessageText(value) {
+    const text = String(value ?? ""); let result = "", end = 0;
+    for (const match of text.matchAll(/https?:\/\/[^\s<>"'`]+/gi)) {
+      let link = match[0].replace(/[.,!?;:]+$/, "");
+      for (const [open, close] of [["(", ")"], ["[", "]"]]) {
+        while (link.endsWith(close) && link.split(close).length > link.split(open).length) link = link.slice(0, -1);
+      }
+      result += esc(text.slice(end, match.index));
+      try {
+        const url = new URL(link);
+        if (!url.hostname || url.username || url.password) throw new Error("Not a public web link");
+        result += `<a class="message-link" href="${esc(url.href)}" target="_blank" rel="noopener noreferrer nofollow ugc" title="Open link in a new tab">${esc(link)}</a>`;
+      } catch { result += esc(link); }
+      end = match.index + link.length;
+    }
+    return result + esc(text.slice(end));
+  }
   const drafts = saved.drafts && typeof saved.drafts === "object" && !Array.isArray(saved.drafts) ? saved.drafts : {};
   const draftBooks = saved.draftsByIdentity && typeof saved.draftsByIdentity === "object" && !Array.isArray(saved.draftsByIdentity) ? saved.draftsByIdentity : {};
   const replyDrafts = saved.replyDrafts && typeof saved.replyDrafts === "object" && !Array.isArray(saved.replyDrafts) ? saved.replyDrafts : {};
@@ -299,11 +328,17 @@
     $("#peopleList").innerHTML = members.length ? members.map(item => `<div class="person-card"><span class="avatar">${esc(item.emoji || "✦")}</span><b>${esc(item.name)}</b><small>${item.registered ? "Member" : "Guest"}</small></div>`).join("") : `<div class="empty-state">Invite someone to join you.</div>`;
   }
   function renderMessage(item) {
-    const reactions = Object.entries(item.reactions || {}).map(([emoji, list]) => `<button class="reaction" data-react="${esc(item.id)}" data-emoji="${esc(emoji)}">${esc(emoji)} ${list.length}</button>`).join("");
+    const who = state.profile ? `user-${state.profile.id}` : `guest-${state.guest.id}`;
+    const busy = reactionRequests.has(`${state.active}:${item.id}`);
+    const reactions = Object.entries(item.reactions || {}).filter(([, list]) => Array.isArray(list) && list.length).map(([emoji, list]) => {
+      const mine = list.some(person => person?.id === who), label = emojiChoices.find(choice => choice[0] === emoji)?.[1] || emoji;
+      const people = list.slice(0, 8).map(person => person?.id === who ? "You" : person?.name || "Someone").join(", ");
+      return `<button type="button" class="reaction ${mine ? "is-mine" : ""}" data-react="${esc(item.id)}" data-emoji="${esc(emoji)}" aria-pressed="${mine}" aria-label="${esc(label)}: ${list.length} ${list.length === 1 ? "reaction" : "reactions"}. ${mine ? "Remove your reaction" : "Add your reaction"}" title="${esc(people)}${list.length > 8 ? ` and ${list.length - 8} more` : ""}" ${busy ? "disabled" : ""}>${esc(emoji)} <span>${list.length}</span></button>`;
+    }).join("");
     const stamp = new Date(item.createdAt || Date.now()), reply = replySnapshot(item.replyTo);
     const quote = reply ? `<button type="button" class="message-quote" data-jump-reply="${esc(reply.id)}" aria-label="Go to original message from ${esc(reply.user)}"><span aria-hidden="true">↩</span><b>${esc(reply.user)}</b><span class="quote-text">${esc(reply.text)}</span></button>` : "";
-    const actions = item.pending ? `<span class="message-delivery">Sending…</span>` : item.failed ? `<span class="message-delivery failed">${item.uncertain ? "Delivery unconfirmed" : "Not sent"}</span><button class="retry-message" data-retry-message="${esc(item.id)}">Try again</button>${reply ? `<button class="retry-message" data-retry-plain="${esc(item.id)}">Send without reply</button>` : ""}` : `${reactions}<button class="reaction" data-react="${esc(item.id)}" data-emoji="💜" aria-label="React with a purple heart">💜 +</button>${state.replySupport ? `<button class="reply-link" data-reply="${esc(item.id)}">↩ Reply</button>` : ""}`;
-    return `<article class="message ${item.failed ? "message-failed" : ""}" data-message-id="${esc(item.id)}"><span class="avatar">${esc(item.emoji || "✦")}</span><div class="message-body"><div class="message-meta"><b>${esc(item.user || "Guest")}</b>${item.registered ? `<i>member</i>` : ""}<time datetime="${esc(stamp.toISOString())}" title="${esc(stamp.toLocaleString())}">${new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" }).format(stamp)}</time></div>${quote}<p>${esc(item.text)}</p><div class="message-actions">${actions}</div></div></article>`;
+    const actions = item.pending ? `<span class="message-delivery">Sending…</span>` : item.failed ? `<span class="message-delivery failed">${item.uncertain ? "Delivery unconfirmed" : "Not sent"}</span><button class="retry-message" data-retry-message="${esc(item.id)}">Try again</button>${reply ? `<button class="retry-message" data-retry-plain="${esc(item.id)}">Send without reply</button>` : ""}` : `${reactions}<button type="button" class="message-tool" data-reaction-picker="${esc(item.id)}" aria-label="Choose a reaction" ${busy ? "disabled" : ""}>☺ <span>React</span></button>${state.replySupport ? `<button type="button" class="message-tool" data-reply="${esc(item.id)}">↩ Reply</button>` : ""}<button type="button" class="message-tool" data-copy-message="${esc(item.id)}" aria-label="Copy message text">⧉ <span>Copy</span></button>`;
+    return `<article class="message ${item.failed ? "message-failed" : ""}" data-message-id="${esc(item.id)}"><span class="avatar">${esc(item.emoji || "✦")}</span><div class="message-body"><div class="message-meta"><b>${esc(item.user || "Guest")}</b>${item.registered ? `<i>member</i>` : ""}<time datetime="${esc(stamp.toISOString())}" title="${esc(stamp.toLocaleString())}">${new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" }).format(stamp)}</time></div>${quote}<p>${formatMessageText(item.text)}</p><div class="message-actions">${actions}</div></div></article>`;
   }
   function renderMessages({ scrollToBottom = false } = {}) {
     const current = room(state.active), rawItems = state.messages[state.active] || [], items = visibleMessages(state.active, rawItems);
@@ -471,6 +506,71 @@
     ($(".modal input:not([readonly])") || $(".modal button:not([data-close])") || $("[data-close]")).focus();
   }
   function closeModal() { if (accountBusy) return; $("#modalRoot").innerHTML = ""; $(".app-shell").inert = false; $("#mobileVoice").inert = false; if (modalOpener?.isConnected) modalOpener.focus(); modalOpener = null; }
+  function insertComposerEmoji(emoji, selection) {
+    if (!emojiChoices.some(choice => choice[0] === emoji) || selection.version !== identityVersion || selection.channel !== state.active || !draftsResolved) return false;
+    const input = $("#messageInput"), start = Math.min(selection.start, input.value.length), end = Math.min(selection.end, input.value.length);
+    const value = input.value.slice(0, start) + emoji + input.value.slice(end);
+    if (value.length > 700) { toast("Make a little room first. Messages can be up to 700 characters."); return false; }
+    input.value = value; saveDraft();
+    closeModal(); input.focus(); input.setSelectionRange(start + emoji.length, start + emoji.length);
+    return true;
+  }
+  function emojiPicker(messageId = "") {
+    if (accountBusy) return;
+    const input = $("#messageInput"), channel = state.active, version = identityVersion;
+    const item = messageId && visibleMessages(channel).find(message => message.id === messageId && !message.pending && !message.failed);
+    if (messageId && !item) return;
+    if (!messageId && !draftsResolved) return toast("Your account is still connecting. Try again in a moment.");
+    const selection = { channel, version, start: input.selectionStart ?? input.value.length, end: input.selectionEnd ?? input.value.length };
+    modal(messageId ? "A little reaction goes a long way." : "Find your kind of hello.", messageId ? "Pick a reaction. Tap it again on the message to remove it." : "Choose an emoji to add at your cursor.", `${item ? `<blockquote class="picker-context"><b>${esc(item.user || "Guest")}</b><p>${esc(String(item.text || "").slice(0, 160))}</p></blockquote>` : ""}<label class="emoji-search-label" for="emojiSearch">Search emoji</label><input id="emojiSearch" class="search-input" type="search" placeholder="Try love, laugh, music…" autocomplete="off"><div id="emojiChoices" class="emoji-grid" aria-label="Emoji choices"></div><p id="emojiResultStatus" class="picker-status" role="status"></p>`);
+    const searchInput = $("#emojiSearch"), choices = $("#emojiChoices");
+    const update = () => {
+      const term = searchInput.value.trim().toLowerCase();
+      const matches = emojiChoices.filter(([emoji, label]) => label.toLowerCase().includes(term) || emoji.includes(term));
+      choices.innerHTML = matches.map(([emoji, label]) => `<button type="button" class="emoji-choice" data-choose-emoji="${esc(emoji)}" aria-label="${esc(label)}" title="${esc(label)}">${esc(emoji)}</button>`).join("");
+      $("#emojiResultStatus").textContent = matches.length ? `${matches.length} emoji · ${messageId ? "Choose one to react" : "Added to your draft, ready when you are"}` : "No emoji found. Try another word.";
+    };
+    choices.onclick = event => {
+      const button = event.target.closest("[data-choose-emoji]"); if (!button) return;
+      if (version !== identityVersion || channel !== state.active) { closeModal(); return; }
+      if (messageId) { closeModal(); toggleReaction(messageId, button.dataset.chooseEmoji, channel); }
+      else insertComposerEmoji(button.dataset.chooseEmoji, selection);
+    };
+    searchInput.oninput = update; update(); searchInput.focus();
+  }
+  async function toggleReaction(messageId, emoji, channel = state.active) {
+    const key = `${channel}:${messageId}`, version = identityVersion;
+    const item = visibleMessages(channel).find(message => message.id === messageId && !message.pending && !message.failed);
+    if (!item || reactionRequests.has(key)) return;
+    if (!state.connected) return toast("Reconnect to add a reaction. Your message stays here.");
+    reactionRequests.add(key);
+    const updateButtons = busy => $$("[data-react], [data-reaction-picker]").filter(button => (button.dataset.react || button.dataset.reactionPicker) === messageId).forEach(button => button.disabled = busy);
+    if (channel === state.active) updateButtons(true);
+    try {
+      const result = await api("/api/reactions", { method: "POST", body: JSON.stringify({ channel, messageId, emoji, guestId: state.guest.id, guestName: name() }) });
+      if (version !== identityVersion) return;
+      const current = (state.messages[channel] || []).find(message => message.id === messageId);
+      if (current) current.reactions = result.reactions;
+    } catch (error) { if (version === identityVersion) toast(error.uncertain ? "Reaction not confirmed. Check the message before trying again." : error.message); }
+    finally {
+      reactionRequests.delete(key);
+      if (version === identityVersion && channel === state.active) { updateButtons(false); renderMessages(); }
+    }
+  }
+  async function copyMessage(messageId) {
+    const version = identityVersion, channel = state.active;
+    const item = visibleMessages(channel).find(message => message.id === messageId && !message.pending && !message.failed);
+    if (!item) return;
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("Clipboard unavailable");
+      await navigator.clipboard.writeText(item.text);
+      if (version === identityVersion) toast("Message copied.");
+    } catch {
+      if (version !== identityVersion || channel !== state.active) return;
+      modal("Copy this message.", "Your browser couldn’t use the clipboard. Select the text below and copy it.", `<label for="copyMessageText">Message text</label><textarea id="copyMessageText" class="copy-message-text" rows="5" readonly>${esc(item.text)}</textarea>`);
+      $("#copyMessageText").focus(); $("#copyMessageText").select();
+    }
+  }
   function setAccountBusy(busy) {
     accountBusy = busy;
     $$("#modalRoot button, #modalRoot input, #modalRoot select").forEach(control => control.disabled = busy);
@@ -969,7 +1069,9 @@
         }));
       }
       const track = event.target.closest("[data-track]"); if (track) playBuiltin(track.dataset.track);
-      const react = event.target.closest("[data-react]"); if (react) api("/api/reactions", { method: "POST", body: JSON.stringify({ channel: state.active, messageId: react.dataset.react, emoji: react.dataset.emoji, guestId: state.guest.id, guestName: name() }) }).catch(error => toast(error.message));
+      const react = event.target.closest("[data-react]"); if (react) toggleReaction(react.dataset.react, react.dataset.emoji);
+      const reactionPicker = event.target.closest("[data-reaction-picker]"); if (reactionPicker) emojiPicker(reactionPicker.dataset.reactionPicker);
+      const copy = event.target.closest("[data-copy-message]"); if (copy) copyMessage(copy.dataset.copyMessage);
       const retry = event.target.closest("[data-retry-message]"); if (retry) { const item = (state.messages[state.active] || []).find(item => item.id === retry.dataset.retryMessage); if (item?.failed) sendMessage(item.text, item.id); }
       const retryPlain = event.target.closest("[data-retry-plain]"); if (retryPlain) { const item = (state.messages[state.active] || []).find(item => item.id === retryPlain.dataset.retryPlain); if (item?.failed) sendMessage(item.text, item.id, true); }
       const reply = event.target.closest("[data-reply]"); if (reply) startReply(reply.dataset.reply);
@@ -990,7 +1092,7 @@
     $("#messageInput").oninput = e => { saveDraft(); clearTimeout(typingStopTimer); if (e.currentTarget.value.trim()) { if (!localTyping) { clearTimeout(typingTimer); typingTimer = setTimeout(() => sendTyping(true), 180); } typingStopTimer = setTimeout(() => sendTyping(false), 1600); } else { clearTimeout(typingTimer); sendTyping(false); } };
     $("#messageInput").onkeydown = e => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); clearTimeout(typingTimer); clearTimeout(typingStopTimer); sendTyping(false); sendMessage(e.currentTarget.value); } };
     window.addEventListener("resize", updateComposer);
-    $("#emojiButton").onclick = () => { $("#messageInput").value += "👋"; $("#messageInput").dispatchEvent(new Event("input")); $("#messageInput").focus(); };
+    $("#emojiButton").onclick = () => emojiPicker();
     $("#musicForm").onsubmit = shareMusic; $("#memberSearch").oninput = e => renderMembers(e.target.value.toLowerCase());
     $("#voiceToggle").onclick = $("#voiceTabJoin").onclick = joinVoice; $("#voiceMute").onclick = $("#voiceTabMute").onclick = () => { state.muted = !state.muted; setVoiceDevice(); }; $("#voiceDeafen").onclick = $("#voiceTabDeafen").onclick = () => { state.deafened = !state.deafened; setVoiceDevice(); }; $("#mobileVoice").onclick = () => { state.voiceMobileOpen = !state.voiceMobileOpen; renderVoice(); };
     $$("[data-view]").forEach(button => button.onclick = () => setView(button.dataset.view));

@@ -8,7 +8,7 @@ const source = await readFile(new URL("../app.js", import.meta.url), "utf8");
 const entry = "bind(); renderMessages(); updateIdentity(); start();";
 assert.ok(source.includes(entry), "The test harness must replace only the application startup.");
 // Expose functions in the test-only copy; production does not export internals.
-const testSource = source.replace(entry, "globalThis.app = { state, drafts, canManageParty, partyDeletionModal, accountDeletionModal, profileModal, replyDrafts, startReply, cancelReply, jumpToMessage, renderMessage, chooseDrafts, addMessage, setView, renderRoomList, saveDraft, restoreDraft, selectChannel, pollUpdates, sendMessage, receiveLiveEvent, typingPeers, bind, renderMessages, renderVoice, setConnected, loadChannel, bootstrap, scrollBehavior, renderShowcase, selectShowcase, showcaseKeydown, messageFollow, scrollToLatest, scheduleBottomScroll, handleFeedScroll, pauseMessageFollow, initMessageScrolling, enterMessageRoom, visibleMessages, hideWorldHistory, restoreWorldHistory, api, authModal, refreshIdentity, start, signOut, roomForm };");
+const testSource = source.replace(entry, "globalThis.app = { state, drafts, formatMessageText, insertComposerEmoji, emojiPicker, toggleReaction, copyMessage, canManageParty, partyDeletionModal, accountDeletionModal, profileModal, replyDrafts, startReply, cancelReply, jumpToMessage, renderMessage, chooseDrafts, addMessage, setView, renderRoomList, saveDraft, restoreDraft, selectChannel, pollUpdates, sendMessage, receiveLiveEvent, typingPeers, bind, renderMessages, renderVoice, setConnected, loadChannel, bootstrap, scrollBehavior, renderShowcase, selectShowcase, showcaseKeydown, messageFollow, scrollToLatest, scheduleBottomScroll, handleFeedScroll, pauseMessageFollow, initMessageScrolling, enterMessageRoom, visibleMessages, hideWorldHistory, restoreWorldHistory, api, authModal, refreshIdentity, start, signOut, roomForm };");
 
 // Response metadata is a fixture-only wrapper; application payloads stay unchanged.
 const mockHttp = (data, options = {}) => ({ fixtureResponse: { data, status: 200, ...options } });
@@ -19,7 +19,7 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-function fixture({ storage = new Map(), request = () => undefined, reducedMotion = false, storageBlocked = false, locationSearch = "", replySupport = true } = {}) {
+function fixture({ storage = new Map(), request = () => undefined, reducedMotion = false, storageBlocked = false, locationSearch = "", replySupport = true, navigator = {} } = {}) {
   const elements = new Map(), requests = [], timers = new Map(), timerDelays = new Map(), intervals = new Map(), listeners = new Map(), historyChanges = [];
   const frames = new Map(), windowListeners = new Map(), fontListeners = new Map(), resizeObservers = [], fontReady = deferred();
   let timerId = 0, frameId = 0;
@@ -46,6 +46,8 @@ function fixture({ storage = new Map(), request = () => undefined, reducedMotion
         getAttribute: name => attributes.get(name),
         addEventListener: (type, listener) => addListener(eventListeners, type, listener),
         focus() { this.focused = true; },
+        setSelectionRange(start, end) { this.selectionStart = start; this.selectionEnd = end; },
+        select() { this.selected = true; this.setSelectionRange(0, this.value.length); },
         replaceChildren() { this.innerHTML = ""; },
         scrollTo(options) { this.scrollTop = options.top; this.lastScroll = options; },
         dispatchEvent(event) {
@@ -83,7 +85,7 @@ function fixture({ storage = new Map(), request = () => undefined, reducedMotion
       addEventListener: (type, listener) => listeners.set(type, listener),
       fonts: { ready: fontReady.promise, addEventListener: (type, listener) => addListener(fontListeners, type, listener) }
     },
-    window: { addEventListener: (type, listener) => addListener(windowListeners, type, listener), matchMedia: () => ({ matches: reducedMotion }) }, navigator: {},
+    window: { addEventListener: (type, listener) => addListener(windowListeners, type, listener), matchMedia: () => ({ matches: reducedMotion }) }, navigator,
     setTimeout: (callback, delay) => { timers.set(++timerId, callback); timerDelays.set(timerId, delay); return timerId; },
     clearTimeout: id => { timers.delete(id); timerDelays.delete(id); },
     setInterval: callback => { intervals.set(++timerId, callback); return timerId; },
@@ -1210,4 +1212,193 @@ test("unused-account removal requires confirmation and retains the account when 
   await form.onsubmit({ preventDefault() {}, currentTarget: form });
   assert.match(element("#accountDeleteError").textContent, /password did not match/);
   assert.equal(app.state.profile.id, "owner"); assert.equal(app.drafts.global, "Keep my local draft");
+});
+
+test("message links escape surrounding text and attributes while preserving URL punctuation", () => {
+  const { app } = fixture();
+  const html = app.formatMessageText('<b>Hello</b> https://example.com/find?q=one&next=two, (https://example.org/wiki/Thing_(example)).');
+  assert.match(html, /^&lt;b&gt;Hello&lt;\/b&gt; /);
+  assert.match(html, /href="https:\/\/example\.com\/find\?q=one&amp;next=two"/);
+  assert.match(html, />https:\/\/example\.com\/find\?q=one&amp;next=two<\/a>, /);
+  assert.match(html, /href="https:\/\/example\.org\/wiki\/Thing_\(example\)"/);
+  assert.match(html, /<\/a>\)\.$/);
+  assert.equal((html.match(/<a /g) || []).length, 2);
+  assert.equal((html.match(/target="_blank" rel="noopener noreferrer nofollow ugc"/g) || []).length, 2);
+  const injection = app.formatMessageText('https://example.com/" onclick="alert(1)"><img src=x onerror=bad>');
+  assert.doesNotMatch(injection, /<img|<script|href="[^"]*" onclick=/);
+  assert.match(injection, /&quot; onclick=&quot;alert\(1\)&quot;&gt;&lt;img/);
+});
+
+test("only explicit valid HTTP web links without embedded credentials are clickable", () => {
+  const { app } = fixture();
+  for (const unsafe of ["javascript:alert(1)", "data:text/html,<script>bad()</script>", "ftp://example.com/file", "//example.com/path", "http://user:password@example.com/", "https://someone@example.com/", "https://"]) {
+    assert.doesNotMatch(app.formatMessageText(unsafe), /<a /, unsafe);
+  }
+  const html = app.formatMessageText("HTTP://example.com/path! then https://example.net/ok?");
+  assert.equal((html.match(/<a /g) || []).length, 2);
+  assert.match(html, /href="http:\/\/example\.com\/path"/);
+  assert.match(html, /<\/a>! then /);
+  assert.match(html, /<\/a>\?$/);
+});
+
+test("composer emoji replaces the selected text and persists its draft without dropping a reply", () => {
+  const { app, element, storage, requests } = fixture();
+  app.chooseDrafts(null); app.state.messages.global = [{ id: "emoji-original", user: "Friend", text: "Keep this context" }];
+  app.startReply("emoji-original");
+  const input = element("#messageInput"); input.value = "Hello replace friend"; app.saveDraft();
+  assert.equal(app.insertComposerEmoji("👋", { channel: "global", version: 0, start: 6, end: 13 }), true);
+  assert.equal(input.value, "Hello 👋 friend");
+  assert.equal(input.selectionStart, 8); assert.equal(input.selectionEnd, 8);
+  assert.equal(input.focused, true);
+  assert.equal(app.replyDrafts.global.id, "emoji-original");
+  const saved = JSON.parse(storage.get("orbit.chat.v3"));
+  assert.equal(saved.draftsByIdentity[`guest-${app.state.guest.id}`].global, input.value);
+  assert.equal(saved.replyDraftsByIdentity[`guest-${app.state.guest.id}`].global.id, "emoji-original");
+  assert.equal(requests.length, 0, "choosing emoji must not send a message");
+});
+
+test("emoji insertion respects the full 700-unit message limit without truncating existing text", () => {
+  const { app, element } = fixture(); app.chooseDrafts(null);
+  const input = element("#messageInput"), select = { channel: "global", version: 0, start: 698, end: 698 };
+  input.value = "a".repeat(698); app.saveDraft();
+  assert.equal(app.insertComposerEmoji("👋", select), true);
+  assert.equal(input.value.length, 700); assert.equal(input.value, "a".repeat(698) + "👋");
+  input.value = "b".repeat(699); app.saveDraft(); input.setSelectionRange(699, 699);
+  app.replyDrafts.global = { id: "keep-reply", user: "Friend", text: "Reply stays" };
+  assert.equal(app.insertComposerEmoji("👋", { ...select, start: 699, end: 699 }), false);
+  assert.equal(input.value, "b".repeat(699)); assert.equal(app.drafts.global, input.value);
+  assert.equal(input.selectionStart, 699); assert.equal(app.replyDrafts.global.id, "keep-reply");
+  assert.match(element("#toast").textContent, /700 characters/);
+  input.value = "c".repeat(700); app.saveDraft();
+  assert.equal(app.insertComposerEmoji("👋", { ...select, start: 200, end: 202 }), true);
+  assert.equal(input.value, "c".repeat(200) + "👋" + "c".repeat(498));
+  assert.equal(input.value.length, 700);
+});
+
+test("stale emoji selections cannot write into another account or room's draft", () => {
+  const { app, element } = fixture();
+  const input = element("#messageInput"), selection = { channel: "global", version: 0, start: 0, end: 0 };
+  input.value = "Unresolved account";
+  assert.equal(app.insertComposerEmoji("👋", selection), false);
+  app.chooseDrafts(null); input.value = "Keep this text"; app.saveDraft();
+  for (const [emoji, invalid] of [["👋", { ...selection, version: 1 }], ["👋", { ...selection, channel: "music" }], ["not-an-emoji", selection]]) {
+    assert.equal(app.insertComposerEmoji(emoji, invalid), false);
+    assert.equal(input.value, "Keep this text"); assert.equal(app.drafts.global, "Keep this text");
+  }
+});
+
+test("searchable composer picker uses the captured caret and offers an understandable empty state", () => {
+  const { app, element, requests } = fixture(); app.chooseDrafts(null);
+  const input = element("#messageInput"); input.value = "Play this song"; input.setSelectionRange(5, 9); app.saveDraft();
+  app.emojiPicker();
+  assert.match(element("#modalRoot").innerHTML, /Search emoji/);
+  element("#emojiSearch").value = "no-such-emoji"; element("#emojiSearch").oninput();
+  assert.equal(element("#emojiChoices").innerHTML, ""); assert.match(element("#emojiResultStatus").textContent, /No emoji found/);
+  element("#emojiSearch").value = "MuSiC"; element("#emojiSearch").oninput();
+  assert.match(element("#emojiChoices").innerHTML, /data-choose-emoji="🎵"/);
+  assert.doesNotMatch(element("#emojiChoices").innerHTML, /data-choose-emoji="🍕"/);
+  element("#emojiChoices").onclick({ target: { closest: () => ({ dataset: { chooseEmoji: "🎵" } }) } });
+  assert.equal(input.value, "Play 🎵 song"); assert.equal(input.selectionStart, 7);
+  assert.equal(element("#modalRoot").innerHTML, ""); assert.equal(app.drafts.global, input.value);
+  assert.equal(requests.length, 0);
+});
+
+test("reaction controls identify your prefixed account or guest identity and escape participant names", () => {
+  const { app } = fixture();
+  const item = { id: "reaction-own", text: "Hello", reactions: { "💜": [{ id: `guest-${app.state.guest.id}`, name: "Guest" }, { id: "user-other", name: '<img src=x onerror="bad">' }] } };
+  let html = app.renderMessage(item);
+  assert.match(html, /class="reaction is-mine"/); assert.match(html, /aria-pressed="true"/);
+  assert.match(html, /title="You, &lt;img/); assert.doesNotMatch(html, /<img src=x/);
+  app.state.profile = { id: "registered", name: "Registered" };
+  html = app.renderMessage(item); assert.match(html, /aria-pressed="false"/);
+  item.reactions["💜"] = [{ id: "registered", name: "Incorrect raw id" }];
+  assert.match(app.renderMessage(item), /aria-pressed="false"/);
+  item.reactions["💜"] = [{ id: "user-registered", name: "Registered" }];
+  assert.match(app.renderMessage(item), /aria-pressed="true"/);
+  item.reactions.broken = null;
+  assert.doesNotThrow(() => app.renderMessage(item), "malformed legacy reaction entries must not break the feed");
+});
+
+test("reactions wait for confirmation, block duplicate toggles, and preserve the reading position", async () => {
+  const response = deferred(), started = deferred();
+  const { app, element, requests, flushFrames } = fixture({ request(record) {
+    if (record.url.pathname === "/api/reactions") { started.resolve(); return response.promise; }
+  } });
+  app.chooseDrafts(null); app.state.connected = true; app.state.loading = false; app.state.view = "chat";
+  const original = { id: "reaction-target", user: "Friend", text: "Keep reading", reactions: { "💜": [{ id: "user-friend", name: "Friend" }] } };
+  app.state.messages.global = [original];
+  const feed = element("#messages"); feed.scrollHeight = 5000; feed.clientHeight = 600; feed.scrollTop = 350;
+  app.enterMessageRoom("global");
+  app.messageFollow.pinned = false; app.messageFollow.anchor = { top: 350 };
+  const pending = app.toggleReaction(original.id, "💜"); await started.promise;
+  assert.equal(original.reactions["💜"].length, 1, "no optimistic count before the server confirms");
+  assert.match(app.renderMessage(original), /data-emoji="💜"[^>]*disabled/);
+  await app.toggleReaction(original.id, "💜");
+  assert.equal(requests.filter(record => record.url.pathname === "/api/reactions").length, 1);
+  response.resolve({ reactions: { "💜": [...original.reactions["💜"], { id: `guest-${app.state.guest.id}`, name: "Me" }] } });
+  await pending; flushFrames();
+  assert.equal(app.state.messages.global[0].reactions["💜"].length, 2);
+  assert.match(element("#messageList").innerHTML, /aria-pressed="true"/);
+  assert.doesNotMatch(app.renderMessage(original), /data-emoji="💜"[^>]*disabled/);
+  assert.equal(feed.scrollTop, 350);
+});
+
+test("a rejected reaction keeps existing counts, composer text and reply context", async () => {
+  const { app, element } = fixture({ request(record) {
+    if (record.url.pathname === "/api/reactions") return mockHttp({ error: "That message is no longer here." }, { status: 404 });
+  } });
+  app.chooseDrafts(null); app.state.connected = true; app.state.loading = false;
+  const reactions = { "💜": [{ id: "user-friend", name: "Friend" }] };
+  app.state.messages.global = [{ id: "durable-only", user: "Friend", text: "A visible message", reactions }];
+  app.startReply("durable-only"); element("#messageInput").value = "Keep my unfinished reply"; app.saveDraft();
+  await app.toggleReaction("durable-only", "💜");
+  assert.equal(JSON.stringify(app.state.messages.global[0].reactions), JSON.stringify(reactions));
+  assert.equal(element("#messageInput").value, "Keep my unfinished reply"); assert.equal(app.drafts.global, "Keep my unfinished reply");
+  assert.equal(app.replyDrafts.global.id, "durable-only"); assert.match(element("#toast").textContent, /no longer here/);
+  assert.doesNotMatch(app.renderMessage(app.state.messages.global[0]), /data-emoji="💜"[^>]*disabled/);
+});
+
+test("reaction responses from a previous session cannot alter the next account's cached message", async () => {
+  const response = deferred(), started = deferred();
+  const { app } = fixture({ request(record) {
+    if (record.url.pathname === "/api/reactions") { started.resolve(); return response.promise; }
+  } });
+  app.chooseDrafts(null); app.state.connected = true; app.state.loading = false;
+  app.state.messages.global = [{ id: "shared-message", text: "Earlier session", reactions: {} }];
+  const pending = app.toggleReaction("shared-message", "💜"); await started.promise;
+  await app.refreshIdentity({ id: "next-account", name: "Next account" }, true);
+  app.state.messages.global = [{ id: "shared-message", text: "Current account snapshot", reactions: {} }];
+  response.resolve({ reactions: { "💜": [{ id: "guest-previous", name: "Previous session" }] } });
+  await pending;
+  assert.equal(app.state.profile.id, "next-account");
+  assert.equal(Object.keys(app.state.messages.global[0].reactions).length, 0);
+  assert.equal(app.state.messages.global[0].text, "Current account snapshot");
+});
+
+test("copy sends exact message text to the clipboard and provides escaped manual fallback", async () => {
+  const copied = [], message = { id: "copy-target", text: 'Raw <text> & "quotes"\nSecond line' };
+  const success = fixture({ navigator: { clipboard: { writeText: async text => copied.push(text) } } });
+  success.app.state.messages.global = [message];
+  await success.app.copyMessage(message.id);
+  assert.deepEqual(copied, [message.text]); assert.equal(success.element("#toast").textContent, "Message copied.");
+  assert.equal(success.element("#modalRoot").innerHTML, "");
+  const fallback = fixture(); fallback.app.chooseDrafts(null); fallback.app.state.messages.global = [message];
+  fallback.element("#messageInput").value = "My own draft"; fallback.app.saveDraft();
+  await fallback.app.copyMessage(message.id);
+  assert.match(fallback.element("#modalRoot").innerHTML, /readonly>Raw &lt;text&gt; &amp; &quot;quotes&quot;/);
+  assert.doesNotMatch(fallback.element("#modalRoot").innerHTML, /Raw <text>/);
+  assert.equal(fallback.element("#copyMessageText").selected, true);
+  assert.equal(fallback.element("#messageInput").value, "My own draft"); assert.equal(fallback.app.drafts.global, "My own draft");
+});
+
+test("message tools cannot act on pending, failed or deliberately hidden messages", async () => {
+  const copied = [], { app, element, requests } = fixture({ navigator: { clipboard: { writeText: async text => copied.push(text) } } });
+  app.chooseDrafts(null); app.state.loading = false; app.state.connected = true;
+  app.state.messages.global = [{ id: "hidden-tool-target", text: "Earlier text", createdAt: "2026-10-27T12:00:00Z" }];
+  app.hideWorldHistory();
+  app.state.messages.global.push({ id: "pending-tool-target", text: "Sending", pending: true }, { id: "failed-tool-target", text: "Unsent", failed: true });
+  for (const id of ["hidden-tool-target", "pending-tool-target", "failed-tool-target"]) {
+    app.emojiPicker(id); await app.toggleReaction(id, "💜"); await app.copyMessage(id);
+  }
+  assert.equal(requests.length, 0); assert.deepEqual(copied, []); assert.equal(element("#modalRoot").innerHTML, "");
 });
