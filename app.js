@@ -84,6 +84,11 @@
     ["🎮", "Game controller"], ["🚀", "Rocket launch"], ["🌍", "Earth world"], ["🌙", "Moon night"]
   ];
   const reactionRequests = new Set();
+  const reactionRequestKey = (channel, id) => `${identityVersion}:${channel}:${id}`;
+  const messageTime = new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" });
+  const messageDay = new Intl.DateTimeFormat([], { month: "long", day: "numeric", year: "numeric" });
+  const messageRows = new Map();
+  let messageListRoom, messageListIdentity;
   // Only explicit web URLs become links. All user text and attributes stay escaped.
   function formatMessageText(value) {
     const text = String(value ?? ""); let result = "", end = 0;
@@ -327,18 +332,73 @@
     $("#memberList").innerHTML = members.length ? members.map(row).join("") : `<div class="empty-state">${state.connected ? "You're here first. Say hello." : "Connecting to the chat…"}</div>`;
     $("#peopleList").innerHTML = members.length ? members.map(item => `<div class="person-card"><span class="avatar">${esc(item.emoji || "✦")}</span><b>${esc(item.name)}</b><small>${item.registered ? "Member" : "Guest"}</small></div>`).join("") : `<div class="empty-state">Invite someone to join you.</div>`;
   }
-  function renderMessage(item) {
+  function renderMessageActions(item) {
+    if (item.pending) return '<span class="message-delivery">Sending…</span>';
+    if (item.failed) {
+      const retry = `<button type="button" class="retry-message" data-retry-message="${esc(item.id)}">Try again</button>`;
+      const sendPlain = replySnapshot(item.replyTo) ? `<button type="button" class="retry-message" data-retry-plain="${esc(item.id)}">Send without reply</button>` : "";
+      return `<span class="message-delivery failed">${item.uncertain ? "Delivery unconfirmed" : "Not sent"}</span>${retry}${sendPlain}`;
+    }
     const who = state.profile ? `user-${state.profile.id}` : `guest-${state.guest.id}`;
-    const busy = reactionRequests.has(`${state.active}:${item.id}`);
+    const busy = reactionRequests.has(reactionRequestKey(state.active, item.id));
     const reactions = Object.entries(item.reactions || {}).filter(([, list]) => Array.isArray(list) && list.length).map(([emoji, list]) => {
       const mine = list.some(person => person?.id === who), label = emojiChoices.find(choice => choice[0] === emoji)?.[1] || emoji;
       const people = list.slice(0, 8).map(person => person?.id === who ? "You" : person?.name || "Someone").join(", ");
-      return `<button type="button" class="reaction ${mine ? "is-mine" : ""}" data-react="${esc(item.id)}" data-emoji="${esc(emoji)}" aria-pressed="${mine}" aria-label="${esc(label)}: ${list.length} ${list.length === 1 ? "reaction" : "reactions"}. ${mine ? "Remove your reaction" : "Add your reaction"}" title="${esc(people)}${list.length > 8 ? ` and ${list.length - 8} more` : ""}" ${busy ? "disabled" : ""}>${esc(emoji)} <span>${list.length}</span></button>`;
+      return `<button type="button" class="reaction ${mine ? "is-mine" : ""}" data-react="${esc(item.id)}" data-emoji="${esc(emoji)}" data-action-key="reaction:${esc(emoji)}" aria-pressed="${mine}" aria-label="${esc(label)}: ${list.length} ${list.length === 1 ? "reaction" : "reactions"}. ${mine ? "Remove your reaction" : "Add your reaction"}" title="${esc(people)}${list.length > 8 ? ` and ${list.length - 8} more` : ""}" ${busy ? 'aria-disabled="true"' : ""}>${esc(emoji)} <span>${list.length}</span></button>`;
     }).join("");
-    const stamp = new Date(item.createdAt || Date.now()), reply = replySnapshot(item.replyTo);
+    const picker = `<button type="button" class="message-tool" data-reaction-picker="${esc(item.id)}" data-action-key="react" aria-label="Choose a reaction" aria-haspopup="dialog" ${busy ? 'aria-disabled="true"' : ""}>☺ <span>React</span></button>`;
+    const reply = state.replySupport ? `<button type="button" class="message-tool" data-reply="${esc(item.id)}" data-action-key="reply">↩ Reply</button>` : "";
+    const copy = `<button type="button" class="message-tool" data-copy-message="${esc(item.id)}" data-action-key="copy" aria-label="Copy message text">⧉ <span>Copy</span></button>`;
+    return reactions + picker + reply + copy;
+  }
+  function renderMessage(item, actions = renderMessageActions(item)) {
+    const stamp = new Date(item.createdAt ?? NaN), reply = replySnapshot(item.replyTo);
+    const time = Number.isFinite(stamp.getTime()) ? `<time datetime="${stamp.toISOString()}" title="${esc(stamp.toLocaleString())}">${esc(messageTime.format(stamp))}</time>` : "";
     const quote = reply ? `<button type="button" class="message-quote" data-jump-reply="${esc(reply.id)}" aria-label="Go to original message from ${esc(reply.user)}"><span aria-hidden="true">↩</span><b>${esc(reply.user)}</b><span class="quote-text">${esc(reply.text)}</span></button>` : "";
-    const actions = item.pending ? `<span class="message-delivery">Sending…</span>` : item.failed ? `<span class="message-delivery failed">${item.uncertain ? "Delivery unconfirmed" : "Not sent"}</span><button class="retry-message" data-retry-message="${esc(item.id)}">Try again</button>${reply ? `<button class="retry-message" data-retry-plain="${esc(item.id)}">Send without reply</button>` : ""}` : `${reactions}<button type="button" class="message-tool" data-reaction-picker="${esc(item.id)}" aria-label="Choose a reaction" ${busy ? "disabled" : ""}>☺ <span>React</span></button>${state.replySupport ? `<button type="button" class="message-tool" data-reply="${esc(item.id)}">↩ Reply</button>` : ""}<button type="button" class="message-tool" data-copy-message="${esc(item.id)}" aria-label="Copy message text">⧉ <span>Copy</span></button>`;
-    return `<article class="message ${item.failed ? "message-failed" : ""}" data-message-id="${esc(item.id)}"><span class="avatar">${esc(item.emoji || "✦")}</span><div class="message-body"><div class="message-meta"><b>${esc(item.user || "Guest")}</b>${item.registered ? `<i>member</i>` : ""}<time datetime="${esc(stamp.toISOString())}" title="${esc(stamp.toLocaleString())}">${new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" }).format(stamp)}</time></div>${quote}<p>${formatMessageText(item.text)}</p><div class="message-actions">${actions}</div></div></article>`;
+    return `<article class="message ${item.failed ? "message-failed" : ""}" data-message-id="${esc(item.id)}"><span class="avatar">${esc(item.emoji || "✦")}</span><div class="message-body"><div class="message-meta"><b>${esc(item.user || "Guest")}</b>${item.registered ? "<i>member</i>" : ""}${time}</div>${quote}<p>${formatMessageText(item.text)}</p><div class="message-actions">${actions}</div></div></article>`;
+  }
+  function replaceMessageActions(node, html) {
+    const actions = node.querySelector(".message-actions");
+    const actionKey = button => button && actions.contains(button) ? button.dataset.actionKey : "";
+    const focused = actionKey(document.activeElement), opener = actionKey(modalOpener);
+    actions.innerHTML = html;
+    if (!focused && !opener) return;
+    const buttons = [...actions.querySelectorAll("[data-action-key]")];
+    const findButton = key => buttons.find(button => button.dataset.actionKey === key)
+      || buttons.find(button => button.dataset.actionKey === "react");
+    if (opener) modalOpener = findButton(opener);
+    if (focused) (findButton(focused) || $("#messages")).focus({ preventScroll: true });
+  }
+  // Keep existing rows mounted so a delivery event cannot interrupt reading or tapping an older message.
+  function syncMessageList(list, rows) {
+    if (messageListRoom !== state.active || messageListIdentity !== identityVersion) {
+      list.replaceChildren(); messageRows.clear();
+      messageListRoom = state.active; messageListIdentity = identityVersion;
+    }
+    const keep = new Set(rows.map(row => row.key));
+    for (const [key, row] of messageRows) {
+      if (keep.has(key)) continue;
+      row.node.remove(); messageRows.delete(key);
+    }
+    let cursor = list.firstElementChild;
+    for (const row of rows) {
+      const previous = messageRows.get(row.key);
+      let node = previous?.node;
+      if (!node || previous.html !== row.html) {
+        const template = document.createElement("template");
+        template.innerHTML = row.html;
+        const replacement = template.content.firstElementChild;
+        if (node && node === cursor) cursor = replacement;
+        node?.replaceWith(replacement);
+        node = replacement;
+        if (row.actions !== undefined) node.querySelector(".message-actions").innerHTML = row.actions;
+      } else if (previous.actions !== row.actions) {
+        replaceMessageActions(node, row.actions);
+      }
+      if (node !== cursor) list.insertBefore(node, cursor);
+      cursor = node.nextElementSibling;
+      messageRows.set(row.key, { ...row, node });
+    }
   }
   function renderMessages({ scrollToBottom = false } = {}) {
     const current = room(state.active), rawItems = state.messages[state.active] || [], items = visibleMessages(state.active, rawItems);
@@ -360,18 +420,34 @@
     $("#messageInput").placeholder = `Message ${channelInfo[0]}…`; $("#musicPanel").classList.toggle("hidden", state.active !== "music");
     renderWorldHistory();
     if (!rawItems.length && (state.loading || loadingChannels.has(state.active))) {
-      feed.setAttribute("aria-busy", "true"); list.innerHTML = `<div class="conversation-loading" role="status"><span class="loading-orbit" aria-hidden="true">◌</span><b>Finding your conversations</b><p>A little hello is on its way.</p><div class="skeleton-message"></div><div class="skeleton-message short"></div><div class="skeleton-message"></div></div>`; finish(); return;
+      feed.setAttribute("aria-busy", "true");
+      syncMessageList(list, [{ key: "loading", html: '<div class="conversation-loading" role="status"><span class="loading-orbit" aria-hidden="true">◌</span><b>Finding your conversations…</b><div class="skeleton-message"></div><div class="skeleton-message short"></div><div class="skeleton-message"></div></div>' }]);
+      finish(); return;
     }
     feed.setAttribute("aria-busy", "false");
     if (!rawItems.length && state.channelErrors[state.active]) {
-      list.innerHTML = `<div class="offline-card"><img src="assets/turbochat-mark.svg" alt="" width="60" height="60"><small>LET’S RECONNECT</small><h2>Your conversation can wait.<br>Your words are still here.</h2><p>We couldn’t load this room. ${state.storageAvailable === false ? "Keep this tab open to keep your draft." : "Your draft stays on this device while you reconnect."}</p><p class="connection-detail">${esc(state.channelErrors[state.active])}</p><button data-retry-channel>Try this room again ↻</button></div>`; finish(); return;
+      syncMessageList(list, [{ key: "offline", html: `<div class="offline-card"><img src="assets/turbochat-mark.svg" alt="" width="60" height="60"><h2>Couldn’t load this room</h2><p>${state.storageAvailable === false ? "Keep this tab open to keep your draft." : "Your draft stays on this device while you reconnect."}</p><p class="connection-detail">${esc(state.channelErrors[state.active])}</p><button data-retry-channel>Try this room again ↻</button></div>` }]);
+      finish(); return;
     }
-    const hiddenHistory = state.active === "global" && worldHistoryReset;
-    const greeting = `<div class="welcome-card ${items.length ? "has-history" : "is-empty"}"><span>${esc(channelInfo[2])}</span><div><small>${items.length ? "YOUR CONVERSATION" : "A FRESH START"}</small><h2>${hiddenHistory && !items.length ? "A fresh view of The World." : state.active === "global" ? "Good conversations start with a hello." : `Make yourself at home in ${esc(channelInfo[0])}.`}</h2><p>${items.length ? "Pick up where the conversation left off." : hiddenHistory ? `Earlier texts are hidden in this ${state.storageAvailable === false ? "tab" : "browser"}. New messages will appear here.` : esc(channelInfo[3])}</p>${items.length ? "" : `<div class="empty-actions"><button class="primary-action" data-compose>${hiddenHistory ? "Write a hello" : "Write the first hello"} <span>↗</span></button><button class="text-action" data-search-open>Find another room</button></div><div class="empty-note">Your message is sent only when you press Send.</div>`}</div></div>${items.length ? `<div class="day-label">CONVERSATION HISTORY</div>` : ""}`;
+    const rows = [];
+    if (!items.length) {
+      const hiddenHistory = state.active === "global" && worldHistoryReset;
+      const heading = hiddenHistory ? "You’re starting with a fresh view." : `Start the conversation in ${channelInfo[0]}.`;
+      rows.push({ key: "empty", html: `<div class="welcome-card"><span aria-hidden="true">${esc(channelInfo[2])}</span><div><h2>${esc(heading)}</h2>${hiddenHistory ? "" : `<p>${esc(channelInfo[3])}</p>`}<div class="empty-actions"><button class="primary-action" data-compose>${hiddenHistory ? "Write a hello" : "Write the first hello"}</button><button class="text-action" data-search-open>Find another room</button></div></div></div>` });
+    }
     let previousDay = "";
-    list.innerHTML = greeting + items.map(item => { const date = new Date(item.createdAt || Date.now()), day = date.toLocaleDateString(); const label = day !== previousDay ? `<div class="day-label">${esc(date.toLocaleDateString([], { month: "long", day: "numeric", year: "numeric" }))}</div>` : ""; previousDay = day; return label + renderMessage(item); }).join("");
+    for (const item of items) {
+      const date = new Date(item.createdAt ?? NaN);
+      if (Number.isFinite(date.getTime())) {
+        const day = date.toDateString();
+        if (day !== previousDay) rows.push({ key: `date:${day}`, html: `<div class="day-label">${esc(messageDay.format(date))}</div>` });
+        previousDay = day;
+      }
+      rows.push({ key: `message:${item.id}`, html: renderMessage(item, ""), actions: renderMessageActions(item) });
+    }
+    syncMessageList(list, rows);
     finish();
-    $("#voiceRoomName").textContent = `${channelInfo[0]} voice`; renderVoice();
+    renderVoice();
   }
   function mergeMessages(channel, incoming) {
     const existing = state.messages[channel] || [], byId = new Map(existing.map(item => [item.id, item]));
@@ -430,7 +506,13 @@
       if (data.type === "message") addMessage(data.channel, data.message, notifyUnread);
       if (data.type === "typing" && data.channel === state.active && data.id !== `guest-${state.guest.id}` && data.id !== `user-${state.profile?.id}`) { typingPeers.set(data.id, data.name); renderTyping(); clearTimeout(typingPeers.get(`${data.id}:timer`)); typingPeers.set(`${data.id}:timer`, setTimeout(() => { typingPeers.delete(data.id); renderTyping(); }, 2800)); }
       if (data.type === "typing-stop") { const timer = typingPeers.get(`${data.id}:timer`); if (timer) clearTimeout(timer); typingPeers.delete(data.id); typingPeers.delete(`${data.id}:timer`); if (data.channel === state.active) renderTyping(); }
-      if (data.type === "reaction") { const item = (state.messages[data.channel] || []).find(m => m.id === data.messageId); if (item) { item.reactions = data.reactions; if (state.active === data.channel) renderMessages(); } }
+      if (data.type === "reaction") {
+        const item = (state.messages[data.channel] || []).find(message => message.id === data.messageId);
+        if (item && JSON.stringify(item.reactions || {}) !== JSON.stringify(data.reactions || {})) {
+          item.reactions = data.reactions;
+          if (state.active === data.channel) renderMessages();
+        }
+      }
       if (data.type === "presence") { state.members = data.members || []; state.registered = Number(data.registeredCount) || 1428; renderMembers(); }
       if (data.type === "room" && data.room?.type !== "party" && !state.rooms.some(r => r.id === data.room.id)) { state.rooms.unshift(data.room); renderRoomList(); }
       if (data.type === "server" && data.server) { const index = state.servers.findIndex(server => server.id === data.server.id); if (index < 0) state.servers.unshift(data.server); else state.servers[index] = data.server; renderRoomList(); }
@@ -487,7 +569,7 @@
     clearTyping();
     const tempId = `pending-${crypto.randomUUID()}`, pending = { id: tempId, user: name(), emoji: state.profile?.emoji || "✦", text: content, createdAt: new Date().toISOString(), reactions: {}, pending: true, ...(reply ? { replyTo: reply } : {}) };
     mergeMessages(channel, [pending]); if (state.active === channel) renderMessages({ scrollToBottom: true });
-    try { const result = await api("/api/messages", { method: "POST", body: JSON.stringify({ channel, text: content, guestId: state.guest.id, guestName: name(), ...(reply ? { replyTo: reply.id } : {}) }) }); if (version !== identityVersion) return; state.messages[channel] = (state.messages[channel] || []).filter(item => item.id !== tempId); mergeMessages(channel, [result.message]); if (state.active === channel) renderMessages({ scrollToBottom: true }); }
+    try { const result = await api("/api/messages", { method: "POST", body: JSON.stringify({ channel, text: content, guestId: state.guest.id, guestName: name(), ...(reply ? { replyTo: reply.id } : {}) }) }); if (version !== identityVersion) return; state.messages[channel] = (state.messages[channel] || []).filter(item => item.id !== tempId); mergeMessages(channel, [result.message]); if (state.active === channel) renderMessages(); }
     catch (error) { if (version !== identityVersion) return; const item = (state.messages[channel] || []).find(item => item.id === tempId); if (item) { item.pending = false; item.failed = true; item.uncertain = error.uncertain === true; } if (state.active === channel) renderMessages(); toast(error.uncertain ? `${error.message} Your text is kept above. Check the conversation before using Try again.` : `${error.message} Your message is kept above. Use Try again to resend.`); }
   }
   async function selectChannel(id) {
@@ -518,6 +600,7 @@
   function emojiPicker(messageId = "") {
     if (accountBusy) return;
     const input = $("#messageInput"), channel = state.active, version = identityVersion;
+    if (messageId && reactionRequests.has(reactionRequestKey(channel, messageId))) return;
     const item = messageId && visibleMessages(channel).find(message => message.id === messageId && !message.pending && !message.failed);
     if (messageId && !item) return;
     if (!messageId && !draftsResolved) return toast("Your account is still connecting. Try again in a moment.");
@@ -539,12 +622,18 @@
     searchInput.oninput = update; update(); searchInput.focus();
   }
   async function toggleReaction(messageId, emoji, channel = state.active) {
-    const key = `${channel}:${messageId}`, version = identityVersion;
+    const key = reactionRequestKey(channel, messageId), version = identityVersion;
     const item = visibleMessages(channel).find(message => message.id === messageId && !message.pending && !message.failed);
     if (!item || reactionRequests.has(key)) return;
     if (!state.connected) return toast("Reconnect to add a reaction. Your message stays here.");
     reactionRequests.add(key);
-    const updateButtons = busy => $$("[data-react], [data-reaction-picker]").filter(button => (button.dataset.react || button.dataset.reactionPicker) === messageId).forEach(button => button.disabled = busy);
+    const updateButtons = busy => {
+      const row = messageRows.get(`message:${messageId}`)?.node;
+      for (const button of row?.querySelectorAll("[data-react], [data-reaction-picker]") || []) {
+        if (busy) button.setAttribute("aria-disabled", "true");
+        else button.removeAttribute("aria-disabled");
+      }
+    };
     if (channel === state.active) updateButtons(true);
     try {
       const result = await api("/api/reactions", { method: "POST", body: JSON.stringify({ channel, messageId, emoji, guestId: state.guest.id, guestName: name() }) });

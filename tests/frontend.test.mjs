@@ -30,6 +30,85 @@ function fixture({ storage = new Map(), request = () => undefined, reducedMotion
   const dispatch = (collection, type, event = {}) => {
     for (const listener of collection.get(type) || []) listener({ type, ...event });
   };
+  // Model only the feed's shallow DOM. Browser integration checks native focus;
+  // these nodes let the unit suite detect replacement of otherwise unchanged rows.
+  const firstElementMarkup = html => {
+    const tags = /<\/?([a-z][\w:-]*)\b[^>]*>/gi;
+    const voidTags = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]);
+    let start = -1, depth = 0;
+    for (const match of html.matchAll(tags)) {
+      if (start < 0) start = match.index;
+      if (match[0].startsWith("</")) depth--;
+      else if (!voidTags.has(match[1].toLowerCase()) && !match[0].endsWith("/>")) depth++;
+      if (depth === 0) return { html: html.slice(start, match.index + match[0].length), end: match.index + match[0].length };
+    }
+    return null;
+  };
+  const feedRow = html => {
+    let original = html, actions = null, actionStart = 0, actionEnd = 0;
+    const node = {
+      parentNode: null, dataset: {},
+      querySelectorAll: () => [],
+      querySelector(selector) {
+        if (selector !== ".message-actions" || !/^<article\b/i.test(original)) return null;
+        if (!actions) {
+          const match = /<div\b[^>]*class="message-actions"[^>]*>/.exec(original);
+          if (!match) return null;
+          const block = firstElementMarkup(original.slice(match.index));
+          actionStart = match.index + match[0].length;
+          actionEnd = match.index + block.html.lastIndexOf("</div>");
+          let content = original.slice(actionStart, actionEnd);
+          actions = { updates: 0, contains: () => false, querySelectorAll: () => [] };
+          Object.defineProperty(actions, "innerHTML", { get: () => content, set: value => { content = value; actions.updates++; } });
+        }
+        return actions;
+      },
+      remove() {
+        if (!this.parentNode) return;
+        const siblings = this.parentNode.children, index = siblings.indexOf(this);
+        if (index >= 0) siblings.splice(index, 1);
+        this.parentNode = null;
+      },
+      replaceWith(replacement) { const parent = this.parentNode; if (parent) { parent.insertBefore(replacement, this); this.remove(); } }
+    };
+    for (const [, name, value] of html.slice(0, html.indexOf(">") + 1).matchAll(/data-([\w-]+)="([^"]*)"/g)) node.dataset[name.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = value;
+    Object.defineProperties(node, {
+      outerHTML: { get: () => actions ? original.slice(0, actionStart) + actions.innerHTML + original.slice(actionEnd) : original },
+      innerHTML: {
+        get: () => node.outerHTML.slice(node.outerHTML.indexOf(">") + 1, node.outerHTML.lastIndexOf("</")),
+        set(value) { original = original.slice(0, original.indexOf(">") + 1) + value + original.slice(original.lastIndexOf("</")); actions = null; }
+      },
+      nextElementSibling: { get: () => node.parentNode?.children[node.parentNode.children.indexOf(node) + 1] || null },
+      isConnected: { get: () => !!node.parentNode?.isConnected }
+    });
+    return node;
+  };
+  const feedChildren = node => {
+    node.children = [];
+    node.insertBefore = (child, next) => {
+      if (child === next) return child;
+      assert.ok(next === null || node.children.includes(next), "insertBefore requires a current sibling or null");
+      child.remove?.();
+      const index = next === null ? node.children.length : node.children.indexOf(next);
+      node.children.splice(index, 0, child); child.parentNode = node; return child;
+    };
+    node.replaceChildren = (...children) => {
+      for (const child of node.children) child.parentNode = null;
+      node.children.length = 0;
+      for (const child of children) node.insertBefore(child, null);
+    };
+    Object.defineProperties(node, {
+      firstElementChild: { get: () => node.children[0] || null },
+      innerHTML: {
+        get: () => node.children.map(child => child.outerHTML).join(""),
+        set(html) {
+          node.replaceChildren();
+          let remaining = String(html);
+          for (let parsed; (parsed = firstElementMarkup(remaining)); remaining = remaining.slice(parsed.end)) node.insertBefore(feedRow(parsed.html), null);
+        }
+      }
+    });
+  };
   const element = selector => {
     if (!elements.has(selector)) {
       const classes = new Set(), attributes = new Map(), eventListeners = new Map();
@@ -62,6 +141,7 @@ function fixture({ storage = new Map(), request = () => undefined, reducedMotion
         get: () => Math.min(scrollTop, Math.max(0, node.scrollHeight - node.clientHeight)),
         set: value => { scrollTop = Math.max(0, Math.min(Number(value) || 0, node.scrollHeight - node.clientHeight)); }
       });
+      if (selector === "#messageList") feedChildren(node);
       elements.set(selector, node);
     }
     return elements.get(selector);
@@ -80,6 +160,12 @@ function fixture({ storage = new Map(), request = () => undefined, reducedMotion
     localStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => { if (storageBlocked) throw new Error("Browser storage is unavailable"); storage.set(key, value); } },
     crypto: { randomUUID }, URL, URLSearchParams, console, Event, AbortController, btoa, atob,
     document: {
+      createElement(tag) {
+        assert.equal(tag, "template", "the feed fixture supports inert HTML templates only");
+        const template = { content: { firstElementChild: null } };
+        Object.defineProperty(template, "innerHTML", { set: html => { const parsed = firstElementMarkup(String(html)); template.content.firstElementChild = parsed ? feedRow(parsed.html) : null; } });
+        return template;
+      },
       querySelector: selector => selector === ".modal" ? null : element(selector),
       querySelectorAll: selector => selector === "#showcaseChoices [data-showcase-select]" ? showcaseChoices : selector === "[data-search-mode]" ? searchModes : [],
       addEventListener: (type, listener) => listeners.set(type, listener),
@@ -631,7 +717,7 @@ test("the first successful World history load starts clean once, keeps new arriv
     response.resolve({ messages: old }); await loading;
     assert.equal(app.visibleMessages("global").length, 0);
     assert.equal(app.state.messages.global.length, 1);
-    assert.match(element("#messageList").innerHTML, /A fresh view of The World/);
+    assert.match(element("#messageList").innerHTML, /fresh view/i);
     assert.equal(element("#worldHistoryToggle").textContent, "Restore history");
     assert.equal(JSON.parse(storage.get("orbit.chat.v3")).worldHistoryInitialized, true);
     app.receiveLiveEvent({ type: "message", channel: "global", message: fresh });
@@ -710,7 +796,7 @@ test("World history controls are room-scoped and describe tab-only hiding when s
   app.renderMessages(); element("#worldHistoryToggle").onclick();
   assert.equal(app.visibleMessages("global").length, 0); assert.equal(storage.size, 0);
   assert.match(element("#worldHistoryStatus").textContent, /hidden in this tab/);
-  assert.match(element("#messageList").innerHTML, /Earlier texts are hidden in this tab/);
+  assert.match(element("#worldHistoryStatus").textContent, /Earlier texts hidden in this tab/);
   assert.match(element("#toast").textContent, /hidden in this tab/);
   await app.selectChannel("music");
   assert.equal(element("#worldHistoryBar").classList.contains("hidden"), true);
@@ -1401,4 +1487,113 @@ test("message tools cannot act on pending, failed or deliberately hidden message
     app.emojiPicker(id); await app.toggleReaction(id, "💜"); await app.copyMessage(id);
   }
   assert.equal(requests.length, 0); assert.deepEqual(copied, []); assert.equal(element("#modalRoot").innerHTML, "");
+});
+
+test("live arrivals preserve existing message rows, reply context and the composer draft", () => {
+  const { app, element } = fixture(); app.chooseDrafts(null); app.state.loading = false; app.state.view = "chat";
+  app.state.messages.global = [
+    { id: "mounted-original", user: "Friend", text: "A message I am reading", createdAt: "2026-11-19T12:00:00Z" },
+    { id: "mounted-reply", user: "Another friend", text: "An answer", replyTo: { id: "mounted-original", user: "Friend", text: "A message I am reading" }, createdAt: "2026-11-19T12:01:00Z" }
+  ];
+  app.renderMessages();
+  const list = element("#messageList"), find = id => list.children.find(node => node.dataset.messageId === id);
+  const original = find("mounted-original"), reply = find("mounted-reply"), originalActions = original.querySelector(".message-actions");
+  const replyActions = reply.querySelector(".message-actions"), originalWrites = originalActions.updates;
+  app.startReply("mounted-original"); element("#messageInput").value = "My unfinished reply"; app.saveDraft();
+  app.addMessage("global", { id: "mounted-arrival", user: "New friend", text: "A new hello", createdAt: "2026-11-19T12:02:00Z" });
+  assert.equal(find("mounted-original"), original); assert.equal(find("mounted-reply"), reply);
+  assert.equal(original.isConnected, true); assert.equal(reply.isConnected, true);
+  assert.equal(original.querySelector(".message-actions"), originalActions); assert.equal(originalActions.updates, originalWrites);
+  app.receiveLiveEvent({ type: "reaction", channel: "global", messageId: "mounted-reply", reactions: { "💜": [{ id: "user-friend", name: "Friend" }] } });
+  assert.equal(find("mounted-reply"), reply, "a reaction must update controls without replacing its message body");
+  assert.equal(reply.querySelector(".message-actions"), replyActions);
+  assert.match(reply.outerHTML, /data-jump-reply="mounted-original"/); assert.match(reply.outerHTML, /data-emoji="💜"/);
+  assert.equal(originalActions.updates, originalWrites);
+  assert.equal(element("#messageInput").value, "My unfinished reply"); assert.equal(app.drafts.global, "My unfinished reply");
+  assert.equal(app.replyDrafts.global.id, "mounted-original");
+});
+
+test("identical polling and reaction snapshots leave mounted rows and controls untouched", () => {
+  const { app, element } = fixture(); app.state.loading = false;
+  const message = { id: "unchanged-row", user: "Friend", text: "Keep this mounted", createdAt: "2026-11-19T12:00:00Z", reactions: { "💜": [{ id: "user-friend", name: "Friend" }] } };
+  app.state.messages.global = [message]; app.renderMessages();
+  const list = element("#messageList"), before = [...list.children], row = list.children.find(node => node.dataset.messageId === message.id);
+  const actions = row.querySelector(".message-actions"), writes = actions.updates;
+  for (let count = 0; count < 3; count++) {
+    app.addMessage("global", JSON.parse(JSON.stringify(message)));
+    app.receiveLiveEvent({ type: "reaction", channel: "global", messageId: message.id, reactions: JSON.parse(JSON.stringify(message.reactions)) });
+    app.renderMessages();
+  }
+  assert.deepEqual(list.children, before); assert.equal(row.querySelector(".message-actions"), actions); assert.equal(actions.updates, writes);
+  assert.equal((list.innerHTML.match(/data-message-id=/g) || []).length, 1);
+});
+
+test("history inserted before existing messages changes order without replacing their nodes", () => {
+  const { app, element } = fixture(); app.state.loading = false;
+  app.state.messages.music = [{ id: "later-history", text: "Already visible", createdAt: "2026-11-19T12:00:00Z" }];
+  app.state.active = "music"; app.renderMessages();
+  const list = element("#messageList"), later = list.children.find(node => node.dataset.messageId === "later-history");
+  app.addMessage("music", { id: "earlier-history", text: "Backfilled earlier conversation", createdAt: "2026-11-18T12:00:00Z" });
+  const messages = list.children.filter(node => node.dataset.messageId);
+  assert.deepEqual(messages.map(node => node.dataset.messageId), ["earlier-history", "later-history"]);
+  assert.equal(messages[1], later); assert.equal(later.isConnected, true);
+  assert.match(list.innerHTML, /November 18, 2026/); assert.match(list.innerHTML, /November 19, 2026/);
+});
+
+test("channel and account switches remove previous private DOM while preserving identity-scoped drafts", async () => {
+  const { app, element } = fixture(); app.chooseDrafts(null); app.state.loading = false; app.state.active = "party-mounted";
+  app.state.parties = [{ id: "party-mounted", name: "Private mounted party", type: "party" }];
+  app.state.messages["party-mounted"] = [{ id: "private-mounted", user: "Friend", text: "Private party text", createdAt: "2026-11-19T12:00:00Z" }];
+  app.renderMessages();
+  const list = element("#messageList"), privateNode = list.children.find(node => node.dataset.messageId === "private-mounted");
+  element("#messageInput").value = "Private party draft"; app.saveDraft();
+  await app.selectChannel("music");
+  assert.equal(privateNode.isConnected, false); assert.doesNotMatch(list.innerHTML, /Private party text/);
+  assert.equal(app.drafts["party-mounted"], "Private party draft");
+  await app.selectChannel("party-mounted");
+  assert.equal(element("#messageInput").value, "Private party draft");
+  const reopened = list.children.find(node => node.dataset.messageId === "private-mounted");
+  assert.notEqual(reopened, privateNode); assert.equal(reopened.isConnected, true);
+  await app.refreshIdentity({ id: "next-mounted-account", name: "Next account" }, true);
+  assert.equal(reopened.isConnected, false); assert.doesNotMatch(list.innerHTML, /Private party text/);
+  assert.equal(app.drafts["party-mounted"], undefined); assert.equal(element("#messageInput").value, "");
+});
+
+test("pending and failed delivery updates preserve unrelated message rows and newer reply drafts", async () => {
+  const response = deferred(), started = deferred();
+  const { app, element } = fixture({ request(record) {
+    if (record.url.pathname === "/api/messages" && record.method === "POST") { started.resolve(); return response.promise; }
+  } });
+  app.chooseDrafts(null); app.state.loading = false; app.state.connected = true;
+  app.state.messages.global = [{ id: "unrelated-mounted", user: "Friend", text: "Keep reading this", createdAt: "2026-11-19T12:00:00Z" }];
+  app.renderMessages();
+  const list = element("#messageList"), unrelated = list.children.find(node => node.dataset.messageId === "unrelated-mounted");
+  element("#messageInput").value = "A message in flight"; app.saveDraft();
+  const sending = app.sendMessage(element("#messageInput").value); await started.promise;
+  const pending = app.state.messages.global.find(item => item.pending);
+  assert.match(list.innerHTML, /Sending…/); assert.equal(list.children.find(node => node.dataset.messageId === unrelated.dataset.messageId), unrelated);
+  app.startReply("unrelated-mounted"); element("#messageInput").value = "A newer unsent reply"; app.saveDraft();
+  response.resolve(mockHttp({ error: "Chat could not accept the message." }, { status: 400 })); await sending;
+  assert.equal(list.children.find(node => node.dataset.messageId === unrelated.dataset.messageId), unrelated);
+  assert.equal(app.state.messages.global.find(item => item.id === pending.id).failed, true);
+  assert.match(list.innerHTML, /data-retry-message=/);
+  assert.equal(element("#messageInput").value, "A newer unsent reply"); assert.equal(app.replyDrafts.global.id, "unrelated-mounted");
+});
+
+test("a late send confirmation respects scrolling back into history after pressing Send", async () => {
+  const response = deferred(), started = deferred();
+  const { app, element, flushFrames } = fixture({ request(record) {
+    if (record.url.pathname === "/api/messages" && record.method === "POST") { started.resolve(); return response.promise; }
+  } });
+  app.bind(); app.chooseDrafts(null); app.state.loading = false; app.state.view = "chat"; app.state.connected = true;
+  app.state.messages.global = [{ id: "reading-during-send", text: "Some earlier history", createdAt: "2026-11-19T12:00:00Z" }];
+  const feed = element("#messages"); feed.scrollHeight = 7000; feed.clientHeight = 600;
+  app.renderMessages(); flushFrames();
+  const sending = app.sendMessage("An outgoing message"); await started.promise; flushFrames();
+  feed.dispatchEvent({ type: "wheel", deltaY: -200 }); feed.scrollTop = 400; feed.dispatchEvent({ type: "scroll" });
+  response.resolve({ message: { id: "accepted-after-reading", text: "An outgoing message", createdAt: "2026-11-19T12:01:00Z" } });
+  await sending; flushFrames();
+  assert.equal(feed.scrollTop, 400); assert.equal(app.messageFollow.pinned, false);
+  assert.equal(element("#jumpLatest").classList.contains("hidden"), false);
+  assert.match(element("#messageList").innerHTML, /accepted-after-reading/); assert.doesNotMatch(element("#messageList").innerHTML, /Sending…/);
 });
