@@ -8,7 +8,7 @@ const source = await readFile(new URL("../app.js", import.meta.url), "utf8");
 const entry = "bind(); renderMessages(); updateIdentity(); start();";
 assert.ok(source.includes(entry), "The test harness must replace only the application startup.");
 // Expose functions in the test-only copy; production does not export internals.
-const testSource = source.replace(entry, "globalThis.app = { state, drafts, formatMessageText, insertComposerEmoji, emojiPicker, toggleReaction, copyMessage, canManageParty, partyDeletionModal, accountDeletionModal, profileModal, replyDrafts, startReply, cancelReply, jumpToMessage, renderMessage, chooseDrafts, addMessage, setView, renderRoomList, saveDraft, restoreDraft, selectChannel, pollUpdates, sendMessage, receiveLiveEvent, typingPeers, bind, renderMessages, renderVoice, setConnected, loadChannel, bootstrap, scrollBehavior, renderShowcase, selectShowcase, showcaseKeydown, messageFollow, scrollToLatest, scheduleBottomScroll, handleFeedScroll, pauseMessageFollow, initMessageScrolling, enterMessageRoom, visibleMessages, hideWorldHistory, restoreWorldHistory, api, authModal, refreshIdentity, start, signOut, roomForm };");
+const testSource = source.replace(entry, "globalThis.app = { state, drafts, openRoomDirectory, setMemberPanel, formatMessageText, insertComposerEmoji, emojiPicker, toggleReaction, copyMessage, canManageParty, partyDeletionModal, accountDeletionModal, profileModal, replyDrafts, startReply, cancelReply, jumpToMessage, renderMessage, chooseDrafts, addMessage, setView, renderRoomList, saveDraft, restoreDraft, selectChannel, pollUpdates, sendMessage, receiveLiveEvent, typingPeers, bind, renderMessages, renderVoice, setConnected, loadChannel, bootstrap, scrollBehavior, renderShowcase, selectShowcase, showcaseKeydown, messageFollow, scrollToLatest, scheduleBottomScroll, handleFeedScroll, pauseMessageFollow, initMessageScrolling, enterMessageRoom, visibleMessages, hideWorldHistory, restoreWorldHistory, api, authModal, refreshIdentity, start, signOut, roomForm };");
 
 // Response metadata is a fixture-only wrapper; application payloads stay unchanged.
 const mockHttp = (data, options = {}) => ({ fixtureResponse: { data, status: 200, ...options } });
@@ -135,7 +135,7 @@ function fixture({ storage = new Map(), request = () => undefined, reducedMotion
           dispatch(eventListeners, event.type, detail);
         },
         querySelector: child => element(child.startsWith("#") ? child : `${selector} ${child}`),
-        querySelectorAll: () => []
+        querySelectorAll: child => selector === "#roomDirectoryFilters" && child === "[data-directory-filter]" ? directoryFilters : []
       };
       Object.defineProperty(node, "scrollTop", {
         get: () => Math.min(scrollTop, Math.max(0, node.scrollHeight - node.clientHeight)),
@@ -154,6 +154,9 @@ function fixture({ storage = new Map(), request = () => undefined, reducedMotion
   const searchModes = ["rooms", "messages"].map(mode => {
     const tab = element(`[data-search-mode="${mode}"]`); tab.dataset.searchMode = mode; return tab;
   });
+  const directoryFilters = ["all", "unread", "following"].map(filter => {
+    const button = element(`#roomDirectoryFilters [data-directory-filter="${filter}"]`); button.dataset.directoryFilter = filter; return button;
+  });
   const context = vm.createContext({
     location: { hostname: "orbit.test", protocol: "https:", port: "", origin: "https://orbit.test", pathname: "/", search: locationSearch },
     history: { replaceState: (...args) => historyChanges.push(args) },
@@ -167,7 +170,7 @@ function fixture({ storage = new Map(), request = () => undefined, reducedMotion
         return template;
       },
       querySelector: selector => selector === ".modal" ? null : element(selector),
-      querySelectorAll: selector => selector === "#showcaseChoices [data-showcase-select]" ? showcaseChoices : selector === "[data-search-mode]" ? searchModes : [],
+      querySelectorAll: selector => selector === "#showcaseChoices [data-showcase-select]" ? showcaseChoices : selector === "[data-search-mode]" ? searchModes : selector.includes("[data-directory-filter]") ? directoryFilters : [],
       addEventListener: (type, listener) => listeners.set(type, listener),
       fonts: { ready: fontReady.promise, addEventListener: (type, listener) => addListener(fontListeners, type, listener) }
     },
@@ -327,7 +330,7 @@ test("an unconfirmed send retains its text, warns about delivery, and never retr
   assert.equal(requests.filter(record => record.method === "POST" && record.url.pathname === "/api/messages").length, 1);
 });
 
-test("creating a room or party opens its chat, leaves the old voice room, and preserves the old draft", async () => {
+test("creating a room or party opens its chat while preserving the active call and old draft", async () => {
   for (const isParty of [false, true]) {
     const created = { id: isParty ? "party-created" : "room-created", name: "A new conversation", type: isParty ? "party" : "channel" };
     const { app, element, requests } = fixture({ request: record => record.url.pathname === (isParty ? "/api/parties" : "/api/rooms") ? { room: created, inviteCode: "test-invite" } : undefined });
@@ -336,9 +339,9 @@ test("creating a room or party opens its chat, leaves the old voice room, and pr
     app.roomForm(isParty); element("#roomName").value = created.name; element("#roomTopic").value = "A topic";
     const form = element("#roomForm"); await form.onsubmit({ preventDefault() {}, currentTarget: form });
     assert.equal(app.state.active, created.id); assert.equal(app.state.view, "chat");
-    assert.equal(app.messageFollow.room, created.id); assert.equal(app.state.voiceRoom, "");
+    assert.equal(app.messageFollow.room, created.id); assert.equal(app.state.voiceRoom, "global");
     assert.equal(app.drafts.global, "Keep my World draft"); assert.equal(element("#messageInput").value, "");
-    assert.ok(requests.some(record => record.url.pathname === "/api/voice/leave" && record.body.room === "global"));
+    assert.ok(!requests.some(record => record.url.pathname === "/api/voice/leave"), "opening a text conversation must not hang up an active call");
     assert.ok(requests.some(record => record.url.pathname === "/api/messages" && record.url.searchParams.get("channel") === created.id));
     assert.equal(element("#chatView").classList.contains("hidden"), false);
     if (isParty) assert.match(element("#modalRoot").innerHTML, /Invite someone to A new conversation/);
@@ -1596,4 +1599,162 @@ test("a late send confirmation respects scrolling back into history after pressi
   assert.equal(feed.scrollTop, 400); assert.equal(app.messageFollow.pinned, false);
   assert.equal(element("#jumpLatest").classList.contains("hidden"), false);
   assert.match(element("#messageList").innerHTML, /accepted-after-reading/); assert.doesNotMatch(element("#messageList").innerHTML, /Sending…/);
+});
+
+test("the room directory shows joined spaces with escaped labels and leaves composition untouched", () => {
+  const { app, element, requests } = fixture(); app.chooseDrafts(null); app.state.loading = false; app.state.view = "chat";
+  app.state.rooms = [{ id: "room-directory", name: "A public room", topic: "A public topic", type: "channel" }];
+  app.state.parties = [{ id: "party-directory", name: '<img src=x onerror="bad">', type: "party" }];
+  app.state.servers = [{ id: "server-directory", name: "Design friends", description: "Make things together", channels: [{ id: "channel-directory", name: "studio", type: "text" }, { id: "voice-directory", name: "workshop", type: "voice" }] }];
+  app.state.messages.global = [{ id: "directory-reply", user: "Friend", text: "Keep this reply context" }];
+  app.startReply("directory-reply"); element("#messageInput").value = "Keep my multiline\ndraft"; app.saveDraft();
+  app.openRoomDirectory();
+  const results = element("#roomDirectoryResults").innerHTML;
+  for (const id of ["global", "music", "room-directory", "party-directory", "channel-directory", "voice-directory"]) assert.match(results, new RegExp(`data-directory-room="${id}"`));
+  assert.doesNotMatch(results, /data-channel=|<img src=x/); assert.match(results, /&lt;img src=x/);
+  const selected = /<button\b[^>]*data-directory-room="global"[^>]*>/.exec(results)?.[0];
+  assert.match(selected || "", /aria-current="true"/);
+  assert.equal(app.state.active, "global"); assert.equal(app.state.view, "chat");
+  assert.equal(element("#messageInput").value, "Keep my multiline\ndraft"); assert.equal(app.replyDrafts.global.id, "directory-reply");
+  assert.equal(requests.length, 0);
+});
+
+test("directory search and unread/following filters update live without selecting a room", () => {
+  const { app, element } = fixture(); app.chooseDrafts(null); app.state.loading = false; app.state.view = "chat";
+  app.state.parties = [{ id: "party-filtered", name: "Close friends", type: "party" }];
+  app.state.servers = [{ id: "server-filtered", name: "Design friends", channels: [{ id: "channel-filtered", name: "studio", type: "text" }] }];
+  app.state.followingRooms = ["music", "party-filtered", "party-not-joined"];
+  app.state.unread = { music: 1 }; app.openRoomDirectory();
+  const search = element("#roomDirectorySearch"), results = element("#roomDirectoryResults");
+  const filter = value => element("#roomDirectoryFilters").onclick({ target: { closest: selector => selector === "[data-directory-filter]" ? { dataset: { directoryFilter: value } } : null } });
+  search.value = "DeSiGn"; search.oninput();
+  assert.match(results.innerHTML, /data-directory-room="channel-filtered"/); assert.doesNotMatch(results.innerHTML, /data-directory-room="music"/);
+  search.value = ""; search.oninput(); filter("unread");
+  assert.equal(element('#roomDirectoryFilters [data-directory-filter="unread"]').getAttribute("aria-pressed"), "true");
+  assert.equal(element('#roomDirectoryFilters [data-directory-filter="all"]').getAttribute("aria-pressed"), "false");
+  assert.match(results.innerHTML, /data-directory-room="music"/); assert.doesNotMatch(results.innerHTML, /data-directory-room="travel"/);
+  app.addMessage("travel", { id: "directory-live-unread", user: "Friend", text: "A new postcard" });
+  assert.match(results.innerHTML, /data-directory-room="travel"/, "an open unread list should reflect a new message");
+  filter("following");
+  assert.match(results.innerHTML, /data-directory-room="music"/); assert.match(results.innerHTML, /data-directory-room="party-filtered"/);
+  assert.doesNotMatch(results.innerHTML, /data-directory-room="travel"|party-not-joined/);
+  search.value = "no matching room anywhere"; search.oninput();
+  assert.doesNotMatch(results.innerHTML, /data-directory-room=/);
+  assert.match(results.innerHTML, /no|try|find/i);
+  assert.equal(app.state.active, "global"); assert.equal(app.state.view, "chat");
+});
+
+test("phone and tablet room badges reflect available unread conversations and cap their visible totals", () => {
+  const { app, element } = fixture(); app.state.loading = false; app.state.view = "chat";
+  app.state.unread = { music: 120, travel: 4, "party-not-joined": 30 }; app.renderRoomList();
+  for (const selector of ["#roomDirectoryBadge", "#phoneRoomBadge"]) assert.equal(element(selector).textContent, "99+");
+  for (const selector of ["#roomsButton", "#phoneRooms"]) {
+    assert.match(element(selector).getAttribute("aria-label"), /124/);
+    assert.doesNotMatch(element(selector).getAttribute("aria-label"), /154/);
+  }
+  app.addMessage("music", { id: "badge-live", user: "Friend", text: "A new song" });
+  app.addMessage("music", { id: "badge-live", user: "Friend", text: "A new song" });
+  assert.match(element("#roomsButton").getAttribute("aria-label"), /125/);
+  app.state.unread = {}; app.renderRoomList();
+  for (const selector of ["#roomDirectoryBadge", "#phoneRoomBadge"]) assert.notEqual(element(selector).textContent, "99+", "clearing unread must remove stale totals");
+});
+
+test("directory text selection opens its chat, clears only that unread count and keeps the call", async () => {
+  const { app, element, listeners, requests } = fixture(); app.bind(); app.chooseDrafts(null); app.state.loading = false; app.state.view = "chat";
+  app.state.voiceRoom = "global"; app.state.unread = { music: 2, travel: 3 };
+  element("#messageInput").value = "Keep the World draft"; app.saveDraft(); app.openRoomDirectory();
+  listeners.get("click")({ target: { closest: selector => selector === "[data-directory-room]" ? { dataset: { directoryRoom: "music" } } : null } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(app.state.active, "music"); assert.equal(app.state.view, "chat"); assert.equal(app.state.unread.music || 0, 0); assert.equal(app.state.unread.travel, 3);
+  assert.equal(app.state.voiceRoom, "global"); assert.equal(app.drafts.global, "Keep the World draft"); assert.equal(element("#modalRoot").innerHTML, "");
+  assert.ok(requests.some(record => record.url.pathname === "/api/messages" && record.url.searchParams.get("channel") === "music"));
+  assert.ok(!requests.some(record => record.url.pathname === "/api/voice/leave" || record.url.pathname === "/api/voice/join"));
+});
+
+test("directory voice selection previews voice without moving the text room, draft or active call", async () => {
+  const { app, element, listeners, requests } = fixture(); app.bind(); app.chooseDrafts(null); app.state.loading = false; app.state.view = "chat";
+  app.state.active = "music"; app.state.voiceRoom = "global";
+  app.state.servers = [{ id: "server-voice-directory", name: "Friends", channels: [{ id: "voice-directory-preview", name: "hangout", type: "voice" }] }];
+  element("#messageInput").value = "Keep my music draft"; app.saveDraft(); app.openRoomDirectory();
+  listeners.get("click")({ target: { closest: selector => selector === "[data-directory-room]" ? { dataset: { directoryRoom: "voice-directory-preview" } } : null } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(app.state.view, "voice"); assert.equal(app.state.voiceSelection, "voice-directory-preview"); assert.equal(app.state.active, "music");
+  assert.equal(app.state.voiceRoom, "global"); assert.equal(element("#messageInput").value, "Keep my music draft"); assert.equal(app.drafts.music, "Keep my music draft");
+  assert.match(element("#voiceTabJoin").textContent, /leave current call/i); assert.equal(element("#voiceTabMute").classList.contains("hidden"), true);
+  assert.equal(element("#modalRoot").innerHTML, "");
+  assert.ok(!requests.some(record => record.url.pathname.startsWith("/api/voice/")), "previewing voice must never start or end a call");
+  const selected = app.state.voiceSelection;
+  await app.selectChannel("voice-not-joined");
+  assert.equal(app.state.active, "music"); assert.equal(app.state.voiceSelection, selected);
+});
+
+test("the member panel toggle remembers its preference while preserving chat and voice state", () => {
+  const { app, element, storage, requests, flushFrames } = fixture(); app.bind(); app.chooseDrafts(null); app.state.loading = false; app.state.view = "chat";
+  app.state.voiceRoom = "global"; app.state.messages.global = [{ id: "member-toggle-reading", user: "Friend", text: "Keep this message mounted" }];
+  app.renderMessages(); flushFrames();
+  const list = element("#messageList"), row = list.children.find(node => node.dataset.messageId === "member-toggle-reading");
+  app.startReply("member-toggle-reading"); element("#messageInput").value = "My unfinished reply"; app.saveDraft();
+  const feed = element("#messages"); feed.scrollHeight = 5000; feed.clientHeight = 600; feed.scrollTop = 320;
+  app.messageFollow.pinned = false; app.messageFollow.anchor = { top: 320 };
+  assert.equal(element("#desktopMembers").getAttribute("aria-expanded"), "true");
+  element("#desktopMembers").onclick(); flushFrames();
+  assert.equal(element("#chatView").classList.contains("members-collapsed"), true);
+  assert.equal(element("#desktopMembers").getAttribute("aria-expanded"), "false"); assert.match(element("#desktopMembers").getAttribute("aria-label"), /show/i);
+  assert.equal(JSON.parse(storage.get("orbit.chat.v3")).memberPanelOpen, false);
+  assert.equal(list.children.find(node => node.dataset.messageId === "member-toggle-reading"), row);
+  assert.equal(feed.scrollTop, 320); assert.equal(element("#messageInput").value, "My unfinished reply"); assert.equal(app.replyDrafts.global.id, "member-toggle-reading");
+  assert.equal(app.state.voiceRoom, "global"); assert.equal(requests.length, 0);
+  const reloaded = fixture({ storage }); reloaded.app.bind();
+  assert.equal(reloaded.element("#chatView").classList.contains("members-collapsed"), true); assert.equal(reloaded.element("#desktopMembers").getAttribute("aria-expanded"), "false");
+  reloaded.element("#desktopMembers").onclick();
+  assert.equal(reloaded.element("#chatView").classList.contains("members-collapsed"), false); assert.match(reloaded.element("#desktopMembers").getAttribute("aria-label"), /hide/i);
+});
+
+test("member panel preferences default safely and remain usable when browser storage is blocked", () => {
+  for (const value of [undefined, null, "false", 0]) {
+    const storage = new Map([["orbit.chat.v3", JSON.stringify({ memberPanelOpen: value })]]);
+    const { app, element } = fixture({ storage }); app.bind();
+    assert.equal(element("#chatView").classList.contains("members-collapsed"), false);
+    assert.equal(element("#desktopMembers").getAttribute("aria-expanded"), "true");
+  }
+  const { app, element } = fixture({ storageBlocked: true }); app.bind(); app.chooseDrafts(null);
+  element("#messageInput").value = "Keep writing with storage blocked"; app.saveDraft();
+  assert.doesNotThrow(() => app.setMemberPanel(false)); assert.equal(element("#chatView").classList.contains("members-collapsed"), true);
+  assert.doesNotThrow(() => app.setMemberPanel(true)); assert.equal(element("#chatView").classList.contains("members-collapsed"), false);
+  assert.equal(element("#messageInput").value, "Keep writing with storage blocked"); assert.equal(app.drafts.global, element("#messageInput").value);
+});
+
+test("the voice dock follows the joined call and opens controls without replacing the text draft", async () => {
+  const { app, element, requests } = fixture(); app.bind(); app.chooseDrafts(null); app.state.loading = false; app.state.connected = true; app.state.active = "music";
+  app.renderVoice(); assert.equal(element("#voiceDock").classList.contains("hidden"), true);
+  app.state.voiceRoom = "global"; app.state.voiceSelection = "global"; app.renderVoice();
+  assert.equal(element("#voiceDock").classList.contains("hidden"), false); assert.match(element("#voiceDockRoom").textContent, /World/);
+  assert.equal(element("#phoneVoiceTab").classList.contains("joined"), true);
+  element("#messageInput").value = "Music notes while talking"; app.saveDraft();
+  element("#voiceDockOpen").onclick();
+  assert.equal(app.state.view, "voice"); assert.equal(app.state.active, "music"); assert.equal(app.state.voiceRoom, "global");
+  assert.equal(element("#messageInput").value, "Music notes while talking");
+  element("#voiceDockMute").onclick(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(app.state.muted, true);
+  assert.ok(requests.some(record => record.url.pathname === "/api/voice/state" && record.body.room === "global" && record.body.muted === true));
+  assert.ok(!requests.some(record => record.url.pathname === "/api/voice/join" || record.url.pathname === "/api/voice/leave"));
+  element("#voiceDockLeave").onclick(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(app.state.voiceRoom, ""); assert.equal(element("#voiceDock").classList.contains("hidden"), true); assert.equal(element("#phoneVoiceTab").classList.contains("joined"), false);
+  assert.equal(element("#messageInput").value, "Music notes while talking"); assert.equal(app.drafts.music, "Music notes while talking");
+});
+
+test("directory Enter opens its sole search result and respects IME text confirmation", async () => {
+  const { app, element, requests } = fixture(); app.bind(); app.chooseDrafts(null); app.state.loading = false; app.state.view = "chat";
+  app.state.rooms = [{ id: "room-keyboard-directory", name: "Unique keyboard room", type: "channel" }];
+  element("#messageInput").value = "A draft before searching"; app.saveDraft(); app.openRoomDirectory();
+  const search = element("#roomDirectorySearch"); search.value = "Unique keyboard"; search.oninput();
+  assert.equal(element("#roomDirectoryStatus").textContent, "1 room");
+  let prevented = false;
+  search.onkeydown({ key: "Enter", isComposing: true, preventDefault() { prevented = true; } });
+  assert.equal(prevented, false); assert.equal(app.state.active, "global"); assert.equal(requests.length, 0);
+  search.onkeydown({ key: "Enter", isComposing: false, preventDefault() { prevented = true; } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(prevented, true); assert.equal(app.state.active, "room-keyboard-directory"); assert.equal(app.state.view, "chat");
+  assert.equal(element("#modalRoot").innerHTML, ""); assert.equal(app.drafts.global, "A draft before searching");
+  assert.ok(requests.some(record => record.url.pathname === "/api/messages" && record.url.searchParams.get("channel") === "room-keyboard-directory"));
 });

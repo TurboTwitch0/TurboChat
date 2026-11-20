@@ -34,7 +34,9 @@
     makers: ["The Makers Table", "A friendly corner for things in progress.", "✳", "Show us what you’re making, learning, or figuring out."],
     lounge: ["The Slow Lounge", "A softer room for slower conversations.", "☾", "Take a breath. What’s one good thing from today?"]
   };
-  const state = { guest, profile: null, active: saved.active || "global", view: ["discover", "chat", "people", "voice"].includes(saved.view) ? saved.view : "discover", loading: true, channelErrors: {}, rooms: [], parties: [], servers: [], messages: {}, music: null, members: [], registered: 1428, goal: 1500, followingRooms: Array.isArray(saved.followingRooms) ? saved.followingRooms : [], connected: false, stream: null, peerId: crypto.randomUUID(), voiceRoom: "", joiningVoice: false, voiceMembers: [], muted: false, deafened: false, voiceError: "", voiceMobileOpen: false };
+  const savedRoom = typeof saved.active === "string" ? saved.active : "";
+  const savedVoiceRoom = savedRoom.startsWith("voice-") ? savedRoom : "";
+  const state = { guest, profile: null, active: savedVoiceRoom ? "global" : savedRoom || "global", view: ["discover", "chat", "people", "voice"].includes(saved.view) ? saved.view : "discover", loading: true, channelErrors: {}, rooms: [], parties: [], servers: [], messages: {}, music: null, members: [], registered: 1428, goal: 1500, followingRooms: Array.isArray(saved.followingRooms) ? saved.followingRooms : [], connected: false, stream: null, peerId: crypto.randomUUID(), voiceRoom: "", joiningVoice: false, voiceMembers: [], muted: false, deafened: false, voiceError: "", voiceMobileOpen: false };
   const loadingChannels = new Set();
   let showcaseIndex = 0;
   const showcaseNotes = {
@@ -113,12 +115,14 @@
   const replyBooks = saved.replyDraftsByIdentity && typeof saved.replyDraftsByIdentity === "object" && !Array.isArray(saved.replyDraftsByIdentity) ? saved.replyDraftsByIdentity : {};
   let draftIdentity = typeof saved.draftIdentity === "string" ? saved.draftIdentity : "", accountBusy = false, draftsResolved = false;
   state.unread = {};
+  state.memberPanelOpen = saved.memberPanelOpen !== false;
+  state.voiceSelection = savedVoiceRoom;
   state.replySupport = false;
   state.cleanupSupport = false;
   let worldHistoryReset = saved.worldHistoryReset && Number.isFinite(saved.worldHistoryReset.through) && Array.isArray(saved.worldHistoryReset.ids) ? saved.worldHistoryReset : null;
   let worldHistoryInitialized = saved.worldHistoryInitialized === true || !!worldHistoryReset;
   const messageFollow = { room: null, pinned: true, generation: 0, adjusting: false, frame: null, anchor: null };
-  let identityVersion = 0, modalOpener = null, pollingHasSnapshot = false;
+  let identityVersion = 0, modalOpener = null, pollingHasSnapshot = false, refreshDirectory = null;
   const save = () => {
     if (draftIdentity) { draftBooks[draftIdentity] = { ...drafts }; replyBooks[draftIdentity] = { ...replyDrafts }; }
     try {
@@ -126,7 +130,7 @@
         localStorage.setItem(`${storageKey}.recovery.${Date.now()}`, damagedSaved);
         damagedSaved = null;
       }
-      localStorage.setItem(storageKey, JSON.stringify({ guest: state.guest, active: state.active, view: state.view, followingRooms: state.followingRooms, drafts, draftIdentity, draftsByIdentity: draftBooks, replyDrafts, replyDraftsByIdentity: replyBooks, worldHistoryReset, worldHistoryInitialized }));
+      localStorage.setItem(storageKey, JSON.stringify({ guest: state.guest, active: state.active, view: state.view, memberPanelOpen: state.memberPanelOpen, followingRooms: state.followingRooms, drafts, draftIdentity, draftsByIdentity: draftBooks, replyDrafts, replyDraftsByIdentity: replyBooks, worldHistoryReset, worldHistoryInitialized }));
       state.storageAvailable = true; return true;
     } catch { state.storageAvailable = false; return false; }
   };
@@ -316,13 +320,32 @@
   function renderRoomList() {
     const rooms = allRooms();
     const row = item => `<button class="space-row ${state.active === item.id ? "selected" : ""}" data-channel="${esc(item.id)}"><span style="--tile:${esc(item.color || "#6758ad")}">${esc(item.emoji || "✦")}</span><b>${esc(item.name)}</b>${unreadBadge(item.id)}</button>`;
-    $("#spaceList").innerHTML = [...defaultRooms, ...state.rooms, ...state.parties].map(row).join("");
-    $("#mobileRoomNav").innerHTML = rooms.map(item => `<button class="mobile-room-chip ${state.active === item.id ? "selected" : ""}" data-channel="${esc(item.id)}" title="${esc(item.name)}"><span>${esc(item.emoji || "✦")}</span>${esc(item.serverName ? `${item.serverName} / ${item.name}` : item.name)}${unreadBadge(item.id)}${state.followingRooms.includes(item.id) ? `<i aria-label="Following">★</i>` : ""}</button>`).join("");
+    $("#spaceList").innerHTML = [...defaultRooms, ...state.rooms].map(row).join("");
+    $("#partyList").innerHTML = state.parties.map(row).join("");
+    $("#partySection").classList.toggle("hidden", !state.parties.length);
     const followed = rooms.filter(item => state.followingRooms.includes(item.id));
     $("#followingSection").classList.toggle("hidden", followed.length === 0);
     $("#followingList").innerHTML = followed.map(row).join("");
     $("#serverList").innerHTML = state.servers.map(server => { const isOwner = server.ownerId === state.profile?.id || server.ownerId === `guest-${state.guest.id}`; return `<section class="server-group"><div class="server-heading"><span>${esc(server.emoji || "✳")} ${esc(server.name)}</span><div><button data-server-invite="${esc(server.id)}" title="Invite to ${esc(server.name)}">↗</button>${isOwner ? `<button data-add-channel="${esc(server.id)}" title="Add channel">＋</button>` : ""}</div></div>${(server.channels || []).map(channel => `<button class="space-row server-channel ${state.active === channel.id ? "selected" : ""}" data-channel="${esc(channel.id)}"><span class="channel-type-icon">${channel.type === "voice" ? "◖" : "#"}</span><b>${esc(channel.name)}</b>${unreadBadge(channel.id)}</button>`).join("")}</section>`; }).join("") || `<div class="server-empty">Make a server to gather your people and add text or voice channels.</div>`;
     renderVoiceRooms();
+    const unread = [...new Set(rooms.map(item => item.id))].reduce((total, id) => total + (state.unread[id] || 0), 0);
+    for (const [buttonId, badgeId] of [["#roomsButton", "#roomDirectoryBadge"], ["#phoneRooms", "#phoneRoomBadge"]]) {
+      const badge = $(badgeId);
+      badge.textContent = unread > 99 ? "99+" : unread || "";
+      badge.classList.toggle("hidden", !unread);
+      $(buttonId).setAttribute("aria-label", unread ? `Rooms, ${unread} unread ${unread === 1 ? "message" : "messages"}` : "Rooms");
+    }
+    refreshDirectory?.();
+  }
+  function setMemberPanel(open, remember = true) {
+    state.memberPanelOpen = open;
+    $("#chatView").classList.toggle("members-collapsed", !open);
+    const button = $("#desktopMembers");
+    const label = open ? "Hide members" : "Show members";
+    button.setAttribute("aria-expanded", String(open));
+    button.setAttribute("aria-label", label);
+    button.title = label;
+    if (remember) save();
   }
   function renderMembers(filter = $("#memberSearch").value.toLowerCase()) {
     const members = state.members.filter(item => item.name.toLowerCase().includes(filter));
@@ -417,7 +440,7 @@
     $("#followButton").textContent = isFollowing ? "✓ Following" : "✧ Follow";
     $("#followButton").classList.toggle("following", isFollowing);
     $("#followButton").setAttribute("aria-pressed", String(isFollowing));
-    $("#messageInput").placeholder = `Message ${channelInfo[0]}…`; $("#musicPanel").classList.toggle("hidden", state.active !== "music");
+    $("#musicPanel").classList.toggle("hidden", state.active !== "music");
     renderWorldHistory();
     if (!rawItems.length && (state.loading || loadingChannels.has(state.active))) {
       feed.setAttribute("aria-busy", "true");
@@ -467,11 +490,19 @@
     if (notifyUnread && isNew && !ownMessage && (state.active !== channel || state.view !== "chat")) { state.unread[channel] = (state.unread[channel] || 0) + 1; renderRoomList(); }
     if (changed && state.active === channel) renderMessages();
   }
-  function toggleFollow() {
-    const index = state.followingRooms.indexOf(state.active);
-    if (index < 0) { state.followingRooms.push(state.active); toast(`Following ${room(state.active).name}. Find it in your sidebar.`); }
-    else { state.followingRooms.splice(index, 1); toast(`Unfollowed ${room(state.active).name}.`); }
-    save(); renderRoomList(); renderMessages();
+  function toggleFollow(id = state.active) {
+    const item = allRooms().find(room => room.id === id && room.type !== "voice");
+    if (!item) return;
+    const index = state.followingRooms.indexOf(id);
+    if (index < 0) {
+      state.followingRooms.push(id);
+      toast(`Following ${item.name}.`);
+    } else {
+      state.followingRooms.splice(index, 1);
+      toast(`Unfollowed ${item.name}.`);
+    }
+    save(); renderRoomList();
+    if (id === state.active) renderMessages();
   }
   async function loadChannel(id) {
     const version = identityVersion;
@@ -499,7 +530,7 @@
     const query = new URLSearchParams({ guestId: state.guest.id, name: name(), peerId: state.peerId });
     const stream = new EventSource(`${API_BASE}/api/events?${query}`, { withCredentials: true }); state.stream = stream;
     stream.onopen = () => { clearTimeout(reconnectTimer); setConnected(true, "Live"); };
-    stream.onerror = () => { setConnected(false, "Reconnecting…"); if (state.voiceRoom) leaveVoice(true); };
+    stream.onerror = () => { setConnected(false, "Reconnecting…"); if (state.voiceRoom || state.joiningVoice) leaveVoice(true); };
     stream.addEventListener("update", event => { let data; try { data = JSON.parse(event.data); } catch { return; } receiveLiveEvent(data); });
   }
   function receiveLiveEvent(data, notifyUnread = true) {
@@ -519,13 +550,19 @@
       if (data.type === "music") { state.music = data.track; renderMusic(); }
       if (data.type === "voice" && data.room === (state.voiceRoom || state.joiningVoice)) {
         state.voiceMembers = data.participants || []; renderVoice();
-        if (state.voiceRoom) connectToVoiceMembers(state.voiceMembers).catch(error => { state.voiceError = error.message; renderVoice(); });
+        const generation = voiceConnectionGeneration;
+        if (usePolling && state.voiceRoom) connectToVoiceMembers(state.voiceMembers).catch(error => {
+          if (generation !== voiceConnectionGeneration) return;
+          state.voiceError = error.message; renderVoice();
+        });
       }
       if (data.type === "signal" && data.room === state.voiceRoom && data.to === state.peerId) {
         if ((blockedVoicePeers.get(data.from) || 0) > Date.now()) return;
+        const generation = voiceConnectionGeneration;
         handleVoiceSignal(data).catch(error => {
-        if (error.status === 409) { dropVoicePeer(data.from); return; }
-        state.voiceError = error.message; renderVoice();
+          if (generation !== voiceConnectionGeneration) return;
+          if (error.status === 409) { dropVoicePeer(data.from); return; }
+          state.voiceError = error.message; renderVoice();
         });
       }
   }
@@ -538,11 +575,8 @@
       if (version !== identityVersion) return;
       for (const event of result.events || []) receiveLiveEvent(event, pollingHasSnapshot);
       pollingHasSnapshot = true;
-      if (state.voiceRoom && Date.now() - lastVoiceHeartbeat > 5000) {
-        const voice = await api("/api/voice/join", { method: "POST", body: JSON.stringify({ room: state.voiceRoom, peerId: state.peerId, guestId: state.guest.id, guestName: name() }) });
-        lastVoiceHeartbeat = Date.now(); state.voiceMembers = voice.participants || []; renderVoice();
-        await connectToVoiceMembers(state.voiceMembers);
-      }
+      if (state.voiceRoom) await refreshVoicePresence();
+      if (version !== identityVersion) return;
       const presenceChanged = JSON.stringify(state.members) !== JSON.stringify(result.members || []);
       state.members = result.members || []; state.registered = Number(result.registeredCount) || state.registered; if (presenceChanged) renderMembers();
       if (Date.now() - lastMessageSync > 4500) {
@@ -553,7 +587,7 @@
         lastMessageSync = Date.now();
       }
       lastEventSeq = Math.max(lastEventSeq, Number(result.nextSeq) || 0); setConnected(true, "Live");
-    } catch { setConnected(false, "Reconnecting…"); } finally { polling = false; }
+    } catch { if (version === identityVersion) setConnected(false, "Reconnecting…"); } finally { polling = false; }
   }
   function renderTyping() { const names = [...typingPeers.entries()].filter(([key]) => !key.endsWith(":timer")).map(([, value]) => value); $("#typingIndicator").textContent = names.length ? `${names.slice(0, 2).join(", ")}${names.length > 2 ? ` and ${names.length - 2} others` : names.length === 1 ? " is" : " are"} typing…` : ""; }
   function sendTyping(typing) { if (localTyping === typing) return; localTyping = typing; api("/api/typing", { method: "POST", body: JSON.stringify({ channel: state.active, typing, guestId: state.guest.id, guestName: name() }) }).catch(() => {}); }
@@ -573,21 +607,114 @@
     catch (error) { if (version !== identityVersion) return; const item = (state.messages[channel] || []).find(item => item.id === tempId); if (item) { item.pending = false; item.failed = true; item.uncertain = error.uncertain === true; } if (state.active === channel) renderMessages(); toast(error.uncertain ? `${error.message} Your text is kept above. Check the conversation before using Try again.` : `${error.message} Your message is kept above. Use Try again to resend.`); }
   }
   async function selectChannel(id) {
-    if (!allRooms().some(item => item.id === id)) return;
+    const channel = allRooms().find(item => item.id === id);
+    if (!channel) return;
+    if (channel.type === "voice") return selectVoiceRoom(id);
+    if (id === state.active && state.view === "chat") return loadChannel(id);
     saveDraft(); clearTyping();
-    if (state.voiceRoom && state.voiceRoom !== id) await leaveVoice(true);
     state.active = id; enterMessageRoom(id); save(); restoreDraft(); renderRoomList();
-    if (room(id).type === "voice") { $("#voiceTabRoomName").textContent = room(id).name; setView("voice"); renderVoiceRooms(); return; }
     setView("chat"); renderMessages(); await loadChannel(id);
   }
-  function modal(title, subtitle, body) {
+  function modal(title, subtitle, body, focusSelector) {
+    refreshDirectory = null;
     if (!$("#modalRoot").childElementCount) modalOpener = document.activeElement;
     $("#modalRoot").innerHTML = `<div class="modal-backdrop"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle" aria-describedby="modalDescription"><div class="modal-header"><div class="modal-brand"><img src="assets/turbochat-mark.svg" alt="" width="30" height="30"><span>TurboChat</span></div><button class="modal-close" data-close aria-label="Close dialog">×</button></div><div class="modal-content"><h2 id="modalTitle">${esc(title)}</h2><p id="modalDescription">${esc(subtitle)}</p>${body}</div></section></div>`;
     $(".app-shell").inert = true; $("#mobileVoice").inert = true;
     $("[data-close]").addEventListener("click", closeModal); $(".modal-backdrop").addEventListener("click", e => { if (e.target.classList.contains("modal-backdrop")) closeModal(); });
-    ($(".modal input:not([readonly])") || $(".modal button:not([data-close])") || $("[data-close]")).focus();
+    ((focusSelector && $(focusSelector)) || $(".modal input:not([readonly])") || $(".modal button:not([data-close])") || $("[data-close]")).focus();
   }
-  function closeModal() { if (accountBusy) return; $("#modalRoot").innerHTML = ""; $(".app-shell").inert = false; $("#mobileVoice").inert = false; if (modalOpener?.isConnected) modalOpener.focus(); modalOpener = null; }
+  function closeModal() { if (accountBusy) return; refreshDirectory = null; $("#modalRoot").innerHTML = ""; $(".app-shell").inert = false; $("#mobileVoice").inert = false; if (modalOpener?.isConnected) modalOpener.focus(); modalOpener = null; }
+  function openRoomDirectory() {
+    if (accountBusy) return;
+    const filters = [["all", "All rooms"], ["unread", "Unread"], ["following", "Following"]];
+    modal("Rooms", "Open a conversation or a voice room.", `
+      <div class="room-directory">
+        <div class="directory-toolbar">
+          <input id="roomDirectorySearch" type="search" aria-label="Filter rooms and servers" placeholder="Search rooms and servers" autocomplete="off">
+          <button type="button" id="directoryCreate" class="directory-create">＋ Create</button>
+        </div>
+        <div id="roomDirectoryFilters" class="directory-filters" role="group" aria-label="Show rooms">
+          ${filters.map(([id, label]) => `<button type="button" class="directory-filter" data-directory-filter="${id}" aria-pressed="${id === "all"}">${label}</button>`).join("")}
+        </div>
+        <p id="roomDirectoryStatus" class="directory-status" role="status"></p>
+        <div id="roomDirectoryResults"></div>
+      </div>`,
+    window.matchMedia?.("(max-width: 760px)").matches ? '[data-directory-filter="all"]' : "#roomDirectorySearch");
+
+    const input = $("#roomDirectorySearch"), results = $("#roomDirectoryResults"), buttons = $("#roomDirectoryFilters");
+    let mode = "all", previousMarkup = "", matches = [];
+    const render = () => {
+      const term = input.value.trim().toLowerCase();
+      const available = [...new Map(allRooms().map(item => [item.id, item])).values()];
+      matches = available.filter(item => {
+        if (mode === "unread" && !state.unread[item.id]) return false;
+        if (mode === "following" && !state.followingRooms.includes(item.id)) return false;
+        return !term || [item.name, item.serverName, item.topic].some(value => String(value || "").toLowerCase().includes(term));
+      });
+      for (const button of buttons.querySelectorAll("[data-directory-filter]")) {
+        const selected = button.dataset.directoryFilter === mode;
+        button.classList.toggle("active", selected);
+        button.setAttribute("aria-pressed", String(selected));
+      }
+      const groups = new Map();
+      for (const item of matches) {
+        const key = item.serverId ? `server:${item.serverId}` : item.type === "party" ? "parties" : "public";
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(item);
+      }
+      const section = (key, items) => {
+        const server = state.servers.find(server => `server:${server.id}` === key);
+        const heading = server?.name || (key === "parties" ? "Private parties" : "Public rooms");
+        const owned = server && [state.profile?.id, `guest-${state.guest.id}`].includes(server.ownerId);
+        const invite = server ? `<button type="button" data-server-invite="${esc(server.id)}" aria-label="Invite to ${esc(server.name)}">Invite</button>` : "";
+        const create = owned ? `<button type="button" data-add-channel="${esc(server.id)}" aria-label="Add channel to ${esc(server.name)}">＋ Channel</button>` : "";
+        return `<section class="directory-section"><div class="directory-heading"><h3>${esc(heading)}</h3><div class="directory-actions">${invite}${create}</div></div>${items.map(roomRow).join("")}</section>`;
+      };
+      const roomRow = item => {
+        const voice = item.type === "voice";
+        const current = voice ? state.view === "voice" && (state.voiceSelection || state.voiceRoom) === item.id : state.active === item.id;
+        const following = state.followingRooms.includes(item.id);
+        const details = voice ? "Voice" : item.type === "party" ? "Private chat" : item.serverId ? "Text channel" : "Public chat";
+        const follow = voice ? "" : `<button type="button" class="directory-follow" data-directory-follow="${esc(item.id)}" aria-pressed="${following}" aria-label="Follow ${esc(item.name)}" title="${following ? "Unfollow" : "Follow"} ${esc(item.name)}">${following ? "★" : "☆"}</button>`;
+        return `<div class="directory-entry"><button type="button" class="directory-row" data-directory-room="${esc(item.id)}"${current ? ' aria-current="true"' : ""}><span class="directory-glyph" aria-hidden="true">${esc(item.emoji || "#")}</span><span class="directory-name"><b>${esc(item.name)}</b><small class="directory-meta">${details}${following ? " · Following" : ""}</small></span>${unreadBadge(item.id)}<span class="directory-arrow" aria-hidden="true">›</span></button>${follow}</div>`;
+      };
+      const empty = term ? "No matching rooms." : mode === "unread" ? "You’re caught up." : "Star a room to add it to Following.";
+      const markup = matches.length ? [...groups].map(([key, items]) => section(key, items)).join("") : `<p class="directory-empty">${empty}</p>`;
+      if (markup !== previousMarkup) {
+        const focused = document.activeElement;
+        const focusedControl = Object.entries(focused?.dataset || {}).find(([key]) => key === "directoryRoom" || key === "directoryFollow");
+        results.innerHTML = markup;
+        previousMarkup = markup;
+        if (focusedControl) {
+          const [key, id] = focusedControl;
+          const replacement = [...results.querySelectorAll("[data-directory-room], [data-directory-follow]")].find(button => button.dataset[key] === id);
+          // When a room is unfollowed in the Following filter, keep the user in the results controls.
+          (replacement || buttons.querySelector(".active") || input).focus({ preventScroll: true });
+        }
+      }
+      const status = $("#roomDirectoryStatus");
+      const count = `${matches.length} ${matches.length === 1 ? "room" : "rooms"}`;
+      if (status.textContent !== count) status.textContent = count;
+    };
+    input.oninput = render;
+    input.onkeydown = event => {
+      if (event.key !== "Enter" || event.isComposing || matches.length !== 1) return;
+      event.preventDefault(); openDirectoryRoom(matches[0].id);
+    };
+    buttons.onclick = event => {
+      const next = event.target.closest("[data-directory-filter]")?.dataset.directoryFilter;
+      if (!filters.some(([id]) => id === next)) return;
+      mode = next; render();
+    };
+    $("#directoryCreate").onclick = createRoomMenu;
+    refreshDirectory = render;
+    render();
+  }
+  function openDirectoryRoom(id) {
+    if (!allRooms().some(item => item.id === id)) return;
+    closeModal();
+    return selectChannel(id);
+  }
   function insertComposerEmoji(emoji, selection) {
     if (!emojiChoices.some(choice => choice[0] === emoji) || selection.version !== identityVersion || selection.channel !== state.active || !draftsResolved) return false;
     const input = $("#messageInput"), start = Math.min(selection.start, input.value.length), end = Math.min(selection.end, input.value.length);
@@ -818,9 +945,9 @@
   async function refreshIdentity(profile, resetChannel = false) {
     clearTimeout(reconnectTimer); saveDraft(); clearTyping(); identityVersion++; state.stream?.close(); clearInterval(pollTimer);
     const version = identityVersion; let synced = false;
-    if (state.voiceRoom) await leaveVoice(true);
+    if (state.voiceRoom || state.joiningVoice) await leaveVoice(true);
     if (version !== identityVersion) return false;
-    state.profile = profile; if (resetChannel) state.active = "global"; chooseDrafts(profile);
+    state.profile = profile; state.voiceSelection = ""; if (resetChannel) state.active = "global"; chooseDrafts(profile);
     state.messages = {}; state.parties = []; state.servers = []; state.members = []; state.unread = {}; lastEventSeq = 0; lastHeartbeat = 0; lastMessageSync = 0;
     state.loading = true; setConnected(false, "Loading conversations…");
     updateIdentity(); renderRoomList(); renderMessages(); renderMembers();
@@ -836,7 +963,7 @@
     let signedOut = false, synced = false;
     try {
       saveDraft(); clearTyping();
-      if (state.voiceRoom) await leaveVoice(true);
+      if (state.voiceRoom || state.joiningVoice) await leaveVoice(true);
       await api("/api/logout", { method: "POST", body: "{}" });
       signedOut = true; synced = await refreshIdentity(null, true);
     } catch (error) { toast(error.message); }
@@ -866,16 +993,35 @@
     try { const result = await api("/api/music", { method: "POST", body: JSON.stringify({ title: $("#musicTitle").value.trim(), url: $("#musicUrl").value.trim(), guestName: name() }) }); state.music = result.track; renderMusic(); event.currentTarget.reset(); toast("Song shared in Now Playing."); }
     catch (error) { toast(error.message); } finally { button.disabled = false; }
   }
-  function renderVoiceRooms() {
-    const rooms = allRooms();
-    $("#voiceRoomList").innerHTML = rooms.map(item => `<button class="voice-room-option ${state.active === item.id ? "selected" : ""}" data-voice-room="${esc(item.id)}"><span>${esc(item.emoji || "✦")}</span><b>${esc(item.name)}</b><small>${state.voiceRoom === item.id ? "● In voice" : "Open room"}</small></button>`).join("");
+  function voiceTabRoom(rooms = allRooms()) {
+    return [state.voiceSelection, state.voiceRoom, state.joiningVoice, state.active].find(id => rooms.some(item => item.id === id)) || "global";
   }
-  async function selectVoiceRoom(id) {
-    await selectChannel(id); renderVoice();
+  let voiceRoomListMarkup = "";
+  function renderVoiceRooms() {
+    const rooms = allRooms(), selectedRoom = voiceTabRoom(rooms);
+    const list = $("#voiceRoomList");
+    const markup = rooms.map(item => {
+      const selected = selectedRoom === item.id;
+      const label = state.voiceRoom === item.id ? "In call" : selected ? "Selected" : "";
+      const name = item.serverName ? `${item.serverName} / ${item.name}` : item.name;
+      return `<button type="button" class="voice-room-option ${selected ? "selected" : ""}" data-voice-room="${esc(item.id)}" aria-pressed="${selected}"><span aria-hidden="true">${esc(item.emoji || "✦")}</span><b>${esc(name)}</b>${label ? `<small>${label}</small>` : ""}</button>`;
+    }).join("");
+    if (markup === voiceRoomListMarkup) return;
+    const focused = document.activeElement?.dataset?.voiceRoom;
+    list.innerHTML = markup;
+    voiceRoomListMarkup = markup;
+    if (focused) [...list.querySelectorAll("[data-voice-room]")].find(button => button.dataset.voiceRoom === focused)?.focus({ preventScroll: true });
+  }
+  function selectVoiceRoom(id) {
+    if (!allRooms().some(item => item.id === id)) return;
+    if (state.voiceSelection !== id && !state.voiceRoom) state.voiceError = "";
+    state.voiceSelection = id;
+    setView("voice");
+    renderVoice();
   }
   function renderHeader() {
     const current = room(state.active), details = info[state.active] || [current.name, current.topic || "Come in and say hello.", current.emoji || "✦"];
-    const headings = { discover: ["Explore TurboChat", "Find your people. Keep the conversation going.", "✳"], people: ["Your people", "Good conversations bring us a little closer.", "♧"] };
+    const headings = { discover: ["Explore TurboChat", "Find your people. Keep the conversation going.", "✳"], people: ["Your people", "See who’s online and invite friends.", "♧"], voice: ["Voice chat", "Choose a room and join when you’re ready.", "◖"] };
     const heading = headings[state.view] || details;
     $("#channelTitle").textContent = heading[0]; $("#channelSubtitle").textContent = heading[1]; $("#channelGlyph").textContent = heading[2];
   }
@@ -885,28 +1031,87 @@
     state.view = view; $(".main-panel").dataset.view = view; save(); renderHeader();
     if (view === "chat" && state.unread[state.active]) { delete state.unread[state.active]; renderRoomList(); }
     ["discover", "chat", "people", "voice"].forEach(name => $(`#${name}View`).classList.toggle("hidden", name !== view));
-    $("#mobileRoomNav").classList.toggle("is-hidden", view !== "chat");
     $$('[data-view]').forEach(button => { button.classList.toggle("active", button.dataset.view === view); button.setAttribute("aria-pressed", String(button.dataset.view === view)); });
     if (view === "voice") renderVoiceRooms();
     updateJumpLatest();
-    if (view === "chat" && previousView !== "chat") scrollToLatest();
+    if (view === "chat" && previousView !== "chat") {
+      if (messageFollow.pinned) scrollToLatest(false);
+      else restoreReadingAnchor(messageFollow.anchor);
+    }
   }
   function renderVoice() {
-    const self = !!state.voiceRoom, others = state.voiceMembers.filter(item => item.peerId !== state.peerId);
-    const status = state.voiceError || (!state.connected ? "Connect to chat first" : !self ? "Join voice to start talking" : usePolling ? `Peer voice connected · ${others.length ? `${others.length} ${others.length === 1 ? "person" : "people"} here` : "waiting for someone"}` : relaySocket?.readyState === WebSocket.OPEN ? `Voice audio connected · ${others.length ? `${others.length} ${others.length === 1 ? "person" : "people"} here` : "waiting for someone"}` : "Connecting voice audio…");
-    const participants = self ? state.voiceMembers.map(item => `<span class="voice-person ${(item.peerId === state.peerId ? state.muted || state.deafened : item.muted || item.deafened) ? "muted" : ""}">${item.muted || item.deafened ? "⌁" : "◖"} ${esc(item.name)}${item.peerId === state.peerId ? " (you)" : ""}</span>`).join("") : "";
-    $("#voiceRoomName").textContent = `${room(state.active).name} voice`; $("#voiceToggle").textContent = state.joiningVoice ? "Joining…" : self ? "Leave voice" : "Join voice";
-    $("#voiceToggle").disabled = state.joiningVoice || (!state.connected && !self); $("#voiceMute").classList.toggle("hidden", !self); $("#voiceDeafen").classList.toggle("hidden", !self);
-    $("#voiceMute").textContent = state.muted ? "Unmute" : "Mute"; $("#voiceDeafen").textContent = state.deafened ? "Undeafen" : "Deafen"; $("#voiceStatus").textContent = status;
-    $("#voiceDot").classList.toggle("active", self || state.voiceMembers.length > 0); $("#mobileVoiceCount").textContent = state.voiceMembers.length;
-    $("#rightPanel").classList.toggle("mobile-open", state.voiceMobileOpen); $("#voiceParticipants").innerHTML = participants;
+    const joined = Boolean(state.voiceRoom);
+    const sideRoom = state.voiceRoom || state.joiningVoice || state.active;
+    const tabRoom = voiceTabRoom();
+    const showTabControls = joined && state.voiceRoom === tabRoom;
+    const otherCall = joined && !showTabControls;
+    const others = state.voiceMembers.filter(item => item.peerId !== state.peerId).length;
+    const relayReady = relaySocket && relaySocket.readyState === window.WebSocket?.OPEN;
+    const peerAudioReady = [...voicePeers.values()].some(peer => peer.connectionState === "connected");
+    const audioReady = joined && (usePolling ? peerAudioReady : relayReady);
+    let audioLabel = "Connecting audio…";
+    if (audioReady) audioLabel = "Voice connected";
+    else if (usePolling) audioLabel = others ? "Connecting to callers…" : "Waiting for someone";
+    if (!state.connected) audioLabel = "Chat reconnecting";
+    else if (state.voiceError) audioLabel = "Voice needs attention";
+    const roomRoster = others ? `${others} ${others === 1 ? "person" : "people"} here` : "waiting for someone";
+    let status = "Join voice to start talking";
+    if (state.voiceError) status = state.voiceError;
+    else if (state.joiningVoice) status = `Joining ${room(state.joiningVoice).name}…`;
+    else if (joined) status = audioReady && state.connected ? `${audioLabel} · ${roomRoster}` : audioLabel;
+    else if (!state.connected) status = "Connect to chat first";
+    const participants = joined ? state.voiceMembers.map(item => {
+      const self = item.peerId === state.peerId;
+      const muted = self ? state.muted || state.deafened : item.muted || item.deafened;
+      return `<span class="voice-person${muted ? " muted" : ""}">${muted ? "⌁" : "◖"} ${esc(item.name)}${self ? " (you)" : ""}</span>`;
+    }).join("") : "";
+    const unavailable = Boolean(state.joiningVoice) || (!state.connected && !joined);
+    const joinLabel = state.joiningVoice ? "Joining…" : joined ? "Leave voice" : "Join voice";
+    const muteLabel = state.muted ? "Unmute" : "Mute";
+    const deafenLabel = state.deafened ? "Undeafen" : "Deafen";
+
+    $("#voiceRoomName").textContent = `${room(sideRoom).name} voice`;
+    $("#voiceToggle").textContent = joinLabel;
+    $("#voiceToggle").disabled = unavailable;
+    $("#voiceMute").classList.toggle("hidden", !joined);
+    $("#voiceDeafen").classList.toggle("hidden", !joined);
+    $("#voiceMute").textContent = muteLabel;
+    $("#voiceDeafen").textContent = deafenLabel;
+    $("#voiceStatus").textContent = status;
+    $("#voiceDot").classList.toggle("active", joined);
+    $("#mobileVoiceCount").textContent = state.voiceMembers.length;
+    $("#rightPanel").classList.toggle("mobile-open", state.voiceMobileOpen);
+    $("#voiceParticipants").innerHTML = participants;
     $("#mobileVoice").setAttribute("aria-expanded", String(state.voiceMobileOpen));
     $("#mobileVoice").setAttribute("aria-label", state.voiceMobileOpen ? "Hide voice controls" : "Show voice controls");
-    $("#voiceTabRoomName").textContent = `${room(state.active).name} voice`; $("#voiceTabStatus").textContent = status; $("#voiceTabDot").classList.toggle("active", self);
-    $("#voiceTabParticipants").innerHTML = participants || `<p>${self ? "You’re connected. Waiting for someone to join." : "It’s quiet here. Be the first to join."}</p>`;
-    $("#voiceTabJoin").textContent = state.joiningVoice ? "Joining…" : self ? "Leave voice" : "Join voice"; $("#voiceTabJoin").disabled = state.joiningVoice || (!state.connected && !self);
-    $("#voiceTabMute").classList.toggle("hidden", !self); $("#voiceTabDeafen").classList.toggle("hidden", !self); $("#voiceTabMute").textContent = state.muted ? "Unmute" : "Mute"; $("#voiceTabDeafen").textContent = state.deafened ? "Undeafen" : "Deafen";
-    $("#mobileVoice").classList.toggle("joined", self); $(".voice-wave").classList.toggle("is-active", self && !state.muted && !state.deafened && !state.voiceError); renderVoiceRooms();
+    $("#mobileVoice").classList.toggle("joined", joined);
+
+    $("#voiceTabRoomName").textContent = `${room(tabRoom).name} voice`;
+    $("#voiceTabStatus").textContent = otherCall ? `You’re in ${room(state.voiceRoom).name}. Leave that call to join this room.` : status;
+    $("#voiceTabDot").classList.toggle("active", showTabControls);
+    $("#voiceTabParticipants").innerHTML = (showTabControls && participants) || `<p>${showTabControls ? "Waiting for someone to join." : otherCall ? "Your current call is still open." : "Your call starts when you join."}</p>`;
+    $("#voiceTabJoin").textContent = otherCall ? "Leave current call" : joinLabel;
+    $("#voiceTabJoin").disabled = unavailable;
+    $("#voiceTabMute").classList.toggle("hidden", !showTabControls);
+    $("#voiceTabDeafen").classList.toggle("hidden", !showTabControls);
+    $("#voiceTabMute").textContent = muteLabel;
+    $("#voiceTabDeafen").textContent = deafenLabel;
+    $(".voice-wave").classList.toggle("is-active", showTabControls && !state.muted && !state.deafened && !state.voiceError);
+
+    $("#voiceDock").classList.toggle("hidden", !joined);
+    $("#voiceDock").classList.toggle("voice-warning", joined && Boolean(state.voiceError || !state.connected));
+    $("#voiceDockRoom").textContent = joined ? room(state.voiceRoom).name : "";
+    let dockStatus = audioLabel;
+    if (joined && state.connected && !state.voiceError) {
+      if (state.deafened) dockStatus = "Deafened";
+      else if (state.muted) dockStatus = "Mic muted";
+    }
+    $("#voiceDockStatus").textContent = joined ? dockStatus : "";
+    $("#voiceDockMute").textContent = muteLabel;
+    $("#voiceDockMute").setAttribute("aria-label", `${muteLabel} microphone`);
+    $("#voiceDockMute").setAttribute("aria-pressed", String(state.muted));
+    $("#phoneVoiceTab").classList.toggle("joined", joined);
+    renderVoiceRooms();
   }
   function voiceSocketUrl() {
     const base = new URL(API_BASE || location.origin);
@@ -956,26 +1161,159 @@
     outputGain = audioContext.createGain(); outputGain.gain.value = state.deafened ? 0 : 1; outputGain.connect(audioContext.destination);
     micProcessor.onaudioprocess = sendAudio; micSource.connect(micProcessor); micProcessor.connect(audioContext.destination);
   }
-  async function joinVoice() {
-    if (usePolling) return joinVoiceWebRTC();
-    if (state.voiceRoom) return leaveVoice(); if (!state.connected) return toast("Wait for chat to reconnect before joining voice.");
-    state.joiningVoice = true; state.voiceError = ""; renderVoice();
+  let voiceJoinAttempt = null, voicePresenceRequest = null, pendingVoiceLeave = null;
+  let voiceConnectionGeneration = 0;
+
+  function requestVoiceJoin(details) {
+    return api("/api/voice/join", { method: "POST", body: JSON.stringify(details) });
+  }
+  async function refreshVoicePresence() {
+    if (!state.voiceRoom || Date.now() - lastVoiceHeartbeat <= 5000 || voicePresenceRequest) return;
+    const roomId = state.voiceRoom, version = identityVersion, generation = voiceConnectionGeneration;
+    const current = () => version === identityVersion && generation === voiceConnectionGeneration && state.voiceRoom === roomId;
+    const request = requestVoiceJoin({ room: roomId, peerId: state.peerId, guestId: state.guest.id, guestName: name() });
+    voicePresenceRequest = request;
     try {
-      if (!navigator.mediaDevices?.getUserMedia) throw new Error("Microphone access needs HTTPS or localhost.");
-      audioContext = new AudioContext(); await audioContext.resume();
-      mic = await captureVoiceMic();
-      state.joiningVoice = state.active;
-      const result = await api("/api/voice/join", { method: "POST", body: JSON.stringify({ room: state.active, peerId: state.peerId, guestId: state.guest.id }) });
-      state.voiceRoom = state.active; state.joiningVoice = false; state.voiceMembers = result.participants || []; connectVoiceAudio(); renderVoice();
-    } catch (error) { state.joiningVoice = false; mic?.getTracks().forEach(track => track.stop()); mic = null; if (audioContext) await audioContext.close().catch(() => {}); audioContext = null; renderVoice(); toast(error.message); }
+      const result = await request;
+      if (!current()) return;
+      lastVoiceHeartbeat = Date.now();
+      await connectToVoiceMembers(result.participants || []);
+    } catch (error) {
+      if (current()) throw error;
+    } finally {
+      if (voicePresenceRequest === request) voicePresenceRequest = null;
+    }
+  }
+  function closeVoiceContext(context) {
+    return context && context.state !== "closed" ? context.close().catch(() => {}) : Promise.resolve();
+  }
+  function disposeVoiceAttempt(attempt) {
+    if (!attempt) return;
+    attempt.stream?.getTracks().forEach(track => track.stop());
+    attempt.stream = null;
+    const context = attempt.context;
+    attempt.context = null;
+    return closeVoiceContext(context);
+  }
+  async function joinVoice(origin = "sidebar") {
+    if (state.voiceRoom) return leaveVoice();
+    if (voiceJoinAttempt) return;
+    if (!state.connected) return toast("Wait for chat to reconnect before joining voice.");
+    if (!navigator.mediaDevices?.getUserMedia) return toast("Microphone access needs HTTPS or localhost.");
+    if (usePolling && !window.RTCPeerConnection) return toast("This browser does not support secure WebRTC voice.");
+
+    const roomId = origin === "tab" ? voiceTabRoom() : state.active;
+    if (!allRooms().some(item => item.id === roomId)) return toast("This voice room is no longer available.");
+    const version = identityVersion;
+    const details = { room: roomId, peerId: state.peerId, guestId: state.guest.id, guestName: name() };
+    const attempt = { details, context: null, stream: null, request: null };
+    const current = () => voiceJoinAttempt === attempt && version === identityVersion && state.connected;
+    voiceJoinAttempt = attempt;
+    state.joiningVoice = roomId;
+    state.voiceError = "";
+    renderVoice();
+    try {
+      if (!usePolling) {
+        attempt.context = new AudioContext();
+        await attempt.context.resume();
+        if (!current()) return;
+      }
+      attempt.stream = await captureVoiceMic();
+      if (!current()) return;
+      if (pendingVoiceLeave) await pendingVoiceLeave;
+      if (!current()) return;
+      attempt.request = requestVoiceJoin(details);
+      const result = await attempt.request;
+      if (!current()) {
+        if (voiceJoinAttempt === attempt) await leaveVoice(true);
+        return;
+      }
+      mic = attempt.stream;
+      audioContext = attempt.context;
+      attempt.stream = null;
+      attempt.context = null;
+      state.voiceRoom = roomId;
+      state.joiningVoice = false;
+      state.voiceMembers = result.participants || [];
+      lastVoiceHeartbeat = Date.now();
+      if (usePolling) {
+        blockedVoicePeers.clear();
+        await connectToVoiceMembers(state.voiceMembers);
+      } else {
+        connectVoiceAudio();
+        renderVoice();
+      }
+    } catch (error) {
+      if (voiceJoinAttempt !== attempt) return;
+      const cleanup = leaveVoice(true);
+      if (version === identityVersion) {
+        state.voiceError = error.message;
+        renderVoice();
+        toast(error.message);
+      }
+      await cleanup;
+    } finally {
+      if (voiceJoinAttempt === attempt) {
+        voiceJoinAttempt = null;
+        state.joiningVoice = false;
+        renderVoice();
+      }
+      await disposeVoiceAttempt(attempt);
+    }
   }
   async function leaveVoice(silent = false) {
+    voiceConnectionGeneration++;
+    const attempt = voiceJoinAttempt;
     const previous = state.voiceRoom || state.joiningVoice;
-    if (state.voiceRoom) api("/api/voice/leave", { method: "POST", body: JSON.stringify({ room: state.voiceRoom, peerId: state.peerId, guestId: state.guest.id }) }).catch(() => {});
-    for (const pc of voicePeers.values()) { clearTimeout(pc.__orbitOfferRetry); pc.close(); } voicePeers.clear(); pendingIce.clear(); voiceSignalQueues.clear(); blockedVoicePeers.clear(); $("#remoteAudio").replaceChildren();
-    const socket = relaySocket; relaySocket = null; socket?.close(); micProcessor?.disconnect(); micSource?.disconnect(); outputGain?.disconnect(); micProcessor = null; micSource = null; outputGain = null;
-    mic?.getTracks().forEach(track => track.stop()); mic = null; if (audioContext) await audioContext.close().catch(() => {}); audioContext = null; outputSchedule.clear();
-    state.voiceRoom = ""; state.joiningVoice = false; state.voiceMembers = []; state.muted = false; state.deafened = false; state.voiceError = ""; lastVoiceHeartbeat = 0; renderVoice(); if (!silent && previous) toast("You left voice.");
+    const details = attempt?.details || { room: previous, peerId: state.peerId, guestId: state.guest.id };
+    const pendingUpdate = voicePresenceRequest || attempt?.request;
+    if (state.voiceRoom || attempt?.request) {
+      const sendLeave = () => api("/api/voice/leave", { method: "POST", body: JSON.stringify(details) }).catch(() => {});
+      const request = pendingUpdate ? pendingUpdate.catch(() => {}).then(sendLeave) : sendLeave();
+      pendingVoiceLeave = request;
+      request.finally(() => { if (pendingVoiceLeave === request) pendingVoiceLeave = null; });
+    }
+
+    voiceJoinAttempt = null;
+    state.voiceRoom = "";
+    state.joiningVoice = false;
+    state.voiceMembers = [];
+    state.muted = false;
+    state.deafened = false;
+    state.voiceError = "";
+    lastVoiceHeartbeat = 0;
+    for (const pc of voicePeers.values()) {
+      clearTimeout(pc.__orbitOfferRetry);
+      pc.close();
+    }
+    voicePeers.clear();
+    pendingIce.clear();
+    voiceSignalQueues.clear();
+    blockedVoicePeers.clear();
+    $("#remoteAudio").replaceChildren();
+    const socket = relaySocket;
+    relaySocket = null;
+    if (socket) {
+      socket.onopen = null;
+      socket.onclose = null;
+      socket.onerror = null;
+      socket.onmessage = null;
+      socket.close();
+    }
+    micProcessor?.disconnect();
+    micSource?.disconnect();
+    outputGain?.disconnect();
+    micProcessor = null;
+    micSource = null;
+    outputGain = null;
+    mic?.getTracks().forEach(track => track.stop());
+    mic = null;
+    const context = audioContext;
+    audioContext = null;
+    outputSchedule.clear();
+    renderVoice();
+    if (!silent && previous) toast("You left voice.");
+    await Promise.all([disposeVoiceAttempt(attempt), closeVoiceContext(context), pendingVoiceLeave]);
   }
   async function setVoiceDevice() {
     mic?.getAudioTracks().forEach(track => track.enabled = !state.muted && !state.deafened); if (outputGain) outputGain.gain.value = state.deafened ? 0 : 1; $("#remoteAudio").querySelectorAll("audio").forEach(audio => audio.muted = state.deafened); renderVoice();
@@ -983,8 +1321,13 @@
     try { await api("/api/voice/state", { method: "POST", body: JSON.stringify({ room: state.voiceRoom, peerId: state.peerId, muted: state.muted, deafened: state.deafened, guestId: state.guest.id }) }); } catch (error) { toast(error.message); }
   }
   async function sendVoiceSignal(targetId, signal) {
+    const generation = voiceConnectionGeneration;
+    const room = state.voiceRoom;
     const previous = voiceSignalQueues.get(targetId) || Promise.resolve();
-    const next = previous.catch(() => {}).then(() => api("/api/voice/signal", { method: "POST", body: JSON.stringify({ room: state.voiceRoom, peerId: state.peerId, targetId, signal, guestId: state.guest.id }) }));
+    const next = previous.catch(() => {}).then(() => {
+      if (!room || generation !== voiceConnectionGeneration) return;
+      return api("/api/voice/signal", { method: "POST", body: JSON.stringify({ room, peerId: state.peerId, targetId, signal, guestId: state.guest.id }) });
+    });
     voiceSignalQueues.set(targetId, next);
     try { await next; } finally { if (voiceSignalQueues.get(targetId) === next) voiceSignalQueues.delete(targetId); }
   }
@@ -998,6 +1341,7 @@
     });
   }
   async function connectToVoiceMembers(participants) {
+    const generation = voiceConnectionGeneration;
     const now = Date.now();
     for (const [peerId, expiresAt] of blockedVoicePeers) if (expiresAt <= now) blockedVoicePeers.delete(peerId);
     const liveParticipants = (participants || []).filter(item => !blockedVoicePeers.has(item.peerId));
@@ -1008,10 +1352,12 @@
     }
     state.voiceMembers = liveParticipants; renderVoice();
     for (const participant of liveParticipants) {
+      if (generation !== voiceConnectionGeneration || !state.voiceRoom) return;
       if (participant.peerId === state.peerId) continue;
       // One side creates the offer, even when both users join at nearly the same time.
       try { await connectVoicePeer(participant.peerId, state.peerId > participant.peerId); }
       catch (error) {
+        if (generation !== voiceConnectionGeneration) return;
         if (error.status !== 409) throw error;
         dropVoicePeer(participant.peerId);
       }
@@ -1034,6 +1380,7 @@
       { urls: "stun:stun.cloudflare.com:53" }
     ] });
     voicePeers.set(peerId, pc);
+    const current = () => state.voiceRoom && voicePeers.get(peerId) === pc;
     for (const track of mic.getTracks()) {
       const sender = pc.addTrack(track, mic);
       if (track.kind === "audio" && sender.setParameters) {
@@ -1045,13 +1392,38 @@
         } catch { /* Keep the browser's default Opus settings if tuning is unsupported. */ }
       }
     }
-    pc.ontrack = event => { let audio = document.querySelector(`[data-peer-audio="${CSS.escape(peerId)}"]`); if (!audio) { audio = document.createElement("audio"); audio.autoplay = true; audio.playsInline = true; audio.dataset.peerAudio = peerId; audio.muted = state.deafened; $("#remoteAudio").append(audio); } audio.srcObject = event.streams[0] || new MediaStream([event.track]); audio.play().catch(() => { state.voiceError = "Voice connected. Tap the page once to enable audio playback."; renderVoice(); }); };
+    if (!current()) return;
+    pc.ontrack = event => {
+      if (!current()) return;
+      let audio = document.querySelector(`[data-peer-audio="${CSS.escape(peerId)}"]`);
+      if (!audio) {
+        audio = document.createElement("audio");
+        audio.autoplay = true;
+        audio.playsInline = true;
+        audio.dataset.peerAudio = peerId;
+        audio.muted = state.deafened;
+        $("#remoteAudio").append(audio);
+      }
+      audio.srcObject = event.streams[0] || new MediaStream([event.track]);
+      audio.play().catch(() => {
+        if (!current()) return;
+        state.voiceError = "Voice connected. Tap the page once to enable audio playback.";
+        renderVoice();
+      });
+    };
     pc.onconnectionstatechange = () => {
-      if (pc.connectionState === "connected") clearTimeout(pc.__orbitOfferRetry);
-      if (["failed", "disconnected"].includes(pc.connectionState)) { state.voiceError = "A peer voice connection was interrupted. Rejoin the voice room."; renderVoice(); }
+      if (!current()) return;
+      const interrupted = "A peer voice connection was interrupted. Rejoin the voice room.";
+      if (pc.connectionState === "connected") {
+        clearTimeout(pc.__orbitOfferRetry);
+        if (state.voiceError === interrupted) state.voiceError = "";
+      }
+      if (["failed", "disconnected"].includes(pc.connectionState)) state.voiceError = interrupted;
+      renderVoice();
     };
     if (offerer) {
       const offer = await pc.createOffer(); await pc.setLocalDescription(offer); await waitForIceGathering(pc);
+      if (!current()) return;
       const description = pc.localDescription;
       try { await sendVoiceSignal(peerId, { description }); }
       catch (error) { if (error.status !== 409) throw error; }
@@ -1086,17 +1458,6 @@
       const queued = pendingIce.get(event.from) || []; pendingIce.delete(event.from); for (const candidate of queued) await pc.addIceCandidate(candidate);
     }
     if (signal.candidate) { if (pc.remoteDescription) await pc.addIceCandidate(signal.candidate); else { const queued = pendingIce.get(event.from) || []; queued.push(signal.candidate); pendingIce.set(event.from, queued); } }
-  }
-  async function joinVoiceWebRTC() {
-    if (state.voiceRoom) return leaveVoice(); if (!state.connected) return toast("Wait for chat to reconnect before joining voice.");
-    if (!navigator.mediaDevices?.getUserMedia || !window.RTCPeerConnection) return toast("This browser does not support secure WebRTC voice.");
-    state.joiningVoice = state.active; state.voiceError = ""; renderVoice();
-    try {
-      mic = await captureVoiceMic();
-      const result = await api("/api/voice/join", { method: "POST", body: JSON.stringify({ room: state.active, peerId: state.peerId, guestId: state.guest.id, guestName: name() }) });
-      state.voiceRoom = state.active; state.joiningVoice = false; state.voiceMembers = result.participants || []; renderVoice();
-      lastVoiceHeartbeat = Date.now(); blockedVoicePeers.clear(); await connectToVoiceMembers(state.voiceMembers);
-    } catch (error) { state.joiningVoice = false; mic?.getTracks().forEach(track => track.stop()); mic = null; for (const pc of voicePeers.values()) pc.close(); voicePeers.clear(); state.voiceError = error.message; renderVoice(); toast(error.message); }
   }
   function showRules() { modal("A small promise to each other.", "Orbit works best when everyone gets to be a person here.", `<ul class="rules"><li>Be curious before you judge. People arrive with different stories.</li><li>Make room for quieter voices. A thoughtful reply goes a long way.</li><li>Keep personal information personal. Share only what feels right to you.</li><li>If someone asks you to stop, let the conversation breathe.</li></ul>`); }
   function search() {
@@ -1140,6 +1501,9 @@
   }
   function bind() {
     initMessageScrolling();
+    setMemberPanel(state.memberPanelOpen, false);
+    $("#desktopMembers").onclick = () => setMemberPanel(!state.memberPanelOpen);
+    $("#roomsButton").onclick = $("#phoneRooms").onclick = openRoomDirectory;
     document.addEventListener("click", event => {
       const showcaseChoice = event.target.closest("[data-showcase-select]"); if (showcaseChoice) selectShowcase(Number(showcaseChoice.dataset.showcaseSelect));
       if (event.target.closest("[data-compose]")) { setView("chat"); $("#messageInput").focus(); }
@@ -1148,6 +1512,8 @@
       const addChannel = event.target.closest("[data-add-channel]"); if (addChannel) addServerChannelModal(addChannel.dataset.addChannel);
       const inviteServer = event.target.closest("[data-server-invite]"); if (inviteServer) inviteToServer(inviteServer.dataset.serverInvite);
       const channel = event.target.closest("[data-channel]"); if (channel) selectChannel(channel.dataset.channel);
+      const directoryRoom = event.target.closest("[data-directory-room]"); if (directoryRoom) return openDirectoryRoom(directoryRoom.dataset.directoryRoom);
+      const directoryFollow = event.target.closest("[data-directory-follow]"); if (directoryFollow) return toggleFollow(directoryFollow.dataset.directoryFollow);
       const voiceRoom = event.target.closest("[data-voice-room]"); if (voiceRoom) selectVoiceRoom(voiceRoom.dataset.voiceRoom);
       const searchRoom = event.target.closest("[data-search-room]"); if (searchRoom) { const id = searchRoom.dataset.searchRoom; closeModal(); selectChannel(id); }
       const searchMessage = event.target.closest("[data-search-message]"); if (searchMessage) {
@@ -1167,7 +1533,7 @@
       const original = event.target.closest("[data-jump-reply]"); if (original) jumpToMessage(original.dataset.jumpReply);
     });
     $("#createSpace").onclick = $("#railCreate").onclick = createRoomMenu; $("#createServer").onclick = createServerModal; $("#searchOpen").onclick = $("#mobileSearch").onclick = search; $("#inviteButton").onclick = $("#peopleInvite").onclick = inviteGeneral;
-    $("#followButton").onclick = toggleFollow;
+    $("#followButton").onclick = () => toggleFollow();
     $("#manageParty").onclick = partyDeletionModal;
     $("#retryConnection").onclick = start;
     $("#showcasePrevious").onclick = () => selectShowcase(showcaseIndex - 1);
@@ -1175,7 +1541,7 @@
     $("#roomShowcase").onkeydown = showcaseKeydown;
     renderShowcase();
     $("#discoverAccount").onclick = () => state.profile ? profileModal() : authModal();
-    $("#helpButton").onclick = showRules; $("#profileButton").onclick = $("#topProfile").onclick = () => state.profile ? profileModal() : authModal();
+    $("#helpButton").onclick = $("#peopleRules").onclick = showRules; $("#profileButton").onclick = $("#topProfile").onclick = () => state.profile ? profileModal() : authModal();
     $("#messageForm").onsubmit = e => { e.preventDefault(); sendMessage($("#messageInput").value); };
     $("#cancelReply").onclick = cancelReply;
     $("#messageInput").oninput = e => { saveDraft(); clearTimeout(typingStopTimer); if (e.currentTarget.value.trim()) { if (!localTyping) { clearTimeout(typingTimer); typingTimer = setTimeout(() => sendTyping(true), 180); } typingStopTimer = setTimeout(() => sendTyping(false), 1600); } else { clearTimeout(typingTimer); sendTyping(false); } };
@@ -1183,7 +1549,13 @@
     window.addEventListener("resize", updateComposer);
     $("#emojiButton").onclick = () => emojiPicker();
     $("#musicForm").onsubmit = shareMusic; $("#memberSearch").oninput = e => renderMembers(e.target.value.toLowerCase());
-    $("#voiceToggle").onclick = $("#voiceTabJoin").onclick = joinVoice; $("#voiceMute").onclick = $("#voiceTabMute").onclick = () => { state.muted = !state.muted; setVoiceDevice(); }; $("#voiceDeafen").onclick = $("#voiceTabDeafen").onclick = () => { state.deafened = !state.deafened; setVoiceDevice(); }; $("#mobileVoice").onclick = () => { state.voiceMobileOpen = !state.voiceMobileOpen; renderVoice(); };
+    $("#voiceToggle").onclick = () => joinVoice();
+    $("#voiceTabJoin").onclick = () => joinVoice("tab");
+    $("#voiceMute").onclick = $("#voiceTabMute").onclick = $("#voiceDockMute").onclick = () => { state.muted = !state.muted; return setVoiceDevice(); };
+    $("#voiceDeafen").onclick = $("#voiceTabDeafen").onclick = () => { state.deafened = !state.deafened; return setVoiceDevice(); };
+    $("#mobileVoice").onclick = () => { state.voiceMobileOpen = !state.voiceMobileOpen; renderVoice(); };
+    $("#voiceDockOpen").onclick = () => selectVoiceRoom(state.voiceRoom);
+    $("#voiceDockLeave").onclick = () => leaveVoice();
     $$("[data-view]").forEach(button => button.onclick = () => setView(button.dataset.view));
     document.addEventListener("keydown", e => {
       if (accountBusy) { if (e.key === "Tab") { e.preventDefault(); $(".modal")?.focus(); } return; }
