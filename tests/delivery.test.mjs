@@ -250,3 +250,46 @@ test("local deliveries replay after restart and reject revoked-session guest dow
     await rm(dataDir, { recursive: true, force: true });
   }
 });
+
+test("hosted reactions recover retained delivery history after replay with a missing shared cache", async () => {
+  const { request, records, store, reads } = hostedFixture();
+  const body = { channel: "global", text: "Retained despite a lost snapshot", guestId: "reaction-recovery-owner", clientMessageId: "reaction-recovery-delivery" };
+  const first = await request("/api/messages", body); assert.equal(first.status, 201);
+  const { message } = await first.json();
+  const state = JSON.parse(records.get("state")); state.messages.global = [];
+  await store.setJSON("state", state);
+  const replay = await request("/api/messages", body); assert.equal(replay.status, 200); assert.equal((await replay.json()).message.id, message.id);
+  assert.equal(JSON.parse(records.get("state")).nextEventSeq, state.nextEventSeq, "Replay must not emit a new delivery event");
+  reads.length = 0;
+  const reacted = await request("/api/reactions", { channel: "global", messageId: message.id, emoji: "💜", guestId: body.guestId });
+  assert.equal(reacted.status, 200); assert.equal((await reacted.json()).reactions["💜"].length, 1);
+  assert.equal(reads.filter(key => /^messages\/global\/\d{17}-/.test(key)).length, 1);
+  const restored = JSON.parse(records.get("state")).messages.global.find(item => item.id === message.id);
+  assert.equal(restored.text, body.text); assert.equal(restored.reactions["💜"].length, 1);
+  const history = (await (await request("/api/messages?channel=global&guestId=reaction-recovery-owner")).json()).messages;
+  assert.equal(history.length, 1); assert.equal(history[0].reactions["💜"].length, 1);
+  assert.equal((await (await request("/api/messages", body)).json()).message.reactions["💜"].length, 1);
+});
+
+test("reaction history recovery stays inside the retained window and authorized room", async () => {
+  const { request, records, store, reads } = hostedFixture();
+  await request("/api/bootstrap?channel=global&guestId=reaction-window-owner");
+  for (let index = 0; index < 301; index++) {
+    const message = { id: `reaction-seed-${index}`, text: `Window ${index}`, createdAt: new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(), reactions: {} };
+    await store.setJSON(`messages/global/${message.createdAt.replace(/\D/g, "")}-${message.id}`, message);
+  }
+  await store.setJSON("messages/global/delivery-canonical-only", { id: "canonical-only", text: "Not published in ordered history", clientMessageId: "canonical-only-client", createdAt: new Date().toISOString(), reactions: {} });
+  const react = (messageId, channel = "global", guestId = "reaction-window-owner") => request("/api/reactions", { channel, messageId, guestId, emoji: "💜" });
+  reads.length = 0;
+  assert.equal((await react("reaction-seed-0")).status, 404);
+  assert.equal(reads.filter(key => /^messages\/global\/\d{17}-/.test(key)).length, 300);
+  assert.equal((await react("canonical-only")).status, 404);
+  assert.equal((await react("reaction-seed-300")).status, 200);
+  const { room } = await (await request("/api/parties", { guestId: "reaction-private-owner", name: "Private reaction history" })).json();
+  const privateMessage = (await (await request("/api/messages", { channel: room.id, text: "Private retained message", guestId: "reaction-private-owner", clientMessageId: "private-reaction-delivery" })).json()).message;
+  const state = JSON.parse(records.get("state")); state.messages[room.id] = [];
+  await store.setJSON("state", state); reads.length = 0;
+  assert.equal((await react(privateMessage.id, room.id, "reaction-outsider")).status, 403);
+  assert.equal(reads.some(key => key.startsWith(`messages/${room.id}/`)), false, "Unauthorized requests must be rejected before history lookup");
+  assert.equal((await react(privateMessage.id, room.id, "reaction-private-owner")).status, 200);
+});

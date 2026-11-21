@@ -241,8 +241,16 @@ return async function handler(request) {
       pushEvent(db, { type: data.typing ? "typing" : "typing-stop", channel, id: who, name: user?.name || clean(data.guestName, 32) || "Guest" }); await save(); return reply(202, { ok: true });
     }
     if (method === "POST" && path === "/api/reactions") {
-      const channel = validId(data.channel) || "global", message = (db.messages[channel] || []).find(item => item.id === validId(data.messageId));
+      const channel = validId(data.channel) || "global", messageId = validId(data.messageId);
       if (!canSee(channel)) return reply(403, { error: "Join this party first." });
+      let message = (db.messages[channel] || []).find(item => item.id === messageId);
+      if (!message) {
+        // A concurrent snapshot can omit a durable message. Only recover from
+        // retained history after access checks, not orphaned delivery records.
+        const retained = await readMessages(store, db, channel);
+        message = retained.find(item => item.id === messageId);
+        if (message) db.messages[channel] = retained;
+      }
       if (!message) return reply(404, { error: "That message is no longer here." });
       message.reactions ||= {}; const emoji = clean(data.emoji, 8); message.reactions[emoji] ||= [];
       const list = message.reactions[emoji], idx = list.findIndex(item => item.id === who);
