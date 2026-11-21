@@ -423,6 +423,8 @@ h1,h2,h3,p { margin-top:0; }
 .invite-box { display:flex; flex-wrap:wrap; gap:10px; }
 .invite-box input { flex:1 1 200px; }
 .invite-box .submit-button { flex:1 1 120px; width:auto; }
+.modal-content .invite-copy-status { margin:12px 0 0; color:var(--muted); font-size:.9375rem; line-height:1.6; }
+.modal-content .invite-copy-status:empty { margin:0; }
 .rules { padding-left:22px; color:#d5cce2; font-size:.9375rem; line-height:1.8; }
 .search-input { margin-bottom:16px; }
 .search-results { display:grid; gap:8px; max-height:min(48dvh,420px); overflow-y:auto; padding:3px; }

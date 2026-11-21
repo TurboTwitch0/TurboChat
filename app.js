@@ -836,10 +836,29 @@
     };
   }
   function packInvite(data) { return btoa(unescape(encodeURIComponent(JSON.stringify(data)))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, ""); }
+  function bindInviteCopy(link) {
+    const input = $("#inviteLink"), button = $("#copyInvite"), status = $("#inviteCopyStatus"), version = identityVersion;
+    const current = () => version === identityVersion && input.isConnected && button.isConnected;
+    button.onclick = async () => {
+      if (button.disabled) return;
+      button.disabled = true; status.textContent = "";
+      try {
+        if (!navigator.clipboard?.writeText) throw new Error("Clipboard unavailable");
+        await navigator.clipboard.writeText(link);
+        if (current()) status.textContent = "Invite copied.";
+      } catch {
+        if (!current()) return;
+        input.focus(); input.select();
+        let copied = false;
+        try { copied = document.execCommand?.("copy") === true; } catch {}
+        status.textContent = copied ? "Invite copied." : "Your browser couldn’t copy the link. Copy the selected link manually.";
+      } finally { if (current()) button.disabled = false; }
+    };
+  }
   function inviteCreated(item, code, kind = "party") {
     const link = `${appOrigin}${location.pathname}?invite=${packInvite({ kind, id: item.id, inviteCode: code, name: item.name, topic: item.topic })}`;
-    modal(`Invite someone to ${item.name}.`, kind === "server" ? "Anyone with this link can join your server." : "Anyone with this invite can join your private party.", `<div class="invite-box"><input id="inviteLink" readonly value="${esc(link)}"><button id="copyInvite" class="submit-button">Copy invite</button></div><button id="doneInvite" class="subtle-button">Done</button>`);
-    $("#copyInvite").onclick = async () => { try { await navigator.clipboard.writeText(link); toast("Invite copied."); } catch { $("#inviteLink").select(); document.execCommand("copy"); toast("Invite copied."); } };
+    modal(`Invite someone to ${item.name}.`, kind === "server" ? "Anyone with this link can join your server." : "Anyone with this invite can join your private party.", `<div class="invite-box"><input id="inviteLink" aria-label="Invite link" aria-describedby="inviteCopyStatus" readonly value="${esc(link)}"><button id="copyInvite" class="submit-button">Copy invite</button></div><p id="inviteCopyStatus" class="invite-copy-status" role="status"></p><button id="doneInvite" class="subtle-button">Done</button>`);
+    bindInviteCopy(link);
     $("#doneInvite").onclick = closeModal;
   }
   async function processInvite(version = identityVersion) {
@@ -860,14 +879,22 @@
   }
   function inviteGeneral() {
     const link = `${appOrigin}${location.pathname}`;
-    modal("Invite someone to Orbit.", "Send this link so a friend can join the conversation.", `<div class="invite-box"><input id="inviteLink" readonly value="${esc(link)}"><button id="copyInvite" class="submit-button">Copy link</button></div>`);
-    $("#copyInvite").onclick = async () => { try { await navigator.clipboard.writeText(link); toast("Invite copied."); } catch { $("#inviteLink").select(); document.execCommand("copy"); toast("Invite copied."); } };
+    modal("Invite someone to Orbit.", "Send this link so a friend can join the conversation.", `<div class="invite-box"><input id="inviteLink" aria-label="Invite link" aria-describedby="inviteCopyStatus" readonly value="${esc(link)}"><button id="copyInvite" class="submit-button">Copy link</button></div><p id="inviteCopyStatus" class="invite-copy-status" role="status"></p>`);
+    bindInviteCopy(link);
   }
-  function authModal(mode = "login") {
+  function authModal(mode = "login", draft = {}) {
     const register = mode === "register";
     modal(register ? "Make room for you." : "Your people are a hello away.", register ? "Create a TurboChat account to keep your profile and server memberships." : "Sign in to your TurboChat account. You can also keep exploring as a guest.", `<div class="auth-tabs"><button id="toLogin" class="${register ? "" : "active"}">Sign in</button><button id="toRegister" class="${register ? "active" : ""}">Create account</button></div><form id="authForm">${register ? `<label>Display name<input id="authName" required minlength="2" maxlength="32" autocomplete="nickname" placeholder="What should we call you?"></label>` : ""}<label>Email<input id="authEmail" type="email" required autocomplete="email" autocapitalize="none" spellcheck="false" placeholder="you@example.com"></label><label>Password<input id="authPassword" type="password" required minlength="${register ? "8" : "1"}" maxlength="128" autocomplete="${register ? "new-password" : "current-password"}" placeholder="${register ? "At least 8 characters" : "Your password"}"></label><button type="button" id="togglePassword" class="password-toggle" aria-pressed="false">Show password</button><p id="authError" class="auth-error" role="alert"></p><button class="submit-button">${register ? "Create account" : "Sign in"} <span aria-hidden="true">↗</span></button></form>${state.profile ? `<button id="logout" class="subtle-button">Sign out</button>` : ""}<div class="guest-divider"><span>or take a look around</span></div><button id="guestMode" class="subtle-button guest-action">Continue as ${esc(state.guest.name)} →</button>`);
+    $("#authEmail").value = draft.email || "";
+    if (register) $("#authName").value = draft.name || "";
+    $("#authPassword").value = "";
+    $("#toLogin").setAttribute("aria-pressed", String(!register)); $("#toRegister").setAttribute("aria-pressed", String(register));
     $("#togglePassword").onclick = () => { const input = $("#authPassword"), show = input.type === "password"; input.type = show ? "text" : "password"; $("#togglePassword").textContent = show ? "Hide password" : "Show password"; $("#togglePassword").setAttribute("aria-pressed", String(show)); };
-    $("#toLogin").onclick = () => authModal("login"); $("#toRegister").onclick = () => authModal("register");
+    const switchMode = next => {
+      if (next === mode) return;
+      authModal(next, { email: $("#authEmail").value, name: register ? $("#authName").value : draft.name });
+    };
+    $("#toLogin").onclick = () => switchMode("login"); $("#toRegister").onclick = () => switchMode("register");
     $("#authForm").onsubmit = async e => {
       e.preventDefault(); if (accountBusy) return; const form = e.currentTarget, button = form.querySelector(".submit-button"), errorField = form.querySelector("#authError"); setAccountBusy(true); errorField.textContent = ""; button.textContent = register ? "Creating account…" : "Signing in…";
       let signedIn = null, synced = false;

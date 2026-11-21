@@ -8,7 +8,7 @@ const source = await readFile(new URL("../app.js", import.meta.url), "utf8");
 const entry = "bind(); renderMessages(); updateIdentity(); start();";
 assert.ok(source.includes(entry), "The test harness must replace only the application startup.");
 // Expose functions in the test-only copy; production does not export internals.
-const testSource = source.replace(entry, "globalThis.app = { state, drafts, openRoomDirectory, setMemberPanel, formatMessageText, insertComposerEmoji, emojiPicker, toggleReaction, copyMessage, canManageParty, partyDeletionModal, accountDeletionModal, profileModal, replyDrafts, startReply, cancelReply, jumpToMessage, renderMessage, chooseDrafts, addMessage, setView, renderRoomList, saveDraft, restoreDraft, selectChannel, pollUpdates, sendMessage, receiveLiveEvent, typingPeers, bind, renderMessages, renderVoice, setConnected, loadChannel, bootstrap, scrollBehavior, renderShowcase, selectShowcase, showcaseKeydown, messageFollow, scrollToLatest, scheduleBottomScroll, handleFeedScroll, pauseMessageFollow, initMessageScrolling, enterMessageRoom, visibleMessages, hideWorldHistory, restoreWorldHistory, api, authModal, refreshIdentity, start, signOut, roomForm };");
+const testSource = source.replace(entry, "globalThis.app = { state, drafts, openRoomDirectory, setMemberPanel, formatMessageText, insertComposerEmoji, emojiPicker, toggleReaction, copyMessage, canManageParty, partyDeletionModal, accountDeletionModal, profileModal, replyDrafts, startReply, cancelReply, jumpToMessage, renderMessage, chooseDrafts, addMessage, setView, renderRoomList, saveDraft, restoreDraft, selectChannel, pollUpdates, sendMessage, receiveLiveEvent, typingPeers, bind, renderMessages, renderVoice, setConnected, loadChannel, bootstrap, scrollBehavior, renderShowcase, selectShowcase, showcaseKeydown, messageFollow, scrollToLatest, scheduleBottomScroll, handleFeedScroll, pauseMessageFollow, initMessageScrolling, enterMessageRoom, visibleMessages, hideWorldHistory, restoreWorldHistory, api, authModal, refreshIdentity, start, signOut, roomForm, inviteGeneral, inviteCreated };");
 
 // Response metadata is a fixture-only wrapper; application payloads stay unchanged.
 const mockHttp = (data, options = {}) => ({ fixtureResponse: { data, status: 200, ...options } });
@@ -19,7 +19,7 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-function fixture({ storage = new Map(), request = () => undefined, reducedMotion = false, storageBlocked = false, locationSearch = "", replySupport = true, navigator = {} } = {}) {
+function fixture({ storage = new Map(), request = () => undefined, reducedMotion = false, storageBlocked = false, locationSearch = "", replySupport = true, navigator = {}, copy = () => false } = {}) {
   const elements = new Map(), requests = [], timers = new Map(), timerDelays = new Map(), intervals = new Map(), listeners = new Map(), historyChanges = [];
   const frames = new Map(), windowListeners = new Map(), fontListeners = new Map(), resizeObservers = [], fontReady = deferred();
   let timerId = 0, frameId = 0;
@@ -163,6 +163,7 @@ function fixture({ storage = new Map(), request = () => undefined, reducedMotion
     localStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => { if (storageBlocked) throw new Error("Browser storage is unavailable"); storage.set(key, value); } },
     crypto: { randomUUID }, URL, URLSearchParams, console, Event, AbortController, btoa, atob,
     document: {
+      execCommand: copy,
       createElement(tag) {
         assert.equal(tag, "template", "the feed fixture supports inert HTML templates only");
         const template = { content: { firstElementChild: null } };
@@ -356,6 +357,73 @@ test("a rejected room creation keeps the form values and presents its error besi
   assert.equal(form.querySelector("button").disabled, false);
   assert.equal(element("#roomName").value, "My room"); assert.equal(element("#roomTopic").value, "Keep this topic");
   assert.equal(app.state.active, "global"); assert.equal(app.state.rooms.length, 0);
+});
+
+test("switching account modes preserves identity fields without keeping passwords or persisting the draft", () => {
+  const { app, element, storage } = fixture();
+  app.authModal();
+  element("#authEmail").value = "first@example.test"; element("#authPassword").value = "only-in-this-form";
+  element("#toLogin").onclick();
+  assert.equal(element("#authPassword").value, "only-in-this-form", "Selecting the current mode must leave its form intact");
+  element("#toRegister").onclick();
+  assert.equal(element("#authEmail").value, "first@example.test"); assert.equal(element("#authPassword").value, "");
+  assert.equal(element("#toRegister").getAttribute("aria-pressed"), "true");
+  element("#authName").value = "My display name"; element("#authEmail").value = "edited@example.test"; element("#authPassword").value = "new-secret";
+  element("#toLogin").onclick();
+  assert.equal(element("#authEmail").value, "edited@example.test"); assert.equal(element("#authPassword").value, "");
+  assert.equal(element("#toLogin").getAttribute("aria-pressed"), "true");
+  element("#toRegister").onclick();
+  assert.equal(element("#authName").value, "My display name"); assert.equal(element("#authEmail").value, "edited@example.test");
+  app.authModal();
+  assert.equal(element("#authEmail").value, "", "A new sign-in visit must not retain the previous dialog draft");
+  assert.equal([...storage.values()].some(value => /edited@example|new-secret|My display name/.test(value)), false);
+});
+
+test("both invitation flows copy their exact link and announce success only after the clipboard confirms", async () => {
+  for (const created of [false, true]) {
+    const copied = [], pending = deferred();
+    const { app, element } = fixture({ navigator: { clipboard: { writeText: text => { copied.push(text); return pending.promise; } } } });
+    if (created) app.inviteCreated({ id: "private-fixture", name: 'My <party> \"name\"', topic: "Music" }, "fixture-code");
+    else app.inviteGeneral();
+    const button = element("#copyInvite"), status = element("#inviteCopyStatus");
+    const first = button.onclick(); await button.onclick();
+    assert.equal(copied.length, 1); assert.equal(button.disabled, true); assert.equal(status.textContent, "");
+    const link = new URL(copied[0]);
+    assert.equal(link.origin, "https://orbit.test");
+    if (created) {
+      const invite = JSON.parse(atob(link.searchParams.get("invite").replace(/-/g, "+").replace(/_/g, "/")));
+      assert.equal(invite.id, "private-fixture"); assert.equal(invite.inviteCode, "fixture-code");
+    } else assert.equal(link.href, "https://orbit.test/");
+    assert.match(element("#modalRoot").innerHTML, /aria-label="Invite link" aria-describedby="inviteCopyStatus"/);
+    pending.resolve(); await first;
+    assert.equal(status.textContent, "Invite copied."); assert.equal(button.disabled, false);
+  }
+});
+
+test("blocked invite copying offers selected manual text and never claims an unsuccessful copy", async () => {
+  for (const result of [false, true, "throw"]) {
+    let attempts = 0;
+    const { app, element } = fixture({ navigator: { clipboard: { writeText: async () => { throw new Error("Clipboard blocked"); } } }, copy(command) { attempts++; assert.equal(command, "copy"); if (result === "throw") throw new Error("Copy blocked"); return result; } });
+    app.inviteGeneral(); await element("#copyInvite").onclick();
+    assert.equal(attempts, 1); assert.equal(element("#inviteLink").selected, true); assert.equal(element("#inviteLink").focused, true);
+    assert.equal(element("#copyInvite").disabled, false);
+    if (result === true) assert.equal(element("#inviteCopyStatus").textContent, "Invite copied.");
+    else assert.match(element("#inviteCopyStatus").textContent, /couldn’t copy.*manually/);
+    assert.notEqual(element("#toast").textContent, "Invite copied.");
+  }
+});
+
+test("a closed invite cannot reclaim focus or report late clipboard results", async () => {
+  for (const failed of [false, true]) {
+    const pending = deferred(); let attempts = 0;
+    const { app, element } = fixture({ navigator: { clipboard: { writeText: () => pending.promise } }, copy() { attempts++; return true; } });
+    app.inviteGeneral();
+    const input = element("#inviteLink"), status = element("#inviteCopyStatus"), copied = element("#copyInvite").onclick();
+    input.isConnected = false;
+    if (failed) pending.reject(new Error("Late clipboard failure")); else pending.resolve();
+    await copied;
+    assert.equal(status.textContent, ""); assert.equal(input.focused, undefined); assert.equal(attempts, 0);
+  }
 });
 
 test("a confirmed sign-in survives a conversation outage and schedules recovery without claiming sign-in failed", async () => {
