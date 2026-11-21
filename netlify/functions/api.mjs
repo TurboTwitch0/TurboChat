@@ -24,16 +24,34 @@ function isMember(room, who) { return !!who && (room?.memberKeys || []).includes
 function publicMember(entry) { return { id: entry.id, name: entry.name, emoji: entry.emoji, about: entry.about || "", status: entry.status || "online", registered: !!entry.registered }; }
 function pushEvent(db, event) { db.nextEventSeq = (db.nextEventSeq || 0) + 1; db.events.push({ ...event, seq: db.nextEventSeq, at: Date.now() }); db.events = db.events.slice(-maxEvents); }
 const emailKey = email => createHash("sha256").update(email).digest("hex");
+const messageOrder = (a, b) => (Date.parse(a.createdAt) || 0) - (Date.parse(b.createdAt) || 0) || a.id.localeCompare(b.id);
+const historyKey = (channel, message) => `messages/${channel}/${message.createdAt.replace(/\D/g, "")}-${message.id}`;
+const historyBlobs = blobs => blobs.filter(blob => /\/\d{17}-[^/]+$/.test(blob.key)).sort((a, b) => a.key.localeCompare(b.key));
+async function pruneMessages(store, channel) {
+  const { blobs } = await store.list({ prefix: `messages/${channel}/` });
+  const ordered = historyBlobs(blobs);
+  if (ordered.length <= 300) return;
+  // Bound cleanup work after a burst; later writes continue draining excess.
+  const expired = ordered.slice(0, Math.min(100, ordered.length - 250));
+  const remaining = ordered.slice(expired.length);
+  for (const old of expired) {
+    await store.delete(old.key);
+    const id = old.key.slice(`messages/${channel}/`.length + 18);
+    if (/^delivery-[a-f0-9]{64}$/.test(id) && !remaining.some(blob => blob.key.endsWith(`-${id}`))) await store.delete(`messages/${channel}/delivery-${id}`);
+  }
+}
 async function readMessages(store, db, channel) {
   const merged = new Map((db.messages[channel] || []).map(item => [item.id, item]));
   const { blobs } = await store.list({ prefix: `messages/${channel}/` });
-  const recent = blobs.sort((a, b) => a.key.localeCompare(b.key)).slice(-250);
+  // Timestamp keys preserve bounded history reads; delivery records are looked
+  // up directly for replay and never consume the history window.
+  const recent = historyBlobs(blobs).slice(-300);
   const records = await Promise.all(recent.map(blob => store.get(blob.key, { type: "json", consistency: "strong" })));
   for (const item of records) if (item?.id) {
     const previous = merged.get(item.id);
     merged.set(item.id, previous ? { ...item, ...previous, reactions: previous.reactions ?? item.reactions } : item);
   }
-  return [...merged.values()].sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt)).slice(-250);
+  return [...merged.values()].sort(messageOrder).slice(-250);
 }
 async function findReplyTarget(store, db, channel, id) {
   const cached = (db.messages[channel] || []).find(item => item.id === id);
@@ -48,6 +66,14 @@ async function findReplyTarget(store, db, channel, id) {
 }
 
 export function createApiHandler(storeFactory = getStore) {
+const pendingDeliveries = new Map();
+async function serializeDelivery(key, action) {
+  const previous = pendingDeliveries.get(key) || Promise.resolve();
+  const task = previous.catch(() => {}).then(action);
+  pendingDeliveries.set(key, task);
+  try { return await task; }
+  finally { if (pendingDeliveries.get(key) === task) pendingDeliveries.delete(key); }
+}
 return async function handler(request) {
   const url = new URL(request.url);
   const path = url.pathname.replace(/^\/.netlify\/functions\/api/, "/api").replace(/\/$/, "") || "/";
@@ -150,7 +176,7 @@ return async function handler(request) {
     if (method === "GET" && path === "/api/bootstrap") {
       const channel = validId(url.searchParams.get("channel")) || "global";
       if (!canSee(channel)) return reply(403, { error: "Join this party from its invite link first." });
-      return reply(200, { messages: await readMessages(store, db, channel), rooms: db.rooms, parties: db.parties.filter(room => isMember(room, who)).map(safeRoom), servers: db.servers.filter(server => isMember(server, who)).map(safeServer), music: db.music, members: online.map(publicMember), registeredCount: baseline + db.users.length, memberGoal: goal, features: { messageReplies: true, safeSelfCleanup: true } });
+      return reply(200, { messages: await readMessages(store, db, channel), rooms: db.rooms, parties: db.parties.filter(room => isMember(room, who)).map(safeRoom), servers: db.servers.filter(server => isMember(server, who)).map(safeServer), music: db.music, members: online.map(publicMember), registeredCount: baseline + db.users.length, memberGoal: goal, features: { messageReplies: true, messageDeliveryIds: true, safeSelfCleanup: true } });
     }
     if (method === "GET" && path === "/api/messages") {
       const channel = validId(url.searchParams.get("channel")) || "global";
@@ -164,29 +190,49 @@ return async function handler(request) {
     }
     if (method === "POST" && path === "/api/messages") {
       const channel = validId(data.channel) || "global", content = clean(data.text, 700);
+      if (!user && /(?:^|;)\s*orbit_session=/.test(request.headers.get("cookie") || "")) return reply(401, { error: "Your sign-in has ended. Sign in again, or sign out to continue as a guest." });
       if (!content) return reply(400, { error: "Write a message first." });
       if (!who) return reply(400, { error: "Refresh the page and try again." });
       if (!canSee(channel)) return reply(403, { error: "Join this party from its invite link first." });
-      let replyTo;
-      if (data.replyTo !== undefined && data.replyTo !== "") {
-        const targetId = validId(data.replyTo);
-        if (!targetId) return reply(400, { error: "Choose a valid message to reply to." });
-        const target = await findReplyTarget(store, db, channel, targetId);
-        if (!target) return reply(400, { error: "That message is no longer available in this conversation. Choose another message to reply to." });
-        replyTo = { id: target.id, user: clean(target.user, 32) || "Guest", text: clean(target.text, 180) };
-      }
-      const message = { id: randomUUID(), user: user?.name || clean(data.guestName, 32) || "Guest", userId: user?.id || "", registered: !!user, emoji: user?.emoji || "✦", text: content, reactions: {}, createdAt: new Date().toISOString() };
-      if (replyTo) message.replyTo = replyTo;
-      // Store messages under unique immutable keys so concurrent serverless
-      // writes cannot replace another message from the shared state snapshot.
-      const messageKey = `messages/${channel}/${message.createdAt.replace(/\D/g, "")}-${message.id}`;
-      await store.setJSON(messageKey, message);
-      const { blobs } = await store.list({ prefix: `messages/${channel}/` });
-      if (blobs.length > 300) {
-        for (const old of blobs.sort((a, b) => a.key.localeCompare(b.key)).slice(0, blobs.length - 250)) await store.delete(old.key);
-      }
-      db.messages[channel] ||= []; db.messages[channel].push(message); db.messages[channel] = db.messages[channel].slice(-250);
-      pushEvent(db, { type: "message", channel, message }); await save().catch(() => {}); return reply(201, { message });
+      const clientMessageId = data.clientMessageId === undefined ? "" : validId(data.clientMessageId);
+      if (data.clientMessageId !== undefined && !clientMessageId) return reply(400, { error: "Use a valid message delivery ID." });
+      const targetId = data.replyTo === undefined || data.replyTo === "" ? "" : validId(data.replyTo);
+      if (data.replyTo !== undefined && data.replyTo !== "" && !targetId) return reply(400, { error: "Choose a valid message to reply to." });
+      const messageId = clientMessageId ? `delivery-${createHash("sha256").update(JSON.stringify([who, channel, clientMessageId])).digest("hex")}` : randomUUID();
+      const deliveryKey = clientMessageId ? `messages/${channel}/delivery-${messageId}` : "";
+      const saveMessage = async message => {
+        await store.setJSON(historyKey(channel, message), message);
+        await pruneMessages(store, channel);
+        db.messages[channel] = [...(db.messages[channel] || []).filter(item => item.id !== message.id), message].sort(messageOrder).slice(-250);
+        pushEvent(db, { type: "message", channel, message }); await save().catch(() => {});
+      };
+      const deliver = async () => {
+        if (deliveryKey) {
+          const cached = (db.messages[channel] || []).find(item => item.id === messageId);
+          const previous = await store.get(deliveryKey, { type: "json", consistency: "strong" }) || cached;
+          if (previous) {
+            if (previous.text !== content || (previous.replyTo?.id || "") !== targetId) return reply(409, { error: "This delivery ID was already used for another message. Send changed text as a new message." });
+            // Recover if storage accepted the delivery record but the original
+            // request stopped before writing its ordered history record.
+            if (!(await store.get(historyKey(channel, previous), { type: "json", consistency: "strong" }))) await saveMessage(previous);
+            return reply(200, { message: { ...previous, reactions: cached?.reactions ?? previous.reactions }, replayed: true });
+          }
+        }
+        let replyTo;
+        if (targetId) {
+          const target = await findReplyTarget(store, db, channel, targetId);
+          if (!target) return reply(400, { error: "That message is no longer available in this conversation. Choose another message to reply to." });
+          replyTo = { id: target.id, user: clean(target.user, 32) || "Guest", text: clean(target.text, 180) };
+        }
+        const message = { id: messageId, user: user?.name || clean(data.guestName, 32) || "Guest", userId: user?.id || "", registered: !!user, emoji: user?.emoji || "✦", text: content, reactions: {}, createdAt: new Date().toISOString(), ...(clientMessageId ? { clientMessageId } : {}) };
+        if (replyTo) message.replyTo = replyTo;
+        if (deliveryKey) await store.setJSON(deliveryKey, message);
+        // Ordered history is independent of message IDs and the shared snapshot.
+        await saveMessage(message); return reply(201, { message });
+      };
+      // This queue serializes one warm function instance. The deterministic key
+      // also collapses retries across instances; it is not a global CAS lock.
+      return deliveryKey ? await serializeDelivery(deliveryKey, deliver) : await deliver();
     }
     if (method === "POST" && path === "/api/typing") {
       if (!who) return reply(400, { error: "Refresh the page and try again." });

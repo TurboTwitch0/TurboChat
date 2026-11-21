@@ -19,7 +19,7 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-function fixture({ storage = new Map(), request = () => undefined, reducedMotion = false, storageBlocked = false, locationSearch = "", replySupport = true, navigator = {}, copy = () => false } = {}) {
+function fixture({ storage = new Map(), request = () => undefined, reducedMotion = false, storageBlocked = false, locationSearch = "", replySupport = true, deliverySupport = false, navigator = {}, copy = () => false } = {}) {
   const elements = new Map(), requests = [], timers = new Map(), timerDelays = new Map(), intervals = new Map(), listeners = new Map(), historyChanges = [];
   const frames = new Map(), windowListeners = new Map(), fontListeners = new Map(), resizeObservers = [], fontReady = deferred();
   let timerId = 0, frameId = 0;
@@ -216,6 +216,7 @@ function fixture({ storage = new Map(), request = () => undefined, reducedMotion
   });
   vm.runInContext(testSource, context, { filename: "app.js" });
   context.app.state.replySupport = replySupport;
+  context.app.state.deliverySupport = deliverySupport;
   const flushFrames = () => {
     for (let pass = 0; frames.size; pass++) {
       assert.ok(pass < 30, "Bottom-follow work must settle instead of scheduling frames forever.");
@@ -1267,7 +1268,7 @@ test("sending a reply keeps optimistic context and sends only the target identif
 
 test("a failed reply retains context and can be retried without it without changing a newer draft", async () => {
   let attempts = 0;
-  const { app, element, requests } = fixture({ request(record) {
+  const { app, element, requests } = fixture({ deliverySupport: true, request(record) {
     if (record.method !== "POST" || record.url.pathname !== "/api/messages") return;
     if (++attempts === 1) throw new Error("Original no longer available");
     return { message: { id: "retry-accepted", user: "Me", text: record.body.text } };
@@ -1282,6 +1283,7 @@ test("a failed reply retains context and can be retried without it without chang
   await app.sendMessage(failed.text, failed.id, true);
   const outgoing = requests.filter(record => record.method === "POST" && record.url.pathname === "/api/messages");
   assert.equal(outgoing[1].body.replyTo, undefined);
+  assert.notEqual(outgoing[0].body.clientMessageId, outgoing[1].body.clientMessageId, "Sending changed reply context starts a new delivery");
   assert.equal(element("#messageInput").value, "A newer draft");
   assert.equal(app.replyDrafts.global.id, "new-original");
 });
@@ -1825,4 +1827,180 @@ test("directory Enter opens its sole search result and respects IME text confirm
   assert.equal(prevented, true); assert.equal(app.state.active, "room-keyboard-directory"); assert.equal(app.state.view, "chat");
   assert.equal(element("#modalRoot").innerHTML, ""); assert.equal(app.drafts.global, "A draft before searching");
   assert.ok(requests.some(record => record.url.pathname === "/api/messages" && record.url.searchParams.get("channel") === "room-keyboard-directory"));
+});
+
+test("delivery IDs survive retries while preserving a newer composer draft", async () => {
+  let attempts = 0;
+  const { app, element, requests } = fixture({ deliverySupport: true, request(record) {
+    if (record.url.pathname !== "/api/messages" || record.method !== "POST") return;
+    if (++attempts === 1) throw new TypeError("Connection lost after send");
+    return { message: { id: "accepted-replay", text: record.body.text, clientMessageId: record.body.clientMessageId, userId: "", registered: false } };
+  } });
+  app.state.connected = true; app.state.loading = false; app.chooseDrafts(null);
+  await app.sendMessage("One intended message");
+  const failed = app.state.messages.global.find(item => item.failed);
+  assert.ok(failed.clientMessageId); assert.equal(failed.uncertain, true);
+  element("#messageInput").value = "A newer draft"; app.saveDraft();
+  await app.sendMessage(failed.text, failed.id);
+  const writes = requests.filter(record => record.method === "POST" && record.url.pathname === "/api/messages");
+  assert.equal(writes.length, 2); assert.equal(writes[0].body.clientMessageId, writes[1].body.clientMessageId);
+  assert.equal(app.state.messages.global.length, 1); assert.equal(app.state.messages.global[0].id, "accepted-replay");
+  assert.equal(element("#toast").classList.contains("show"), false);
+  assert.equal(element("#messageInput").value, "A newer draft"); assert.equal(app.drafts.global, "A newer draft");
+});
+
+test("live delivery confirmation removes its optimistic row even when the HTTP response is lost", async () => {
+  const pending = deferred(), started = deferred();
+  const { app, element, requests } = fixture({ deliverySupport: true, request(record) {
+    if (record.url.pathname === "/api/messages" && record.method === "POST") { started.resolve(); return pending.promise; }
+  } });
+  app.state.connected = true; app.state.loading = false; app.state.view = "chat";
+  const sending = app.sendMessage("The server already has this"); await started.promise;
+  const write = requests.find(record => record.method === "POST" && record.url.pathname === "/api/messages");
+  element("#messageInput").value = "Keep this next message"; app.saveDraft();
+  app.receiveLiveEvent({ type: "message", channel: "global", message: { id: "live-confirmed", text: write.body.text, clientMessageId: write.body.clientMessageId, userId: "", registered: false } });
+  assert.equal(app.state.messages.global.length, 1); assert.equal(app.state.messages.global[0].id, "live-confirmed");
+  pending.reject(new TypeError("The HTTP response was interrupted")); await sending;
+  assert.equal(app.state.messages.global.length, 1); assert.equal(app.state.messages.global[0].failed, undefined);
+  assert.equal(element("#toast").textContent, ""); assert.equal(element("#messageInput").value, "Keep this next message");
+});
+
+test("a history refresh reconciles failed delivery without merging separate identical messages", async () => {
+  const confirmed = [];
+  const { app, element, requests } = fixture({ deliverySupport: true, request(record) {
+    if (record.url.pathname !== "/api/messages") return;
+    if (record.method === "GET") return { messages: confirmed };
+    confirmed.push({ id: `stored-${confirmed.length}`, text: record.body.text, clientMessageId: record.body.clientMessageId, userId: "", registered: false });
+    throw new TypeError("Response lost");
+  } });
+  app.state.connected = true; app.state.loading = false;
+  await app.sendMessage("Repeat these exact words"); assert.equal(app.state.messages.global[0].failed, true);
+  await app.loadChannel("global"); assert.equal(app.state.messages.global.length, 1); assert.equal(app.state.messages.global[0].failed, undefined);
+  assert.equal(element("#toast").classList.contains("show"), false);
+  await app.sendMessage("Repeat these exact words"); await app.loadChannel("global");
+  assert.equal(app.state.messages.global.length, 2);
+  const ids = requests.filter(record => record.method === "POST" && record.url.pathname === "/api/messages").map(record => record.body.clientMessageId);
+  assert.notEqual(ids[0], ids[1]); assert.equal(app.state.messages.global.some(item => item.pending || item.failed), false);
+});
+
+test("delivery correlation does not accept another author's message with a copied client ID", async () => {
+  const pending = deferred(), started = deferred();
+  const { app, requests } = fixture({ deliverySupport: true, request(record) {
+    if (record.url.pathname === "/api/messages" && record.method === "POST") { started.resolve(); return pending.promise; }
+  } });
+  app.state.profile = { id: "account-a", name: "A" }; app.chooseDrafts(app.state.profile); app.state.connected = true; app.state.loading = false;
+  const sending = app.sendMessage("My outgoing message"); await started.promise;
+  const write = requests.find(record => record.method === "POST" && record.url.pathname === "/api/messages");
+  app.receiveLiveEvent({ type: "message", channel: "global", message: { id: "another-author", text: write.body.text, clientMessageId: write.body.clientMessageId, userId: "account-b", registered: true } });
+  assert.equal(app.state.messages.global.some(item => item.pending), true);
+  pending.resolve({ message: { id: "my-confirmation", text: write.body.text, clientMessageId: write.body.clientMessageId, userId: "account-a", registered: true } }); await sending;
+  assert.equal(app.state.messages.global.length, 2); assert.equal(app.state.messages.global.some(item => item.pending), false);
+});
+
+test("a late unauthorized send cannot change the new account's draft, messages or feedback", async () => {
+  const pending = deferred(), started = deferred();
+  const { app, element } = fixture({ deliverySupport: true, request(record) {
+    if (record.url.pathname === "/api/messages" && record.method === "POST") { started.resolve(); return pending.promise; }
+  } });
+  app.state.profile = { id: "old-account", name: "Old" }; app.chooseDrafts(app.state.profile); app.state.connected = true;
+  const sending = app.sendMessage("An old-account request"); await started.promise;
+  await app.refreshIdentity({ id: "new-account", name: "New" }, true);
+  element("#messageInput").value = "New account's draft"; app.saveDraft();
+  pending.resolve(mockHttp({ error: "Your sign-in has ended." }, { status: 401 })); await sending;
+  assert.equal(app.state.profile.id, "new-account"); assert.equal(element("#messageInput").value, "New account's draft");
+  assert.equal(app.drafts.global, "New account's draft"); assert.equal((app.state.messages.global || []).length, 0); assert.equal(element("#toast").textContent, "");
+});
+
+test("delivery IDs are sent only when the API advertises support", async () => {
+  for (const supported of [false, true]) {
+    const { app, requests } = fixture({ request(record) {
+      if (record.url.pathname === "/api/bootstrap") return { messages: [], features: supported ? { messageDeliveryIds: true } : {} };
+      if (record.url.pathname === "/api/messages" && record.method === "POST") return { message: { id: "accepted", text: record.body.text } };
+    } });
+    await app.bootstrap(); app.state.connected = true; await app.sendMessage("Compatible ordinary message");
+    const write = requests.find(record => record.method === "POST" && record.url.pathname === "/api/messages");
+    assert.equal(typeof write.body.clientMessageId, supported ? "string" : "undefined");
+  }
+});
+
+test("late message-copy results cannot replace a newer account dialog or steal its focus", async () => {
+  for (const rejected of [false, true]) {
+    const pending = deferred();
+    const { app, element } = fixture({ navigator: { clipboard: { writeText: () => pending.promise } } });
+    app.state.messages.global = [{ id: "copy-race", text: "Copy this text" }];
+    const copying = app.copyMessage("copy-race");
+    app.authModal(); element("#authEmail").value = "keep-my-account-draft@example.invalid";
+    if (rejected) pending.reject(new Error("Clipboard denied late")); else pending.resolve();
+    await copying;
+    assert.match(element("#modalRoot").innerHTML, /id="authForm"/); assert.doesNotMatch(element("#modalRoot").innerHTML, /id="copyMessageText"/);
+    assert.equal(element("#authEmail").value, "keep-my-account-draft@example.invalid"); assert.equal(element("#copyMessageText").focused, undefined); assert.equal(element("#toast").textContent, "");
+  }
+});
+
+test("closing an intervening dialog also cancels an earlier message-copy fallback", async () => {
+  const pending = deferred(), { app, element } = fixture({ navigator: { clipboard: { writeText: () => pending.promise } } });
+  app.state.messages.global = [{ id: "copy-before-dialog", text: "Earlier request" }];
+  const copying = app.copyMessage("copy-before-dialog"); app.authModal(); element("#guestMode").onclick();
+  assert.equal(element("#modalRoot").innerHTML, ""); pending.reject(new Error("Late clipboard denial")); await copying;
+  assert.equal(element("#modalRoot").innerHTML, ""); assert.equal(element("#copyMessageText").focused, undefined);
+});
+
+test("polling reconciles delivery after both retained events and a pruned event cursor", async () => {
+  for (const eventRetained of [false, true]) {
+    let confirmed;
+    const { app } = fixture({ deliverySupport: true, request(record) {
+      if (record.url.pathname === "/api/messages" && record.method === "POST") {
+        confirmed = { id: "poll-confirmed", text: record.body.text, clientMessageId: record.body.clientMessageId, userId: "", registered: false };
+        throw new TypeError("Response interrupted");
+      }
+      if (record.url.pathname === "/api/updates") return { events: eventRetained ? [{ type: "message", channel: "global", message: confirmed }] : [], members: [], nextSeq: 900 };
+      if (record.url.pathname === "/api/messages") return { messages: [confirmed] };
+    } });
+    app.state.connected = true; app.state.loading = false;
+    await app.sendMessage("Recover through polling"); assert.equal(app.state.messages.global[0].failed, true);
+    await app.pollUpdates();
+    assert.equal(app.state.messages.global.length, 1); assert.equal(app.state.messages.global[0].id, "poll-confirmed");
+    assert.equal(app.state.messages.global[0].failed, undefined); assert.equal(app.state.connected, true);
+  }
+});
+
+test("equal-time live events and history snapshots retain the same deterministic order", async () => {
+  const messages = ["opaque-z", "opaque-a"].map(id => ({ id, text: id, createdAt: "2026-01-01T00:00:00.000Z" }));
+  const { app } = fixture({ request: record => record.url.pathname === "/api/messages" ? { messages } : undefined });
+  app.state.loading = false;
+  for (const message of messages) app.receiveLiveEvent({ type: "message", channel: "global", message });
+  assert.deepEqual(Array.from(app.state.messages.global, item => item.id), ["opaque-a", "opaque-z"]);
+  await app.loadChannel("global");
+  assert.deepEqual(Array.from(app.state.messages.global, item => item.id), ["opaque-a", "opaque-z"]);
+});
+
+test("an expired current session shows a definite failed send and preserves newer text", async () => {
+  const pending = deferred(), started = deferred();
+  const { app, element } = fixture({ deliverySupport: true, request(record) {
+    if (record.url.pathname === "/api/messages" && record.method === "POST") { started.resolve(); return pending.promise; }
+  } });
+  app.state.profile = { id: "expired-account", name: "Expired sender" }; app.chooseDrafts(app.state.profile); app.state.connected = true;
+  const sending = app.sendMessage("Keep the rejected text above"); await started.promise;
+  element("#messageInput").value = "A newer account draft"; app.saveDraft();
+  pending.resolve(mockHttp({ error: "Your sign-in has ended. Sign in again, or sign out to continue as a guest." }, { status: 401 })); await sending;
+  assert.equal(app.state.messages.global[0].failed, true); assert.equal(app.state.messages.global[0].uncertain, false);
+  assert.match(element("#messageList").innerHTML, /Not sent/); assert.match(element("#toast").textContent, /sign-in has ended/);
+  assert.equal(element("#messageInput").value, "A newer account draft"); assert.equal(app.drafts.global, "A newer account draft");
+  assert.equal(app.state.profile.id, "expired-account", "A failed old request must not silently switch identity");
+});
+
+test("delivery recovery clears only its own warning and preserves newer unrelated feedback", async () => {
+  let confirmed;
+  const { app, element } = fixture({ deliverySupport: true, request(record) {
+    if (record.url.pathname !== "/api/messages") return;
+    if (record.method === "GET") return { messages: [confirmed] };
+    confirmed = { id: "delivered-with-newer-notice", text: record.body.text, clientMessageId: record.body.clientMessageId, userId: "", registered: false };
+    throw new TypeError("Lost confirmation");
+  } });
+  app.state.connected = true; app.state.loading = false;
+  await app.sendMessage("A delivery awaiting history");
+  app.restoreWorldHistory(); const notice = element("#toast").textContent;
+  await app.loadChannel("global");
+  assert.equal(app.state.messages.global.length, 1); assert.equal(element("#toast").textContent, notice);
+  assert.equal(element("#toast").classList.contains("show"), true);
 });

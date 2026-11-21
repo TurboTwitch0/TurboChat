@@ -118,11 +118,12 @@
   state.memberPanelOpen = saved.memberPanelOpen !== false;
   state.voiceSelection = savedVoiceRoom;
   state.replySupport = false;
+  state.deliverySupport = false;
   state.cleanupSupport = false;
   let worldHistoryReset = saved.worldHistoryReset && Number.isFinite(saved.worldHistoryReset.through) && Array.isArray(saved.worldHistoryReset.ids) ? saved.worldHistoryReset : null;
   let worldHistoryInitialized = saved.worldHistoryInitialized === true || !!worldHistoryReset;
   const messageFollow = { room: null, pinned: true, generation: 0, adjusting: false, frame: null, anchor: null };
-  let identityVersion = 0, modalOpener = null, pollingHasSnapshot = false, refreshDirectory = null;
+  let identityVersion = 0, modalGeneration = 0, modalOpener = null, pollingHasSnapshot = false, refreshDirectory = null;
   const save = () => {
     if (draftIdentity) { draftBooks[draftIdentity] = { ...drafts }; replyBooks[draftIdentity] = { ...replyDrafts }; }
     try {
@@ -284,7 +285,8 @@
   function saveDraft() { const value = $("#messageInput").value; if (value) drafts[state.active] = value; else delete drafts[state.active]; save(); updateComposer(); }
   function restoreDraft() { $("#messageInput").value = typeof drafts[state.active] === "string" ? drafts[state.active].slice(0, 700) : ""; updateComposer(); }
   function clearTyping() { clearTimeout(typingTimer); clearTimeout(typingStopTimer); sendTyping(false); for (const [key, value] of typingPeers) if (key.endsWith(":timer")) clearTimeout(value); typingPeers.clear(); renderTyping(); }
-  function toast(message) { const el = $("#toast"); el.textContent = message; el.classList.add("show"); clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove("show"), 3000); }
+  let deliveryToast = null;
+  function toast(message, delivery = null) { const el = $("#toast"); deliveryToast = delivery ? { identity: identityVersion, message: delivery } : null; el.textContent = message; el.classList.add("show"); clearTimeout(toastTimer); toastTimer = setTimeout(() => { el.classList.remove("show"); deliveryToast = null; }, 3000); }
   async function api(path, options = {}) {
     const controller = typeof AbortController === "function" ? new AbortController() : null, method = (options.method || "GET").toUpperCase();
     const deadline = controller && setTimeout(() => controller.abort(), 15000);
@@ -472,20 +474,34 @@
     finish();
     renderVoice();
   }
+  function sameDelivery(first, second) {
+    return !!first.clientMessageId && first.clientMessageId === second.clientMessageId && first.text === second.text &&
+      (first.replyTo?.id || "") === (second.replyTo?.id || "") && (first.userId || "") === (second.userId || "") && !!first.registered === !!second.registered;
+  }
+  function messageOrder(first, second) {
+    const a = Date.parse(first.createdAt), b = Date.parse(second.createdAt);
+    return (a || 0) - (b || 0) || (Number.isFinite(a) && Number.isFinite(b) ? first.id.localeCompare(second.id) : 0);
+  }
   function mergeMessages(channel, incoming) {
-    const existing = state.messages[channel] || [], byId = new Map(existing.map(item => [item.id, item]));
+    const existing = state.messages[channel] || [];
+    const delivered = (incoming || []).filter(item => !item.pending && !item.failed && item.clientMessageId);
+    if (deliveryToast?.identity === identityVersion && delivered.some(item => sameDelivery(deliveryToast.message, item))) {
+      clearTimeout(toastTimer); $("#toast").textContent = ""; $("#toast").classList.remove("show"); deliveryToast = null;
+    }
+    const retained = existing.filter(item => !(item.pending || item.failed) || !delivered.some(confirmed => sameDelivery(item, confirmed)));
+    const byId = new Map(retained.map(item => [item.id, item]));
     for (const item of incoming || []) {
       const previous = byId.get(item.id);
       byId.set(item.id, previous ? { ...previous, ...item, reactions: item.reactions ?? previous.reactions } : item);
     }
-    const merged = [...byId.values()].sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0)).slice(-250);
+    const merged = [...byId.values()].sort(messageOrder).slice(-250);
     const changed = merged.length !== existing.length || merged.some((item, i) => item.id !== existing[i]?.id || JSON.stringify(item.reactions || {}) !== JSON.stringify(existing[i]?.reactions || {}) || item.pending !== existing[i]?.pending);
     state.messages[channel] = merged;
     return changed;
   }
   function addMessage(channel, item, notifyUnread = true) {
     const existing = state.messages[channel] || [], isNew = !existing.some(message => message.id === item.id);
-    const ownMessage = (item.userId && item.userId === state.profile?.id) || existing.some(message => message.pending && message.user === item.user && message.text === item.text);
+    const ownMessage = (item.userId && item.userId === state.profile?.id) || existing.some(message => ((message.pending || message.failed) && sameDelivery(message, item)) || (message.pending && message.user === item.user && message.text === item.text));
     const changed = mergeMessages(channel, [item]);
     if (notifyUnread && isNew && !ownMessage && (state.active !== channel || state.view !== "chat")) { state.unread[channel] = (state.unread[channel] || 0) + 1; renderRoomList(); }
     if (changed && state.active === channel) renderMessages();
@@ -522,7 +538,7 @@
     }
     if (version !== identityVersion) return;
     state.loading = false; delete state.channelErrors[channel]; initializeWorldHistory(channel, data.messages || []);
-    state.rooms = data.rooms || []; state.parties = data.parties || []; state.servers = [...new Map((data.servers || []).map(server => [server.id, server])).values()]; mergeMessages(channel, data.messages || []); state.members = data.members || []; state.registered = Number(data.registeredCount) || 1428; state.goal = Number(data.memberGoal) || 1500; state.music = data.music || null; state.replySupport = data.features?.messageReplies === true; state.cleanupSupport = data.features?.safeSelfCleanup === true; renderRoomList(); renderMessages(); renderMembers(); renderMusic(); restoreDraft();
+    state.rooms = data.rooms || []; state.parties = data.parties || []; state.servers = [...new Map((data.servers || []).map(server => [server.id, server])).values()]; mergeMessages(channel, data.messages || []); state.members = data.members || []; state.registered = Number(data.registeredCount) || 1428; state.goal = Number(data.memberGoal) || 1500; state.music = data.music || null; state.replySupport = data.features?.messageReplies === true; state.deliverySupport = data.features?.messageDeliveryIds === true; state.cleanupSupport = data.features?.safeSelfCleanup === true; renderRoomList(); renderMessages(); renderMembers(); renderMusic(); restoreDraft();
   }
   function connectLive() {
     state.stream?.close();
@@ -596,15 +612,17 @@
     if (content.length > 700) return toast("Use 700 characters or fewer to send.");
     const channel = state.active, version = identityVersion;
     const retry = retryId && (state.messages[channel] || []).find(item => item.id === retryId);
+    if (retryId && !retry?.failed) return;
     const reply = withoutReply ? null : replySnapshot(retryId ? retry?.replyTo : replyDrafts[channel]);
+    const clientMessageId = retryId && !withoutReply ? retry.clientMessageId : state.deliverySupport ? crypto.randomUUID() : "";
     if (reply && !state.replySupport) return toast("Replies are updating. Cancel the reply or use Send without reply.");
     if (retryId) state.messages[channel] = (state.messages[channel] || []).filter(item => item.id !== retryId);
     else { $("#messageInput").value = ""; delete replyDrafts[channel]; saveDraft(); }
     clearTyping();
-    const tempId = `pending-${crypto.randomUUID()}`, pending = { id: tempId, user: name(), emoji: state.profile?.emoji || "✦", text: content, createdAt: new Date().toISOString(), reactions: {}, pending: true, ...(reply ? { replyTo: reply } : {}) };
+    const tempId = `pending-${crypto.randomUUID()}`, pending = { id: tempId, user: name(), userId: state.profile?.id || "", registered: !!state.profile, emoji: state.profile?.emoji || "✦", text: content, createdAt: new Date().toISOString(), reactions: {}, pending: true, ...(clientMessageId ? { clientMessageId } : {}), ...(reply ? { replyTo: reply } : {}) };
     mergeMessages(channel, [pending]); if (state.active === channel) renderMessages({ scrollToBottom: true });
-    try { const result = await api("/api/messages", { method: "POST", body: JSON.stringify({ channel, text: content, guestId: state.guest.id, guestName: name(), ...(reply ? { replyTo: reply.id } : {}) }) }); if (version !== identityVersion) return; state.messages[channel] = (state.messages[channel] || []).filter(item => item.id !== tempId); mergeMessages(channel, [result.message]); if (state.active === channel) renderMessages(); }
-    catch (error) { if (version !== identityVersion) return; const item = (state.messages[channel] || []).find(item => item.id === tempId); if (item) { item.pending = false; item.failed = true; item.uncertain = error.uncertain === true; } if (state.active === channel) renderMessages(); toast(error.uncertain ? `${error.message} Your text is kept above. Check the conversation before using Try again.` : `${error.message} Your message is kept above. Use Try again to resend.`); }
+    try { const result = await api("/api/messages", { method: "POST", body: JSON.stringify({ channel, text: content, guestId: state.guest.id, guestName: name(), ...(clientMessageId ? { clientMessageId } : {}), ...(reply ? { replyTo: reply.id } : {}) }) }); if (version !== identityVersion) return; state.messages[channel] = (state.messages[channel] || []).filter(item => item.id !== tempId); mergeMessages(channel, [result.message]); if (state.active === channel) renderMessages(); }
+    catch (error) { if (version !== identityVersion) return; const item = (state.messages[channel] || []).find(item => item.id === tempId); if (!item && (state.messages[channel] || []).some(confirmed => !confirmed.pending && !confirmed.failed && sameDelivery(pending, confirmed))) return; if (item) { item.pending = false; item.failed = true; item.uncertain = error.uncertain === true; } if (state.active === channel) renderMessages(); toast(error.uncertain ? `${error.message} Your text is kept above. Check the conversation before using Try again.` : `${error.message} Your message is kept above. Use Try again to resend.`, pending); }
   }
   async function selectChannel(id) {
     const channel = allRooms().find(item => item.id === id);
@@ -616,6 +634,7 @@
     setView("chat"); renderMessages(); await loadChannel(id);
   }
   function modal(title, subtitle, body, focusSelector) {
+    modalGeneration++;
     refreshDirectory = null;
     if (!$("#modalRoot").childElementCount) modalOpener = document.activeElement;
     $("#modalRoot").innerHTML = `<div class="modal-backdrop"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle" aria-describedby="modalDescription"><div class="modal-header"><div class="modal-brand"><img src="assets/turbochat-mark.svg" alt="" width="30" height="30"><span>TurboChat</span></div><button class="modal-close" data-close aria-label="Close dialog">×</button></div><div class="modal-content"><h2 id="modalTitle">${esc(title)}</h2><p id="modalDescription">${esc(subtitle)}</p>${body}</div></section></div>`;
@@ -623,7 +642,7 @@
     $("[data-close]").addEventListener("click", closeModal); $(".modal-backdrop").addEventListener("click", e => { if (e.target.classList.contains("modal-backdrop")) closeModal(); });
     ((focusSelector && $(focusSelector)) || $(".modal input:not([readonly])") || $(".modal button:not([data-close])") || $("[data-close]")).focus();
   }
-  function closeModal() { if (accountBusy) return; refreshDirectory = null; $("#modalRoot").innerHTML = ""; $(".app-shell").inert = false; $("#mobileVoice").inert = false; if (modalOpener?.isConnected) modalOpener.focus(); modalOpener = null; }
+  function closeModal() { if (accountBusy) return; modalGeneration++; refreshDirectory = null; $("#modalRoot").innerHTML = ""; $(".app-shell").inert = false; $("#mobileVoice").inert = false; if (modalOpener?.isConnected) modalOpener.focus(); modalOpener = null; }
   function openRoomDirectory() {
     if (accountBusy) return;
     const filters = [["all", "All rooms"], ["unread", "Unread"], ["following", "Following"]];
@@ -774,15 +793,15 @@
     }
   }
   async function copyMessage(messageId) {
-    const version = identityVersion, channel = state.active;
+    const version = identityVersion, channel = state.active, generation = modalGeneration;
     const item = visibleMessages(channel).find(message => message.id === messageId && !message.pending && !message.failed);
     if (!item) return;
     try {
       if (!navigator.clipboard?.writeText) throw new Error("Clipboard unavailable");
       await navigator.clipboard.writeText(item.text);
-      if (version === identityVersion) toast("Message copied.");
+      if (version === identityVersion && generation === modalGeneration) toast("Message copied.");
     } catch {
-      if (version !== identityVersion || channel !== state.active) return;
+      if (version !== identityVersion || channel !== state.active || generation !== modalGeneration) return;
       modal("Copy this message.", "Your browser couldn’t use the clipboard. Select the text below and copy it.", `<label for="copyMessageText">Message text</label><textarea id="copyMessageText" class="copy-message-text" rows="5" readonly>${esc(item.text)}</textarea>`);
       $("#copyMessageText").focus(); $("#copyMessageText").select();
     }

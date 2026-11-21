@@ -174,7 +174,7 @@ const server = http.createServer(async (req, res) => {
       const who = identity(req, { guestId: url.searchParams.get("guestId") });
       const channel = safeId(url.searchParams.get("channel")) || "global";
       if (!canReadChannel(channel, who)) return sendJson(res, 403, { error: "Join this server from its invite link first." });
-      return sendJson(res, 200, { messages: (store.messages[channel] || []).slice(-250), rooms: store.rooms, parties: store.parties.filter(item => roomMember(item, who)), servers: (store.servers || []).filter(item => roomMember(item, who)).map(publicServer), music: store.music, members: publicMembers(), registeredCount: registeredCount(), memberGoal, features: { messageReplies: true, safeSelfCleanup: true } });
+      return sendJson(res, 200, { messages: (store.messages[channel] || []).slice(-250), rooms: store.rooms, parties: store.parties.filter(item => roomMember(item, who)), servers: (store.servers || []).filter(item => roomMember(item, who)).map(publicServer), music: store.music, members: publicMembers(), registeredCount: registeredCount(), memberGoal, features: { messageReplies: true, messageDeliveryIds: true, safeSelfCleanup: true } });
     }
     if (req.method === "GET" && url.pathname === "/api/messages") {
       const channel = safeId(url.searchParams.get("channel")) || "global", who = identity(req, { guestId: url.searchParams.get("guestId") });
@@ -183,18 +183,27 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "POST" && url.pathname === "/api/messages") {
       const data = await readBody(req), channel = safeId(data.channel) || "global", content = text(data.text, 700), who = identity(req, data), user = userFor(req);
+      if (!user && /(?:^|;)\s*orbit_session=/.test(req.headers.cookie || "")) return sendJson(res, 401, { error: "Your sign-in has ended. Sign in again, or sign out to continue as a guest." });
       if (!content) return sendJson(res, 400, { error: "Write a message first." });
       if (!who) return sendJson(res, 400, { error: "Refresh the page and try again." });
       if (!canReadChannel(channel, who)) return sendJson(res, 403, { error: "Join this server from its invite link first." });
+      const clientMessageId = data.clientMessageId === undefined ? "" : safeId(data.clientMessageId);
+      if (data.clientMessageId !== undefined && !clientMessageId) return sendJson(res, 400, { error: "Use a valid message delivery ID." });
+      const targetId = data.replyTo === undefined || data.replyTo === "" ? "" : safeId(data.replyTo);
+      if (data.replyTo !== undefined && data.replyTo !== "" && !targetId) return sendJson(res, 400, { error: "Choose a valid message to reply to." });
+      const messageId = clientMessageId ? `delivery-${crypto.createHash("sha256").update(JSON.stringify([who, channel, clientMessageId])).digest("hex")}` : crypto.randomUUID();
+      const previous = clientMessageId && (store.messages[channel] || []).find(item => item.id === messageId);
+      if (previous) {
+        if (previous.text !== content || (previous.replyTo?.id || "") !== targetId) return sendJson(res, 409, { error: "This delivery ID was already used for another message. Send changed text as a new message." });
+        return sendJson(res, 200, { message: previous, replayed: true });
+      }
       let replyTo;
-      if (data.replyTo !== undefined && data.replyTo !== "") {
-        const targetId = safeId(data.replyTo);
-        if (!targetId) return sendJson(res, 400, { error: "Choose a valid message to reply to." });
+      if (targetId) {
         const target = (store.messages[channel] || []).find(item => item.id === targetId);
         if (!target) return sendJson(res, 400, { error: "That message is no longer available in this conversation. Choose another message to reply to." });
         replyTo = { id: target.id, user: text(target.user, 32) || "Guest", text: text(target.text, 180) };
       }
-      const message = { id: crypto.randomUUID(), user: user?.name || text(data.guestName, 32) || "Guest", userId: user?.id || "", registered: !!user, emoji: user?.emoji || "✦", text: content, reactions: {}, createdAt: new Date().toISOString() };
+      const message = { id: messageId, user: user?.name || text(data.guestName, 32) || "Guest", userId: user?.id || "", registered: !!user, emoji: user?.emoji || "✦", text: content, reactions: {}, createdAt: new Date().toISOString(), ...(clientMessageId ? { clientMessageId } : {}) };
       if (replyTo) message.replyTo = replyTo;
       store.messages[channel] ||= []; store.messages[channel].push(message); store.messages[channel] = store.messages[channel].slice(-250); persist();
       broadcast({ type: "message", channel, message }, item => eventVisible(item, { type: "message", channel }));
