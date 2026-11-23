@@ -1507,42 +1507,79 @@
   }
   function showRules() { modal("A small promise to each other.", "Orbit works best when everyone gets to be a person here.", `<ul class="rules"><li>Be curious before you judge. People arrive with different stories.</li><li>Make room for quieter voices. A thoughtful reply goes a long way.</li><li>Keep personal information personal. Share only what feels right to you.</li><li>If someone asks you to stop, let the conversation breathe.</li></ul>`); }
   function search() {
-    modal("Find a conversation.", "Search rooms or find a message in your conversations.", `<input id="searchInput" class="search-input" aria-label="Search rooms and messages" placeholder="Try music, travel, or a message…" autocomplete="off"><div class="search-tabs"><button class="active" data-search-mode="rooms">Rooms</button><button data-search-mode="messages">Messages</button></div><div id="searchResults" class="search-results" aria-live="polite"></div>`);
-    let mode = "rooms", historyPromise = null;
-    const cache = new Map(Object.entries(state.messages));
-    const results = $("#searchResults"), input = $("#searchInput");
-    const roomResults = term => allRooms().filter(item => item.name.toLowerCase().includes(term) || (item.topic || "").toLowerCase().includes(term)).map(item => `<button data-search-room="${esc(item.id)}">${esc(item.emoji || "✦")} ${esc(item.name)}<small>${esc(item.topic || "")}</small></button>`).join("") || `<p class="empty-state">No matching room yet.</p>`;
+    modal("Find a conversation.", "Search rooms and recent messages. Older history may not be included.", `<input id="searchInput" class="search-input" aria-label="Search rooms and messages" placeholder="Try music, travel, or a message…" autocomplete="off"><div class="search-tabs"><button class="active" data-search-mode="rooms" aria-pressed="true">Rooms</button><button data-search-mode="messages" aria-pressed="false">Messages</button></div><p id="searchStatus" class="search-status" role="status"></p><button id="searchRetry" class="subtle-button search-retry hidden" type="button">Retry unavailable rooms ↻</button><div id="searchResults" class="search-results" aria-live="polite" aria-busy="false"></div>`);
+    let mode = "rooms", historyPromise = null, historyRequested = false, loading = false;
+    const generation = modalGeneration, version = identityVersion;
+    const cache = new Map(Object.entries(state.messages)), loaded = new Set(), failed = new Set();
+    const results = $("#searchResults"), input = $("#searchInput"), status = $("#searchStatus"), retry = $("#searchRetry");
+    const current = () => input.isConnected && generation === modalGeneration && version === identityVersion;
+    const textRooms = () => [...new Map(allRooms().filter(item => item.type !== "voice").map(item => [item.id, item])).values()];
+    const roomResults = term => allRooms().filter(item => [item.name, item.topic, item.serverName, info[item.id] ? item.id : "", info[item.id]?.[1], info[item.id]?.[3]].some(value => String(value || "").toLowerCase().includes(term))).map(item => `<button data-search-room="${esc(item.id)}">${esc(item.emoji || "✦")} ${esc(item.name)}<small>${esc(item.topic || "")}</small></button>`).join("") || `<p class="empty-state">No matching room yet.</p>`;
     const messageResults = term => {
-      const words = term.split(/\s+/).filter(Boolean), hits = [];
-      for (const [channel, messages] of cache) for (const item of visibleMessages(channel, messages)) {
-        const content = String(item.text || "").toLowerCase();
-        if (words.every(word => content.includes(word))) hits.push({ channel, item });
+      const words = term.split(/\s+/).filter(Boolean), hits = [], available = new Set(textRooms().map(item => item.id));
+      for (const [channel, messages] of cache) {
+        if (!available.has(channel)) continue;
+        for (const item of visibleMessages(channel, messages)) {
+          const content = String(item.text || "").toLowerCase();
+          if (words.every(word => content.includes(word))) hits.push({ channel, item });
+        }
       }
       hits.sort((a, b) => new Date(b.item.createdAt || 0) - new Date(a.item.createdAt || 0));
-      return hits.slice(0, 30).map(({ channel, item }) => `<button class="message-search-result" data-search-message="${esc(item.id)}" data-search-channel="${esc(channel)}"><b>${esc(item.user || "Guest")} <small>in ${esc(room(channel).name)}</small></b><span>${esc(String(item.text || "").slice(0, 180))}</span></button>`).join("") || `<p class="empty-state">No matching messages yet.</p>`;
+      return hits.slice(0, 30).map(({ channel, item }) => `<button class="message-search-result" data-search-message="${esc(item.id)}" data-search-channel="${esc(channel)}"><b>${esc(item.user || "Guest")} <small>in ${esc(room(channel).name)}</small></b><span>${esc(String(item.text || "").slice(0, 180))}</span></button>`).join("") || `<p class="empty-state">${loading || failed.size ? "No matches in messages loaded so far." : "No matching recent messages."}</p>`;
+    };
+    const showResults = html => {
+      if (results.innerHTML === html) return;
+      const focused = document.activeElement;
+      const result = focused?.closest?.("[data-search-message], [data-search-room]");
+      const selection = result && results.contains(result) ? { ...result.dataset } : null;
+      results.innerHTML = html;
+      if (selection) {
+        const replacement = [...results.querySelectorAll("[data-search-message], [data-search-room]")].find(button => selection.searchMessage ? button.dataset.searchMessage === selection.searchMessage && button.dataset.searchChannel === selection.searchChannel : button.dataset.searchRoom === selection.searchRoom);
+        (replacement || input).focus({ preventScroll: true });
+      }
     };
     const render = term => {
-      if (!term) { results.innerHTML = `<p class="empty-state">${mode === "rooms" ? "Choose a room or start typing to search." : "Type at least two characters to search messages."}</p>`; return; }
-      if (mode === "rooms") { results.innerHTML = roomResults(term); return; }
-      if (term.length < 2) { results.innerHTML = `<p class="empty-state">Type at least two characters to search messages.</p>`; return; }
-      results.innerHTML = messageResults(term);
+      const messageSearch = mode === "messages" && term.length >= 2;
+      results.setAttribute("aria-busy", String(messageSearch && loading));
+      retry.classList.toggle("hidden", !messageSearch || loading || !failed.size);
+      status.textContent = !messageSearch ? "" : loading ? "Searching recent history… Available matches appear below." : failed.size ? `Couldn’t refresh ${failed.size} ${failed.size === 1 ? "room" : "rooms"}. Showing available messages; retry to complete the search.` : `Searched recent history in ${loaded.size} ${loaded.size === 1 ? "room" : "rooms"}. Showing up to 30 matches.`;
+      if (!term) { showResults(`<p class="empty-state">${mode === "rooms" ? "Choose a room or start typing to search." : "Type at least two characters to search messages."}</p>`); return; }
+      if (mode === "rooms") { showResults(roomResults(term)); return; }
+      if (term.length < 2) { showResults(`<p class="empty-state">Type at least two characters to search messages.</p>`); return; }
+      showResults(messageResults(term));
     };
     const loadHistory = async id => {
-      if (cache.has(id)) return;
-      try { const data = await api(`/api/messages?channel=${encodeURIComponent(id)}&guestId=${encodeURIComponent(state.guest.id)}`); cache.set(id, data.messages || []); }
-      catch { cache.set(id, []); }
+      try {
+        const data = await api(`/api/messages?channel=${encodeURIComponent(id)}&guestId=${encodeURIComponent(state.guest.id)}`);
+        if (!current()) return;
+        const messages = new Map((cache.get(id) || []).map(item => [item.id, item]));
+        for (const item of data.messages || []) messages.set(item.id, item);
+        cache.set(id, [...messages.values()].sort(messageOrder).slice(-250)); loaded.add(id); failed.delete(id);
+      } catch { if (current()) failed.add(id); }
+    };
+    const loadHistories = () => {
+      if (historyPromise || !current()) return;
+      historyRequested = true; loading = true; render(input.value.trim().toLowerCase());
+      historyPromise = (async () => {
+        const rooms = textRooms().filter(item => !loaded.has(item.id));
+        for (let i = 0; i < rooms.length && current(); i += 6) {
+          await Promise.all(rooms.slice(i, i + 6).map(item => loadHistory(item.id)));
+          if (current()) render(input.value.trim().toLowerCase());
+        }
+      })().finally(() => {
+        loading = false; historyPromise = null;
+        if (current()) render(input.value.trim().toLowerCase());
+      });
     };
     const update = () => {
-      const term = input.value.trim().toLowerCase();
-      render(term);
-      if (mode !== "messages" || term.length < 2 || historyPromise) return;
-      results.innerHTML = `<p class="empty-state">Searching your conversations…</p>`;
-      historyPromise = (async () => {
-        const rooms = allRooms();
-        for (let i = 0; i < rooms.length; i += 6) await Promise.all(rooms.slice(i, i + 6).map(item => loadHistory(item.id)));
-      })().finally(() => { if (input.isConnected && mode === "messages") render(input.value.trim().toLowerCase()); });
+      const term = input.value.trim().toLowerCase(); render(term);
+      if (mode === "messages" && term.length >= 2 && !historyRequested) loadHistories();
     };
-    $$("[data-search-mode]").forEach(button => button.onclick = () => { mode = button.dataset.searchMode; $$("[data-search-mode]").forEach(tab => tab.classList.toggle("active", tab === button)); update(); });
+    $$("[data-search-mode]").forEach(button => button.onclick = () => {
+      mode = button.dataset.searchMode;
+      $$("[data-search-mode]").forEach(tab => { const selected = tab === button; tab.classList.toggle("active", selected); tab.setAttribute("aria-pressed", String(selected)); }); update();
+    });
+    retry.onclick = () => { input.focus(); loadHistories(); };
     input.oninput = update; input.focus(); update();
   }
   function bind() {

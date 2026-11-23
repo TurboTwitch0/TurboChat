@@ -919,6 +919,96 @@ test("message search respects the local World history cutoff while retaining oth
   assert.ok(requests.every(record => record.method === "GET"));
 });
 
+test("message search refreshes partially cached histories and skips voice channels", async () => {
+  const old = { id: "older-music", user: "Listener", text: "Find this older chorus", createdAt: "2026-11-20T12:00:00Z" };
+  const recent = { id: "cached-music", user: "Listener", text: "A newer live arrival", createdAt: "2026-11-23T12:00:00Z" };
+  const { app, element, requests } = fixture({ request(record) {
+    if (record.url.pathname === "/api/messages") return { messages: record.url.searchParams.get("channel") === "music" ? [old, recent] : [] };
+  } });
+  app.bind(); app.state.messages.music = [recent];
+  app.state.servers = [{ id: "search-server", name: "Our server", channels: [{ id: "server-text", name: "Notes", type: "text" }, { id: "voice-room", name: "Voice", type: "voice" }] }];
+  element("#messageInput").value = "Keep composing"; app.saveDraft();
+  element("#searchOpen").onclick(); element("#searchInput").value = "older chorus";
+  element('[data-search-mode="messages"]').onclick();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(element("#searchResults").innerHTML, /data-search-message="older-music"/);
+  assert.equal(requests.filter(record => record.url.searchParams.get("channel") === "music").length, 1);
+  assert.ok(requests.some(record => record.url.searchParams.get("channel") === "server-text"));
+  assert.ok(requests.every(record => record.url.searchParams.get("channel") !== "voice-room"));
+  assert.match(element("#searchStatus").textContent, /recent history in 6 rooms/i);
+  assert.equal(element("#messageInput").value, "Keep composing");
+  assert.equal(app.state.messages.music.length, 1, "search uses its own snapshot without changing the conversation");
+});
+
+test("partial search failure keeps available matches and retries only rooms that failed", async () => {
+  let failures = 1;
+  const { app, element, requests } = fixture({ request(record) {
+    if (record.url.pathname !== "/api/messages") return;
+    if (record.url.searchParams.get("channel") === "music") {
+      if (failures--) return mockHttp({ error: "Temporary outage" }, { status: 503 });
+      return { messages: [{ id: "recovered-search", text: "Chorus from retained history" }] };
+    }
+    return { messages: [] };
+  } });
+  app.bind(); app.state.messages.music = [{ id: "cached-search", text: "Chorus already available" }];
+  element("#searchOpen").onclick(); element("#searchInput").value = "chorus";
+  element('[data-search-mode="messages"]').onclick();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(element("#searchResults").innerHTML, /cached-search/);
+  assert.match(element("#searchStatus").textContent, /Couldn’t refresh 1 room/);
+  assert.equal(element("#searchRetry").classList.contains("hidden"), false);
+  assert.equal(element("#searchResults").getAttribute("aria-busy"), "false");
+  element("#searchRetry").onclick();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(element("#searchResults").innerHTML, /recovered-search/);
+  assert.doesNotMatch(element("#searchStatus").textContent, /Couldn’t/);
+  assert.equal(element("#searchRetry").classList.contains("hidden"), true);
+  assert.equal(requests.filter(record => record.url.searchParams.get("channel") === "music").length, 2);
+  assert.equal(requests.filter(record => record.url.searchParams.get("channel") === "travel").length, 1);
+});
+
+test("search history completion respects the latest query and selected search mode", async () => {
+  const response = deferred();
+  const { app, element } = fixture({ request(record) {
+    if (record.url.pathname === "/api/messages") return response.promise;
+  } });
+  app.bind(); element("#searchOpen").onclick(); element("#searchInput").value = "first phrase";
+  const messagesTab = element('[data-search-mode="messages"]'), roomsTab = element('[data-search-mode="rooms"]');
+  messagesTab.onclick();
+  assert.equal(element("#searchResults").getAttribute("aria-busy"), "true");
+  assert.equal(messagesTab.getAttribute("aria-pressed"), "true");
+  element("#searchInput").value = "music"; roomsTab.onclick();
+  response.resolve({ messages: [{ id: "first-hit", text: "First phrase" }] });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(element("#searchResults").innerHTML, /data-search-room="music"/);
+  assert.doesNotMatch(element("#searchResults").innerHTML, /first-hit/);
+  assert.equal(element("#searchStatus").textContent, "");
+  assert.equal(element("#searchResults").getAttribute("aria-busy"), "false");
+  assert.equal(messagesTab.getAttribute("aria-pressed"), "false");
+  assert.equal(roomsTab.getAttribute("aria-pressed"), "true");
+  element("#searchInput").value = "changed phrase"; messagesTab.onclick();
+  assert.doesNotMatch(element("#searchResults").innerHTML, /first-hit/);
+  assert.match(element("#searchResults").innerHTML, /No matching recent messages/);
+});
+
+test("a closed search stops scheduling history batches and cannot update a replacement dialog", async () => {
+  const response = deferred();
+  const { app, element, requests } = fixture({ request(record) {
+    if (record.url.pathname === "/api/messages") return response.promise;
+  } });
+  app.bind(); app.state.rooms = Array.from({ length: 12 }, (_, i) => ({ id: `extra-${i}`, name: `Extra ${i}`, type: "channel" }));
+  element("#searchOpen").onclick(); element("#searchInput").value = "find me";
+  element('[data-search-mode="messages"]').onclick();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(requests.length, 6, "history concurrency is bounded");
+  app.inviteGeneral();
+  element("#searchResults").innerHTML = "Replacement dialog content";
+  response.resolve({ messages: [{ id: "late-search", text: "Find me late" }] });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(requests.length, 6, "closing the search prevents another batch");
+  assert.equal(element("#searchResults").innerHTML, "Replacement dialog content");
+});
+
 test("voice animation represents only a joined, unmuted, healthy voice session", () => {
   const { app, element } = fixture();
   app.state.connected = true;
