@@ -538,7 +538,7 @@
     }
     if (version !== identityVersion) return;
     state.loading = false; delete state.channelErrors[channel]; initializeWorldHistory(channel, data.messages || []);
-    state.rooms = data.rooms || []; state.parties = data.parties || []; state.servers = [...new Map((data.servers || []).map(server => [server.id, server])).values()]; mergeMessages(channel, data.messages || []); state.members = data.members || []; state.registered = Number(data.registeredCount) || 1428; state.goal = Number(data.memberGoal) || 1500; state.music = data.music || null; state.replySupport = data.features?.messageReplies === true; state.deliverySupport = data.features?.messageDeliveryIds === true; state.cleanupSupport = data.features?.safeSelfCleanup === true; renderRoomList(); renderMessages(); renderMembers(); renderMusic(); restoreDraft();
+    state.rooms = data.rooms || []; state.parties = data.parties || []; state.servers = [...new Map((data.servers || []).map(server => [server.id, server])).values()]; mergeMessages(channel, data.messages || []); state.members = data.members || []; state.registered = Number(data.registeredCount) || 1428; state.goal = Number(data.memberGoal) || 1500; state.replySupport = data.features?.messageReplies === true; state.deliverySupport = data.features?.messageDeliveryIds === true; state.cleanupSupport = data.features?.safeSelfCleanup === true; renderRoomList(); renderMessages(); renderMembers(); updateMusic(data.music || null); restoreDraft();
   }
   function connectLive() {
     state.stream?.close();
@@ -563,7 +563,7 @@
       if (data.type === "presence") { state.members = data.members || []; state.registered = Number(data.registeredCount) || 1428; renderMembers(); }
       if (data.type === "room" && data.room?.type !== "party" && !state.rooms.some(r => r.id === data.room.id)) { state.rooms.unshift(data.room); renderRoomList(); }
       if (data.type === "server" && data.server) { const index = state.servers.findIndex(server => server.id === data.server.id); if (index < 0) state.servers.unshift(data.server); else state.servers[index] = data.server; renderRoomList(); }
-      if (data.type === "music") { state.music = data.track; renderMusic(); }
+      if (data.type === "music") updateMusic(data.track);
       if (data.type === "voice" && data.room === (state.voiceRoom || state.joiningVoice)) {
         state.voiceMembers = data.participants || []; renderVoice();
         const generation = voiceConnectionGeneration;
@@ -1017,27 +1017,79 @@
     if (signedOut) { closeModal(); toast(synced ? "Signed out." : "Signed out. Your conversations are reconnecting."); }
   }
   function updateIdentity() { $("#identityHint").textContent = state.profile ? `Signed in as ${state.profile.name}` : `Chatting as ${state.guest.name}`; $("#profileButton").textContent = state.profile?.emoji || (state.profile ? state.profile.name[0].toUpperCase() : "G"); $("#topProfile").textContent = state.profile ? `${state.profile.emoji || "◉"} ${state.profile.name}` : "Sign in"; $("#discoverAccount").textContent = state.profile ? "Your profile ↗" : "Sign in to your space ↗"; $("#discoverIdentity").textContent = state.profile ? `Welcome back, ${state.profile.name}. Your next conversation is waiting.` : "No introduction needed. Explore as a guest, or sign in to your profile."; }
-  function renderMusic() {
-    const builtins = [
-      ["neon", "Neon Postcards", "Retro pop · 112 BPM", "neon-postcards.wav"], ["midnight", "Midnight Arcade", "Synthwave · 118 BPM", "midnight-arcade.wav"], ["dreamwave", "Dreamwave Radio", "Dream pop · 96 BPM", "dreamwave-radio.wav"], ["orbit", "Slow Orbit", "Ambient pop · 82 BPM", "slow-orbit.wav"]
-    ];
-    const library = `<div class="originals"><div class="originals-title"><b>Orbit Originals</b><small>Made for this room</small></div><div class="track-grid">${builtins.map(([id, title, mood]) => `<button data-track="${id}" class="track-card"><span>♫</span><b>${title}</b><small>${mood}</small><i>Play</i></button>`).join("")}</div></div>`;
-    if (!state.music) { $("#musicPlayback").innerHTML = `<div class="no-track">♫ <b>No song is playing yet.</b><small>Pick an original track below.</small></div>${library}`; return; }
-    let url; try { url = new URL(state.music.url); } catch { state.music = null; return renderMusic(); }
-    const yt = url.hostname.includes("youtu") ? (url.hostname === "youtu.be" ? url.pathname.slice(1) : url.searchParams.get("v") || "") : "";
-    let player = yt && /^[\w-]{11}$/.test(yt) ? `<iframe class="embed-player" src="https://www.youtube-nocookie.com/embed/${encodeURIComponent(yt)}?rel=0" title="${esc(state.music.title)}" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe>` : url.hostname.includes("soundcloud.com") ? `<iframe class="embed-player" src="https://w.soundcloud.com/player/?url=${encodeURIComponent(url.href)}&auto_play=false" title="${esc(state.music.title)}" allow="autoplay"></iframe>` : `<audio controls preload="metadata" src="${esc(url.href)}"></audio>`;
-    $("#musicPlayback").innerHTML = `<div class="current-track"><span>♫</span><div><b>${esc(state.music.title)}</b><small>Shared by ${esc(state.music.submittedBy)}</small></div></div>${player}${library}`;
+  const originalTracks = [
+    ["neon", "Neon Postcards", "Retro pop · 112 BPM", "neon-postcards.wav"],
+    ["midnight", "Midnight Arcade", "Synthwave · 118 BPM", "midnight-arcade.wav"],
+    ["dreamwave", "Dreamwave Radio", "Dream pop · 96 BPM", "dreamwave-radio.wav"],
+    ["orbit", "Slow Orbit", "Ambient pop · 82 BPM", "slow-orbit.wav"]
+  ];
+  let displayedMusicDetails, displayedMusicPlayer;
+  let songDraftVersion = 0, sharingSong = false;
+  function updateMusic(track) {
+    if (track === undefined || Date.parse(track?.createdAt) < Date.parse(state.music?.createdAt)) return;
+    let url;
+    if (track) {
+      try { url = new URL(track.url); } catch { /* Unusable saved track. */ }
+      if (!url || !["http:", "https:"].includes(url.protocol)) {
+        if (state.music) return;
+        track = null;
+        url = undefined;
+      }
+    }
+    state.music = track;
+    const details = track
+      ? `<div class="current-track"><span>♫</span><div><b>${esc(track.title)}</b><small>Shared by ${esc(track.submittedBy)}</small></div></div>`
+      : '<div class="no-track">♫ <b>No song has been shared yet.</b><small>Pick an original track below.</small></div>';
+    if (details !== displayedMusicDetails) {
+      $("#musicTrack").innerHTML = details;
+      displayedMusicDetails = details;
+    }
+    let player = "";
+    if (url) {
+      const yt = /(^|\.)youtube\.com$/.test(url.hostname) ? url.searchParams.get("v") || "" : url.hostname === "youtu.be" ? url.pathname.slice(1) : "";
+      if (/^[\w-]{11}$/.test(yt)) player = `<iframe class="embed-player" src="https://www.youtube-nocookie.com/embed/${encodeURIComponent(yt)}?rel=0" title="Shared YouTube player" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe>`;
+      else if (/(^|\.)soundcloud\.com$/.test(url.hostname)) player = `<iframe class="embed-player" src="https://w.soundcloud.com/player/?url=${encodeURIComponent(url.href)}&auto_play=false" title="Shared SoundCloud player" allow="autoplay"></iframe>`;
+      else player = `<audio controls preload="metadata" aria-label="Shared audio player" src="${esc(url.href)}"></audio>`;
+    }
+    // The POST response and live update can describe the same track. Keep the
+    // mounted player for the same source so playback and controls stay intact.
+    if (player !== displayedMusicPlayer) {
+      $("#musicPlayer").innerHTML = player;
+      displayedMusicPlayer = player;
+    }
   }
-  async function playBuiltin(id) {
-    const files = { neon: ["Neon Postcards", "neon-postcards.wav"], midnight: ["Midnight Arcade", "midnight-arcade.wav"], dreamwave: ["Dreamwave Radio", "dreamwave-radio.wav"], orbit: ["Slow Orbit", "slow-orbit.wav"] };
-    if (!files[id]) return;
-    try { const [title, file] = files[id]; const result = await api("/api/music", { method: "POST", body: JSON.stringify({ title, url: new URL(`/media/${file}`, appOrigin).href, guestName: name() }) }); state.music = result.track; renderMusic(); toast(`${title} is ready. Press play to listen.`); }
-    catch (error) { toast(error.message); }
+  async function shareOriginalTrack(id) {
+    const original = originalTracks.find(([key]) => key === id);
+    if (!original) return;
+    const [, title, , file] = original, version = identityVersion;
+    try {
+      const result = await api("/api/music", { method: "POST", body: JSON.stringify({ title, url: new URL(`/media/${file}`, appOrigin).href, guestName: name() }) });
+      if (identityVersion !== version) return;
+      updateMusic(result.track);
+      toast(`Shared ${title} in Now Playing.`);
+    } catch (error) { if (identityVersion === version) toast(error.message); }
   }
   async function shareMusic(event) {
-    event.preventDefault(); const button = event.currentTarget.querySelector("button"); button.disabled = true;
-    try { const result = await api("/api/music", { method: "POST", body: JSON.stringify({ title: $("#musicTitle").value.trim(), url: $("#musicUrl").value.trim(), guestName: name() }) }); state.music = result.track; renderMusic(); event.currentTarget.reset(); toast("Song shared in Now Playing."); }
-    catch (error) { toast(error.message); } finally { button.disabled = false; }
+    event.preventDefault();
+    if (sharingSong) return;
+    const form = event.currentTarget, button = form.querySelector("button");
+    const version = identityVersion, draftVersion = songDraftVersion;
+    const title = $("#musicTitle").value, url = $("#musicUrl").value;
+    sharingSong = true;
+    button.setAttribute("aria-disabled", "true");
+    button.textContent = "Sharing…";
+    try {
+      const result = await api("/api/music", { method: "POST", body: JSON.stringify({ title: title.trim(), url: url.trim(), guestName: name() }) });
+      if (identityVersion !== version) return;
+      updateMusic(result.track);
+      if (songDraftVersion === draftVersion) form.reset();
+      toast("Song shared in Now Playing.");
+    } catch (error) { if (identityVersion === version) toast(error.message); }
+    finally {
+      sharingSong = false;
+      button.setAttribute("aria-disabled", "false");
+      button.textContent = "Share song";
+    }
   }
   function voiceTabRoom(rooms = allRooms()) {
     return [state.voiceSelection, state.voiceRoom, state.joiningVoice, state.active].find(id => rooms.some(item => item.id === id)) || "global";
@@ -1606,7 +1658,7 @@
           if (target) { pauseMessageFollow(); target.scrollIntoView({ block: "center", behavior: scrollBehavior() }); target.classList.add("search-highlight"); setTimeout(() => target.classList.remove("search-highlight"), 1800); }
         }));
       }
-      const track = event.target.closest("[data-track]"); if (track) playBuiltin(track.dataset.track);
+      const track = event.target.closest("[data-track]"); if (track) shareOriginalTrack(track.dataset.track);
       const react = event.target.closest("[data-react]"); if (react) toggleReaction(react.dataset.react, react.dataset.emoji);
       const reactionPicker = event.target.closest("[data-reaction-picker]"); if (reactionPicker) emojiPicker(reactionPicker.dataset.reactionPicker);
       const copy = event.target.closest("[data-copy-message]"); if (copy) copyMessage(copy.dataset.copyMessage);
@@ -1631,7 +1683,11 @@
     $("#messageInput").onkeydown = e => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); clearTimeout(typingTimer); clearTimeout(typingStopTimer); sendTyping(false); sendMessage(e.currentTarget.value); } };
     window.addEventListener("resize", updateComposer);
     $("#emojiButton").onclick = () => emojiPicker();
-    $("#musicForm").onsubmit = shareMusic; $("#memberSearch").oninput = e => renderMembers(e.target.value.toLowerCase());
+    $("#musicForm").onsubmit = shareMusic;
+    $("#musicForm").oninput = () => { songDraftVersion++; };
+    const trackCards = originalTracks.map(([id, title, mood]) => `<button type="button" data-track="${id}" class="track-card"><span aria-hidden="true">♫</span><b>${title}</b><small>${mood}</small><i>Share</i></button>`).join("");
+    $("#musicPlayback").innerHTML = `<div id="musicTrack" role="status"></div><div id="musicPlayer"></div><div class="originals"><div class="originals-title"><b>Orbit Originals</b><small>Made for this room</small></div><div class="track-grid">${trackCards}</div></div>`;
+    $("#memberSearch").oninput = e => renderMembers(e.target.value.toLowerCase());
     $("#voiceToggle").onclick = () => joinVoice();
     $("#voiceTabJoin").onclick = () => joinVoice("tab");
     $("#voiceMute").onclick = $("#voiceTabMute").onclick = $("#voiceDockMute").onclick = () => { state.muted = !state.muted; return setVoiceDevice(); };

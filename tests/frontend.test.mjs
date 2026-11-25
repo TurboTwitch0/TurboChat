@@ -1071,6 +1071,58 @@ test("blocked browser storage keeps the draft in memory and never claims it was 
   assert.equal(element("#draftHint").textContent, "Draft kept in this tab");
 });
 
+test("music share settles after the submit event and preserves newer form edits", async () => {
+  let response = deferred();
+  const { app, element, requests } = fixture({ request: record => record.url.pathname === "/api/music" ? response.promise : undefined });
+  app.bind();
+  const form = element("#musicForm"), button = form.querySelector("button");
+  const title = element("#musicTitle"), url = element("#musicUrl");
+  form.reset = () => { title.value = ""; url.value = ""; };
+  const submit = () => {
+    const event = { currentTarget: form, preventDefault() {} };
+    const settled = form.onsubmit(event);
+    event.currentTarget = null;
+    return settled;
+  };
+  const track = { title: "The first pick", url: "https://orbit.test/media/slow-orbit.wav", createdAt: "2026-11-25T12:00:00Z" };
+  title.value = track.title; url.value = track.url;
+  const first = submit();
+  assert.equal(button.getAttribute("aria-disabled"), "true");
+  await submit();
+  assert.equal(requests.length, 1, "Repeated submits must wait for the current share.");
+  response.resolve({ track }); await first;
+  assert.equal(element("#toast").textContent, "Song shared in Now Playing.");
+  assert.deepEqual([title.value, url.value], ["", ""]);
+  assert.equal(button.getAttribute("aria-disabled"), "false");
+
+  response = deferred();
+  title.value = track.title; url.value = track.url;
+  const second = submit();
+  title.value = "My new pick"; url.value = "https://orbit.test/media/midnight-arcade.wav"; form.oninput();
+  response.resolve({ track }); await second;
+  assert.deepEqual([title.value, url.value], ["My new pick", "https://orbit.test/media/midnight-arcade.wav"]);
+});
+
+test("shared music refreshes track details without rebuilding the same player or restoring an old track", () => {
+  const { app, element } = fixture();
+  const player = element("#musicPlayer");
+  let html = "", replacements = 0;
+  Object.defineProperty(player, "innerHTML", { get: () => html, set: value => { html = value; replacements++; } });
+  const track = { title: "My pick", url: "https://orbit.test/media/neon-postcards.wav", createdAt: "2026-11-25T12:01:00Z" };
+  const update = track => app.receiveLiveEvent({ type: "music", track });
+  update(track);
+  update({ ...track });
+  update({ ...track, title: "An older pick", url: "https://orbit.test/media/slow-orbit.wav", createdAt: "2026-11-25T12:00:00Z" });
+  assert.equal(replacements, 1);
+  assert.match(element("#musicTrack").innerHTML, /My pick/);
+  update({ ...track, title: "Updated title", createdAt: "2026-11-25T12:02:00Z" });
+  assert.equal(replacements, 1);
+  assert.match(element("#musicTrack").innerHTML, /Updated title/);
+  update({ ...track, url: "https://orbit.test/media/midnight-arcade.wav", createdAt: "2026-11-25T12:03:00Z" });
+  assert.equal(replacements, 2);
+  assert.match(player.innerHTML, /midnight-arcade\.wav/);
+});
+
 test("public room previews wrap selection and update the open action without navigating or autoplay", () => {
   const { app, element, requests, timers, intervals } = fixture();
   app.bind();

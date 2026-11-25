@@ -32,7 +32,7 @@ Run `npm ci`, `npm test`, and `npm run build` before publishing. Tests use isola
 
 The standalone Node server uses built-in modules; the hosted Netlify API uses `@netlify/blobs`. `data/orbit.json` is created as people use local chat. Keep that folder on persistent storage to retain accounts, rooms, parties, messages, and shared music. The header starts at a configured baseline of 1,428 registered members toward the 1,500 community goal; live presence is counted separately. This starting count is not marketing evidence of verified active users.
 
-The Now Playing room has four computer-generated originals: retro pop, synthwave, dream pop, and ambient pop. Run `npm run music:generate` to recreate the bundled tracks. Shared audio supports YouTube, SoundCloud, and direct audio links.
+The Now Playing room has four computer-generated originals: retro pop, synthwave, dream pop, and ambient pop. Run `npm run music:generate` to recreate the bundled tracks. Share an original or a YouTube, SoundCloud, or direct audio link, then press Play to listen. A repeated confirmation for the same source keeps your current playback. A successful share clears the form if you haven't edited it while waiting.
 
 Voice needs microphone permission and a secure context (HTTPS or localhost). The local Node server uses a room-scoped WebSocket audio relay. The hosted Netlify/Vercel app uses browser WebRTC with STUN and serverless signaling; restrictive networks may require a TURN relay. For public use, run it behind HTTPS as a long-lived Node service with persistent storage. Static hosting alone cannot run the chat API or voice relay.
 

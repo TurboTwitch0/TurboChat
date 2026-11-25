@@ -374,6 +374,7 @@ h1,h2,h3,p { margin-top:0; }
 .music-form { display:flex; align-items:stretch; flex-wrap:wrap; gap:10px; margin-top:20px; }
 .music-form input { flex:1 1 190px; min-width:0; width:100%; min-height:44px; padding:9px 12px; border:1px solid var(--line); border-radius:9px; background:#111219; color:var(--text); font-size:1rem; }
 .music-form button { font-size:.875rem; }
+.music-form button[aria-disabled="true"] { opacity:.6; cursor:progress; }
 .no-track { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:16px 0; color:var(--muted); }
 .no-track b,.no-track small { font-size:.875rem; }
 .originals { margin-top:18px; }
