@@ -1046,7 +1046,13 @@
     }
     let player = "";
     if (url) {
-      const yt = /(^|\.)youtube\.com$/.test(url.hostname) ? url.searchParams.get("v") || "" : url.hostname === "youtu.be" ? url.pathname.slice(1) : "";
+      let yt = "";
+      const path = url.pathname.split("/");
+      if (url.hostname === "youtu.be") yt = path[1] || "";
+      else if (/(^|\.)youtube\.com$/.test(url.hostname)) {
+        const pathVideo = ["shorts", "live", "embed", "v"].includes(path[1]) ? path[2] : "";
+        yt = pathVideo || url.searchParams.get("v") || "";
+      }
       if (/^[\w-]{11}$/.test(yt)) player = `<iframe class="embed-player" src="https://www.youtube-nocookie.com/embed/${encodeURIComponent(yt)}?rel=0" title="Shared YouTube player" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe>`;
       else if (/(^|\.)soundcloud\.com$/.test(url.hostname)) player = `<iframe class="embed-player" src="https://w.soundcloud.com/player/?url=${encodeURIComponent(url.href)}&auto_play=false" title="Shared SoundCloud player" allow="autoplay"></iframe>`;
       else player = `<audio controls preload="metadata" aria-label="Shared audio player" src="${esc(url.href)}"></audio>`;

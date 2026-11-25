@@ -1123,6 +1123,37 @@ test("shared music refreshes track details without rebuilding the same player or
   assert.match(player.innerHTML, /midnight-arcade\.wav/);
 });
 
+test("shared YouTube video links use their video player across supported URL forms", () => {
+  const id = "aBcd_12-345";
+  for (const url of [
+    `https://www.youtube.com/watch?v=${id}&t=12`,
+    `https://music.youtube.com/watch?v=${id}`,
+    `https://youtu.be/${id}?si=shared`,
+    `https://youtu.be/${id}/`,
+    `https://www.youtube.com/shorts/${id}?feature=share`,
+    `https://www.youtube.com/shorts/${id}?v=other-video`,
+    `https://www.youtube.com/live/${id}?si=shared`,
+    `https://www.youtube.com/embed/${id}`,
+    `https://www.youtube.com/v/${id}`
+  ]) {
+    const { app, element } = fixture();
+    app.receiveLiveEvent({ type: "music", track: { title: "Shared video", url } });
+    const player = element("#musicPlayer").innerHTML;
+    assert.match(player, new RegExp(`youtube-nocookie\\.com/embed/${id}\\?rel=0`), url);
+    assert.doesNotMatch(player, /<audio/, url);
+  }
+  for (const url of [
+    `https://youtube.com.evil.test/shorts/${id}`,
+    `https://notyoutube.com/live/${id}`,
+    `https://youtu.be.evil.test/${id}`,
+    "https://www.youtube.com/shorts/invalid-id"
+  ]) {
+    const { app, element } = fixture();
+    app.receiveLiveEvent({ type: "music", track: { title: "Other source", url } });
+    assert.doesNotMatch(element("#musicPlayer").innerHTML, /youtube-nocookie/, url);
+  }
+});
+
 test("public room previews wrap selection and update the open action without navigating or autoplay", () => {
   const { app, element, requests, timers, intervals } = fixture();
   app.bind();
